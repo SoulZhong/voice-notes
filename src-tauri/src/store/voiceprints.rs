@@ -32,6 +32,15 @@ pub const MIN_SAMPLE_MS: u64 = 10_000;
 /// 缓存兜住——审库时删一份只重算 0 份。
 pub const MAX_SAMPLES: usize = 30;
 
+/// 子质心最少支撑样本数。少于此的簇不成席——一份装错人的样本单独成席就是 8/23
+/// 校准清掉的那根"永久认领触角";3 份同向的错样本概率低得多,且用户审库时更容易
+/// 一起听出来。
+pub const SUB_CENTROID_MIN_SUPPORT: usize = 3;
+/// 子质心聚类的平均连接合并阈值(余弦):两簇均值相似度 ≥ 此值即并簇。同人不同
+/// 设备/场景的样本余弦常落在 0.3~0.6(2026-08-23 量得同人中位 0.44),取 0.55 让
+/// "同一条件"的样本聚在一起、不同条件分开;待 speaker_loso_eval --multi 校准。
+pub const SUB_CENTROID_LINK_THRESHOLD: f32 = 0.55;
+
 /// resolve 跟随 redirects 链的步数上限。merge 已做链条压扁,正常情况下一跳到底;
 /// 这里是纯防御性上限,防止任何异常写入(例如手工改坏文件成环)导致死循环。
 const MAX_REDIRECT_HOPS: u32 = 8;
@@ -66,6 +75,13 @@ pub struct Person {
     pub centroids: BTreeMap<String, PersonCentroid>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub session_centroids: BTreeMap<String, Vec<PersonCentroid>>,
+    /// 子质心(2026-08-29,多质心匹配):按样本重建时把该人样本按相似度聚成若干簇,
+    /// **支撑样本 ≥ SUB_CENTROID_MIN_SUPPORT 的簇**各留一个归一化均值(count=支撑数)。
+    /// 只在识别方法为 multi_centroid 时成种子席位;与 session_centroids 的区别:
+    /// 后者是"一场一份"的历史堆积(已停写),前者是样本的确定性函数——样本变了
+    /// 重建即重算,没有独立的写入口,所以不会像变体那样被一份脏样本单独劫持。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sub_centroids: BTreeMap<String, Vec<PersonCentroid>>,
     #[serde(default)]
     pub total_ms: u64,
     #[serde(default)]
@@ -1034,6 +1050,7 @@ impl VoiceprintStore {
                 let person = vp.people.get_mut(&id).expect("刚枚举的 key");
                 person.centroids.clear();
                 person.session_centroids.clear();
+                person.sub_centroids.clear();
                 continue;
             }
             let embs: Vec<Vec<f32>> = self
@@ -1041,8 +1058,10 @@ impl VoiceprintStore {
                 .iter()
                 .filter_map(|p| cache.get_or_embed(p, e))
                 .collect();
+            let subs = cluster_sub_centroids(&embs);
             let person = vp.people.get_mut(&id).expect("刚枚举的 key");
             person.session_centroids.clear();
+            person.sub_centroids.clear();
             if embs.is_empty() {
                 person.centroids.clear();
                 continue;
@@ -1079,6 +1098,13 @@ impl VoiceprintStore {
                 person
                     .centroids
                     .insert(src.clone(), PersonCentroid { vec: mean.clone(), count, seen: String::new() });
+            }
+            if !subs.is_empty() {
+                let list: Vec<PersonCentroid> =
+                    subs.iter().map(|(v, c)| PersonCentroid { vec: v.clone(), count: *c, seen: String::new() }).collect();
+                for src in person.centroids.keys().cloned().collect::<Vec<_>>() {
+                    person.sub_centroids.insert(src, list.clone());
+                }
             }
             rebuilt += 1;
         }
@@ -1141,9 +1167,11 @@ impl VoiceprintStore {
             }
         }
         cache.save();
+        let subs = cluster_sub_centroids(&embs);
         let person = vp.people.get_mut(id).expect("上面已校验存在");
         person.session_centroids.clear();
         person.centroids.clear();
+        person.sub_centroids.clear();
         person.total_ms = total_ms;
         person.last_seen = String::new();
         if !embs.is_empty() {
@@ -1164,6 +1192,12 @@ impl VoiceprintStore {
                 "mic".into(),
                 PersonCentroid { vec: mean, count, seen: String::new() },
             );
+            if !subs.is_empty() {
+                person.sub_centroids.insert(
+                    "mic".into(),
+                    subs.iter().map(|(v, c)| PersonCentroid { vec: v.clone(), count: *c, seen: String::new() }).collect(),
+                );
+            }
         }
         self.save(&vp)?;
         journal.invalidate(&[id], "已退回样本基线重算", None);
@@ -1195,6 +1229,20 @@ impl VoiceprintStore {
         super::sample_trace::on_sample_moved(&self.root, path, &dest, &to);
         self.journal_invalidate(&[&from, &to], "此人样本随后有变动");
         Ok(dest)
+    }
+
+    /// 某人名下、溯源到某场某簇的现存样本文件(样本↔会议双向同步用:笔记里把说话人
+    /// 改派/解除时,旧人从那簇截的样本要跟着退掉)。只读不加锁。
+    pub fn samples_traced_to(&self, person: &str, note_id: &str, cluster_id: &str) -> Vec<PathBuf> {
+        let resolved = Self::resolve(&self.load(), person).map(str::to_string);
+        super::sample_trace::load(&self.root)
+            .receipts
+            .into_iter()
+            .filter(|r| r.note_id == note_id && r.cluster_id == cluster_id)
+            .filter(|r| Some(&r.person_id) == resolved.as_ref() || r.person_id == person)
+            .map(|r| self.root.join(r.path))
+            .filter(|p| p.exists())
+            .collect()
     }
 
     /// 样本文件 → 溯源 receipt(note_id, cluster_id)。无溯源(2026-08-20 之前写下的
@@ -1339,6 +1387,7 @@ impl VoiceprintStore {
                     name: String::new(),
                     centroids,
                     session_centroids: BTreeMap::new(),
+                sub_centroids: BTreeMap::new(),
                     total_ms: snap.total_ms,
                     last_seen: now.to_string(),
                     emails: Vec::new(),
@@ -1447,6 +1496,7 @@ impl VoiceprintStore {
                 name: name.to_string(),
                 centroids: BTreeMap::new(),
                 session_centroids: BTreeMap::new(),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 0,
                 last_seen: now.to_string(),
                 emails: Vec::new(),
@@ -1591,15 +1641,21 @@ pub fn sample_content_hash(path: &std::path::Path) -> Option<String> {
 /// 重建那一刻成立,用几天又漂回多变体。生产只认主质心,变体字段留给撤销快照与旧
 /// 表示评测(seed_clusters_with_variants)。
 pub fn seed_clusters(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster> {
-    seed_clusters_inner(vp, false)
+    seed_clusters_inner(vp, false, false)
+}
+
+/// 多质心匹配(识别方法 multi_centroid):主质心 + 各子质心各一席(同人取 max)。
+/// 子质心是样本的确定性函数且要求 ≥3 份支撑,见 Person::sub_centroids。
+pub fn seed_clusters_multi(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster> {
+    seed_clusters_inner(vp, false, true)
 }
 
 /// 旧表示(主质心 + 会话变体各一席),**仅供评测工具对照**,生产不用。
 pub fn seed_clusters_with_variants(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster> {
-    seed_clusters_inner(vp, true)
+    seed_clusters_inner(vp, true, false)
 }
 
-fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool) -> Vec<crate::diar::registry::SeedCluster> {
+fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool, with_sub: bool) -> Vec<crate::diar::registry::SeedCluster> {
     let mut seeds = Vec::new();
     for (id, person) in &vp.people {
         if VoiceprintStore::resolve(vp, id) != Some(id.as_str()) {
@@ -1616,6 +1672,19 @@ fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool) -> Vec<crate::diar
                 count: c.count,
                 source: src.clone(),
             });
+        }
+        if with_sub {
+            for (src, list) in &person.sub_centroids {
+                for c in list {
+                    seeds.push(crate::diar::registry::SeedCluster {
+                        person: id.clone(),
+                        name: person.name.clone(),
+                        centroid: c.vec.clone(),
+                        count: c.count,
+                        source: src.clone(),
+                    });
+                }
+            }
         }
         if !with_variants {
             continue;
@@ -1694,6 +1763,50 @@ pub(crate) fn normalize_loudness(samples: &mut [f32]) {
     for x in samples.iter_mut() {
         *x *= scale;
     }
+}
+
+/// 把一个人的样本嵌入(已归一化)按平均连接层次聚类成子质心。返回支撑数 ≥
+/// SUB_CENTROID_MIN_SUPPORT 的簇 (归一化均值, 支撑数),按支撑数降序;若全部样本
+/// 聚成一个簇(等于主质心)则返回空——子质心只在"确实分出了不同条件"时才有意义。
+pub fn cluster_sub_centroids(embs: &[Vec<f32>]) -> Vec<(Vec<f32>, u64)> {
+    let n = embs.len();
+    if n < SUB_CENTROID_MIN_SUPPORT {
+        return Vec::new();
+    }
+    let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+    // 簇 = (成员下标, 未归一化的和向量)
+    let mut clusters: Vec<(Vec<usize>, Vec<f32>)> = embs.iter().enumerate().map(|(i, v)| (vec![i], v.clone())).collect();
+    loop {
+        let mut best: Option<(usize, usize, f32)> = None;
+        for i in 0..clusters.len() {
+            let ui = normalize(&clusters[i].1);
+            for j in (i + 1)..clusters.len() {
+                let uj = normalize(&clusters[j].1);
+                if let (Some(a), Some(b)) = (&ui, &uj) {
+                    let sim = dot(a, b);
+                    if sim >= SUB_CENTROID_LINK_THRESHOLD && best.map_or(true, |(_, _, s)| sim > s) {
+                        best = Some((i, j, sim));
+                    }
+                }
+            }
+        }
+        let Some((i, j, _)) = best else { break };
+        let (mj, sj) = clusters.remove(j);
+        clusters[i].0.extend(mj);
+        for (acc, x) in clusters[i].1.iter_mut().zip(&sj) {
+            *acc += x;
+        }
+    }
+    if clusters.len() <= 1 {
+        return Vec::new();
+    }
+    let mut out: Vec<(Vec<f32>, u64)> = clusters
+        .into_iter()
+        .filter(|(m, _)| m.len() >= SUB_CENTROID_MIN_SUPPORT)
+        .filter_map(|(m, sum)| normalize(&sum).map(|u| (u, m.len() as u64)))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
 }
 
 /// 样本嵌入缓存:key = 样本文件内容 sha256,value = 归一化嵌入;整文件绑定一个模型
@@ -2696,6 +2809,7 @@ mod tests {
                 name: "张三".into(),
                 centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0))]),
                 session_centroids: BTreeMap::from([("mic".to_string(), vec![pc(0.0, 1.0), pc(0.7, 0.7)])]),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 60_000,
                 last_seen: "t".into(),
                 emails: Vec::new(),
@@ -2722,6 +2836,7 @@ mod tests {
                 name: "张三".into(),
                 centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0)), ("system".to_string(), pc(0.0, 1.0))]),
                 session_centroids: BTreeMap::new(),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 60_000,
                 last_seen: "t".into(),
                 emails: Vec::new(),
@@ -2745,6 +2860,7 @@ mod tests {
                 name: "张三".into(),
                 centroids: BTreeMap::from([("mic".to_string(), pc(0.0, 1.0))]),
                 session_centroids: BTreeMap::from([("mic".to_string(), vec![pc(1.0, 0.0)])]),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 60_000,
                 last_seen: "t".into(),
                 emails: Vec::new(),
@@ -2756,6 +2872,7 @@ mod tests {
             Person {
                 name: String::new(),
                 centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0))]),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 12_000,
                 last_seen: "t".into(),
                 ..Default::default()
@@ -4209,6 +4326,54 @@ mod tests {
         assert_eq!(p.total_ms, 2_000, "total_ms 重置为现存样本时长");
         assert!(p.last_seen.is_empty(), "last_seen 置空,不得用 mtime 推断");
         assert!(p.voiceprint_quarantined, "重算不动隔离标记(解除另有入口)");
+    }
+
+    /// 子质心聚类:两组各 3 份、彼此正交 → 两个子质心;全部同向 → 空(等于主质心);
+    /// 3+2 → 只有 3 份那组成席;不足 3 份 → 空。
+    #[test]
+    fn cluster_sub_centroids_requires_support_and_separation() {
+        let a = |x: f32| normalize(&vec![1.0, x, 0.0]).unwrap();
+        let b = |x: f32| normalize(&vec![0.0, x, 1.0]).unwrap();
+        let two_groups = vec![a(0.05), a(0.1), a(-0.05), b(0.05), b(0.1), b(-0.05)];
+        let subs = cluster_sub_centroids(&two_groups);
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert!(subs.iter().all(|(_, c)| *c == 3));
+        assert!(subs.iter().any(|(v, _)| v[0] > 0.9) && subs.iter().any(|(v, _)| v[2] > 0.9));
+
+        let one_group = vec![a(0.05), a(0.1), a(-0.05), a(0.02), a(0.08)];
+        assert!(cluster_sub_centroids(&one_group).is_empty(), "全同向不出子质心");
+
+        let three_two = vec![a(0.05), a(0.1), a(-0.05), b(0.05), b(0.1)];
+        let subs = cluster_sub_centroids(&three_two);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].1, 3);
+
+        assert!(cluster_sub_centroids(&[a(0.0), b(0.0)]).is_empty());
+    }
+
+    /// 重建写子质心(≥3 份支撑),且只有 multi 种子才把它们当席位。
+    #[test]
+    fn rebuild_writes_sub_centroids_and_only_multi_seeds_use_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        store.upsert_from_session(&[snap("S1", vec![1.0, 0.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t", MODEL).unwrap();
+        let pid = store.load().people.keys().next().unwrap().clone();
+        // 6 份内容各异的样本(嵌入缓存按内容哈希,必须不同)
+        for k in 0..6u32 {
+            let amp = 0.2 + k as f32 * 0.05;
+            let wav: Vec<f32> = (0..16_000).map(|i| if (i / (k as usize + 1)) % 2 == 0 { amp } else { -amp }).collect();
+            store.append_sample(&pid, &wav).unwrap();
+        }
+        let a = |x: f32| Ok(normalize(&vec![1.0, x, 0.0]).unwrap());
+        let b = |x: f32| Ok(normalize(&vec![0.0, x, 1.0]).unwrap());
+        let mut e = crate::diar::MockEmbedder::new(vec![a(0.05), a(0.1), a(-0.05), b(0.05), b(0.1), b(-0.05)]);
+        store.rebuild_person_from_samples(&pid, &mut e, MODEL).unwrap();
+        let vp = store.load();
+        let p = &vp.people[&pid];
+        assert_eq!(p.sub_centroids["mic"].len(), 2, "两组各 3 份 → 两个子质心");
+        assert_eq!(seed_clusters(&vp).len(), 1, "默认种子只有主质心");
+        assert_eq!(seed_clusters_multi(&vp).len(), 3, "multi 种子 = 主质心 + 2 子质心");
+        assert!(seed_clusters_multi(&vp).iter().all(|s| s.person == pid));
     }
 
     /// 嵌入缓存:同内容第二次不再调模型;换模型标签整体作废。

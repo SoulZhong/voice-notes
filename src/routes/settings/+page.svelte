@@ -321,7 +321,7 @@
     volcAccessKey = s.volc_access_key;
     dashKey = s.dashscope_api_key;
     hotwords = s.asr_hotwords;
-    speakerMatchChoice = s.speaker_match === "knn_vote" ? "knn_vote" : "nearest";
+    speakerMatchChoice = s.speaker_match === "knn_vote" || s.speaker_match === "multi_centroid" ? s.speaker_match : "nearest";
   }
 
   async function refreshDiskUsage() {
@@ -603,6 +603,7 @@
   const speakerMatchItems = $derived<SegmentedItem[]>([
     { id: "nearest", label: t("settings.speakerMatch.nearest"), disabled: !settings },
     { id: "knn_vote", label: t("settings.speakerMatch.knnVote"), disabled: !settings },
+    { id: "multi_centroid", label: t("settings.speakerMatch.multiCentroid"), disabled: !settings },
   ]);
   const speakerModelItems = $derived<SegmentedItem[]>([
     { id: "campplus", label: "CAM++", disabled: recording.isLive || !settings },
@@ -1277,7 +1278,9 @@
           <span class="row-desc">
             {speakerMatchChoice === "knn_vote"
               ? t("settings.speakerMatch.knnVoteDesc")
-              : t("settings.speakerMatch.nearestDesc")}
+              : speakerMatchChoice === "multi_centroid"
+                ? t("settings.speakerMatch.multiCentroidDesc")
+                : t("settings.speakerMatch.nearestDesc")}
           </span>
         </div>
         <Segmented

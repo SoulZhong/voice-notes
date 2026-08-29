@@ -1130,6 +1130,7 @@ mod tests {
             name: name.into(),
             centroids,
             session_centroids: BTreeMap::new(),
+            sub_centroids: BTreeMap::new(),
             total_ms: 10_000,
             last_seen: last_seen.into(),
             emails: Vec::new(), voiceprint_quarantined: false,

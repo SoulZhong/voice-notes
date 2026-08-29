@@ -85,6 +85,10 @@ pub const SEED_KNN_K: usize = 5;
 pub const SPEAKER_MATCH_NEAREST: &str = "nearest";
 /// settings.speaker_match 取值:top-K 多数票(实验项)。
 pub const SPEAKER_MATCH_KNN_VOTE: &str = "knn_vote";
+/// 多质心(2026-08-29,实验):匹配策略同最近邻,但种子在主质心之外再加该人的子质心
+/// (store::seed_clusters_multi),同人取 max——耳机/外放/远场各有代表点,单均值
+/// 离哪个都不近的问题由此缓解。子质心须 ≥3 份样本支撑,库里样本少的人退化为单均值。
+pub const SPEAKER_MATCH_MULTI_CENTROID: &str = "multi_centroid";
 /// "近期贡献环"容量:回声追溯撤回窗口(session.rs RETRACT_WINDOW_MS=30s)内可能
 /// 被撤销的 assign 调用数上限,防止长会话无界增长。超出容量的旧条目被静默淘汰
 /// ——淘汰后对应的撤回请求视为 no-op(近似值,回声窗口内的高频 assign 场景下

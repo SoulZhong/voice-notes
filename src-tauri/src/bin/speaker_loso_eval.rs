@@ -17,7 +17,10 @@
 //! - 库里的主质心不参与判定(每次都用样本现算),所以结果不受"库当前脏不脏"
 //!   影响,量的是**样本 + 模型 + 判定规则**这三者的合力。
 //!
-//! 用法: speaker_loso_eval <data_root> <speaker_model.onnx> [--variants]
+//! 用法: speaker_loso_eval <data_root> <speaker_model.onnx> [--variants | --multi]
+//!
+//! `--multi` 按多质心表示建画廊(主质心 + 支撑 ≥3 份的子质心各一席,取 max),
+//! 对应识别方法 multi_centroid;与默认单均值并排比较召回/错认。
 //!
 //! `--variants` 按**校准前的旧表示**建画廊(主质心 + 每份样本各当一份会话变体),
 //! 用于跟当前表示做对照。生产早已不这么写库,这个开关只为评测存在。
@@ -26,7 +29,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use app_lib::diar::{SherpaEmbedder, SpeakerEmbedder};
-use app_lib::store::{seed_clusters, seed_clusters_with_variants, PersonCentroid, VoiceprintStore};
+use app_lib::store::{cluster_sub_centroids, seed_clusters, seed_clusters_multi, seed_clusters_with_variants, PersonCentroid, VoiceprintStore};
 
 /// 探针视作长段:样本本就 ≥10s(MIN_SAMPLE_MS),段长闸恒过。
 const PROBE_SAMPLES: usize = 48_000;
@@ -87,10 +90,12 @@ impl Tally {
 fn main() {
     let mut args = std::env::args().skip(1);
     let (Some(root), Some(model)) = (args.next(), args.next()) else {
-        eprintln!("用法: speaker_loso_eval <data_root> <speaker_model.onnx> [--variants]");
+        eprintln!("用法: speaker_loso_eval <data_root> <speaker_model.onnx> [--variants | --multi]");
         std::process::exit(2);
     };
-    let old_variants = args.any(|a| a == "--variants");
+    let flags: Vec<String> = args.collect();
+    let old_variants = flags.iter().any(|a| a == "--variants");
+    let multi = flags.iter().any(|a| a == "--multi");
     let store = VoiceprintStore::new(root.into());
     let vp = store.load();
     if vp.people.is_empty() {
@@ -156,7 +161,18 @@ fn main() {
                 };
                 person.session_centroids.clear();
                 person.centroids.clear();
+                person.sub_centroids.clear();
                 let Some(m) = mean_unit(&kept) else { continue };
+                // 多质心表示:其余样本按相似度聚成子质心(≥3 份支撑),与生产 rebuild 同一函数。
+                let subs: Vec<PersonCentroid> = if multi {
+                    let owned: Vec<Vec<f32>> = kept.iter().map(|v| (*v).clone()).collect();
+                    cluster_sub_centroids(&owned)
+                        .into_iter()
+                        .map(|(v, c)| PersonCentroid { vec: v, count: c, seen: String::new() })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 // 旧表示:每份样本再写一份 count=1 的会话变体(校准前 rebuild 的做法)。
                 let variants: Vec<PersonCentroid> = if old_variants {
                     kept.iter()
@@ -180,12 +196,21 @@ fn main() {
                         },
                     );
                     if !variants.is_empty() {
-                        person.session_centroids.insert(s, variants.clone());
+                        person.session_centroids.insert(s.clone(), variants.clone());
+                    }
+                    if !subs.is_empty() {
+                        person.sub_centroids.insert(s, subs.clone());
                     }
                 }
             }
             // 旧表示对照要显式取变体席位:生产 seed_clusters 已只取主质心。
-            let seeds = if old_variants { seed_clusters_with_variants(&g) } else { seed_clusters(&g) };
+            let seeds = if old_variants {
+                seed_clusters_with_variants(&g)
+            } else if multi {
+                seed_clusters_multi(&g)
+            } else {
+                seed_clusters(&g)
+            };
             let mut r = app_lib::diar::registry::SpeakerRegistry::with_seeds(&[], &seeds);
             let got = r.assign(&own[held], "mic", PROBE_SAMPLES).and_then(|cid| {
                 r.speakers().into_iter().find(|s| s.id == cid).and_then(|s| s.person)
@@ -230,7 +255,7 @@ fn main() {
     println!(
         "画廊 {} 人(单样本者作干扰项留在库中),表示 = {}",
         embs.len(),
-        if old_variants { "旧·主质心+每样本一变体" } else { "今·仅样本均值" }
+        if old_variants { "旧·主质心+每样本一变体" } else if multi { "多质心·主质心+≥3份支撑的子质心" } else { "今·仅样本均值" }
     );
     print!(
         "判定规则(裸分地板 {:.2} / z {:.1} / 快路 {:.2}): ",
