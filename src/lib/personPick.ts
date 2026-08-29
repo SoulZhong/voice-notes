@@ -67,3 +67,25 @@ export function sortPeopleAlpha(people: PersonSummary[]): PersonSummary[] {
   );
   return [...people].sort((a, b) => collator.compare(personLabel(a), personLabel(b)));
 }
+
+/** 侧栏「会议搭子」已命名组的排序(2026-08-30 用户要求):样本份数降序,同份数按
+    最近一份样本的收录时间降序,再同则按字母序稳定兜底。样本多/新的人是最近在打交道、
+    档案最厚的人,理应排前;字母序留给选人列表(sortPeopleAlpha)——那里用户是带着名字
+    来找人的。 */
+export function sortPeopleBySamples(people: PersonSummary[]): PersonSummary[] {
+  const latest = (p: PersonSummary) => {
+    let m = "";
+    for (const d of p.sample_dates ?? []) if (d > m) m = d;
+    return m;
+  };
+  const alpha = sortPeopleAlpha(people);
+  return alpha.sort((a, b) => {
+    const dn = (b.sample_paths?.length ?? 0) - (a.sample_paths?.length ?? 0);
+    if (dn !== 0) return dn;
+    const la = latest(a);
+    const lb = latest(b);
+    if (la !== lb) return la < lb ? 1 : -1;
+    return 0; // 保留字母序(sort 稳定)
+  });
+}
+
