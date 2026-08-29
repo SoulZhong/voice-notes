@@ -281,7 +281,13 @@ fn load_voiceprint_seeds_for(app: &AppHandle, cur: &str) -> Vec<crate::diar::reg
         return Vec::new();
     }
     // 种子构建下沉 store::seed_clusters(只取主质心;会话变体 2026-08-29 起不再成席)。
-    store::seed_clusters(&vp)
+    // 识别方法 multi_centroid 时再加子质心席位(store::seed_clusters_multi)。
+    let method = app.path().app_data_dir().map(|d| settings::load(&d).speaker_match).unwrap_or_default();
+    if method == diar::registry::SPEAKER_MATCH_MULTI_CENTROID {
+        store::seed_clusters_multi(&vp)
+    } else {
+        store::seed_clusters(&vp)
+    }
 }
 
 // abort_or_finalize 已随 writer 所有权迁入 lifecycle actor(actor.rs::abort_owned,
@@ -4351,6 +4357,13 @@ fn do_assign_note_speaker_person_with(
             person_id: resolved.clone(),
         },
     })?;
+    // 样本↔会议反向同步:先前关联的是**另一个有名字的人** → 他从这簇截的样本退掉。
+    // 无名先前人物走 spawn_feedback 的 MergePrior(整人并入目标,样本随之迁移),不在此处理。
+    if let Some((pid, pname)) = &prior {
+        if pid != &resolved && !pname.is_empty() {
+            retire_traced_samples_async(app, pid.clone(), note_id.to_string(), speaker_id.to_string());
+        }
+    }
     if split_born {
         // 确认才入库:只有用户刚试听过的那段(audited_seq 且确属该说话人)进库。
         let audited = audited_seq.and_then(|q| {
@@ -4607,7 +4620,12 @@ fn clear_note_speaker_person(
     // 复核、账本误撤)根源全在这里。砍掉撤销任务,这些问题不是被堵住,是不存在。
     // 代价:库里那个人多留一段本不该有的样本。见
     // docs/superpowers/specs/2026-08-19-voiceprint-model-space-design.md
-    let _ = (linked, seqs);
+    // 2026-08-29 样本↔会议同步:质心回灌仍不撤,但**有溯源的样本文件退掉并按样本
+    // 重建**——样本是真源,退掉样本再重建,等价于把这段声音从他的声纹里拿走。
+    let _ = seqs;
+    if let Some(pid) = linked {
+        retire_traced_samples_async(&app, pid, note_id, speaker_id);
+    }
     Ok(())
 }
 
@@ -8555,6 +8573,89 @@ fn rebuild_person_blocking(app: &AppHandle, id: &str) -> Result<(), String> {
     r
 }
 
+/// 一份样本的来源会议(溯源真值或按时间推断),供改归属/删除前先取——文件搬走或
+/// 删掉之后就取不到了。
+fn sample_origin_ref(app: &AppHandle, store: &store::VoiceprintStore, path: &std::path::Path) -> Option<ipc::SampleNoteRef> {
+    let notes = notes_dir(app).map(|d| store::NoteStore::new(d).list()).unwrap_or_default();
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok().map(chrono::DateTime::<chrono::Local>::from);
+    sample_note_ref(store, &notes, path, mtime)
+}
+
+/// 样本↔会议同步(2026-08-29 用户:"更新样本,对应出现的会议也要更新"):样本改归属/
+/// 删除后,来源会议里产出这份样本的说话人簇跟着改派给 to / 解除关联,否则人物页
+/// 「出现过的会议」还按旧关联在列。溯源真值只动那一个簇;按时间推断的来源不知道
+/// 是哪个簇,则动该场所有关联到 from 的簇(那场里"是 from 的声音"的簇就是它)。
+/// 录制中的笔记跳过(writer 独占)。返回改动的簇数;失败只记日志——样本操作已完成,
+/// 关联同步是增值层。
+fn sync_note_links_for_sample(app: &AppHandle, origin: Option<ipc::SampleNoteRef>, from: &str, to: Option<&str>) -> usize {
+    let Some(origin) = origin else { return 0 };
+    let Ok(dir) = notes_dir(app) else { return 0 };
+    let Ok(note) = store::NoteStore::new(dir).load(&origin.note_id) else { return 0 };
+    let vp = match open_voiceprint_store(app) {
+        Ok(s) => s.load(),
+        Err(_) => return 0,
+    };
+    let from_r = store::VoiceprintStore::resolve(&vp, from).map(str::to_string);
+    let clusters: Vec<String> = match &origin.cluster_id {
+        Some(c) => vec![c.clone()],
+        None => note
+            .speakers
+            .iter()
+            .filter(|(_, m)| {
+                m.person_id
+                    .as_deref()
+                    .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
+                    .map(str::to_string)
+                    == from_r
+            })
+            .map(|(k, _)| k.clone())
+            .collect(),
+    };
+    if app.state::<AppState>().session.lock().unwrap().as_ref().is_some_and(|s| s.note_id == origin.note_id) {
+        eprintln!("样本↔会议同步跳过:{} 正在录制", origin.note_id);
+        return 0;
+    }
+    let mut n = 0;
+    for speaker_id in clusters {
+        let op = match to {
+            Some(t) => lifecycle::machine::EditOp::AssignPerson {
+                id: origin.note_id.clone(),
+                speaker_id: speaker_id.clone(),
+                person_id: t.to_string(),
+            },
+            None => lifecycle::machine::EditOp::ClearPerson { id: origin.note_id.clone(), speaker_id: speaker_id.clone() },
+        };
+        match app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote { op }) {
+            Ok(()) => n += 1,
+            Err(e) => eprintln!("样本↔会议同步失败({}/{speaker_id}): {e}", origin.note_id),
+        }
+    }
+    n
+}
+
+/// 反向同步:笔记里把某簇改派/解除时,旧人从这簇截下的样本退掉并重建旧人声纹
+/// (否则那段声音还留在旧人档案里参与识别——P11-5.wav 那种重复件就是这么来的)。
+/// 只处理有溯源真值的样本;后台线程执行,失败只记日志。
+fn retire_traced_samples_async(app: &AppHandle, person: String, note_id: String, cluster_id: String) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Ok(store) = open_voiceprint_store(&app) else { return };
+        let paths = store.samples_traced_to(&person, &note_id, &cluster_id);
+        if paths.is_empty() {
+            return;
+        }
+        for p in &paths {
+            if let Err(e) = store.delete_sample(&person, p) {
+                eprintln!("退掉旧人样本失败({person} {}): {e}", p.display());
+            }
+        }
+        eprintln!("笔记改派:退掉 {person} 来自 {note_id}/{cluster_id} 的 {} 份样本,重建声纹", paths.len());
+        if let Err(e) = rebuild_person_blocking(&app, &person) {
+            eprintln!("退样本后重建 {person} 失败: {e}");
+        }
+    });
+}
+
 /// 样本改归属(2026-08-28 样本管理):这份样本其实是 to 的声音。搬文件 + 溯源,
 /// 然后**双方都按样本重建**——搬完不重算,from 的质心里还残留着这段声音、to 也
 /// 没吸收它,界面上"归到了"而识别上什么都没变(删样本曾经就是这么坑的)。
@@ -8571,11 +8672,13 @@ async fn move_person_sample(
         return Err(tr!("录制中不能改样本归属", "Cannot move samples while recording"));
     }
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        open_voiceprint_store(&app)?
-            .move_sample(&from, std::path::Path::new(&path), &to)
-            .map_err(|e| e.to_string())?;
+        let store = open_voiceprint_store(&app)?;
+        let origin = sample_origin_ref(&app, &store, std::path::Path::new(&path));
+        store.move_sample(&from, std::path::Path::new(&path), &to).map_err(|e| e.to_string())?;
         rebuild_person_blocking(&app, &from)?;
-        rebuild_person_blocking(&app, &to)
+        rebuild_person_blocking(&app, &to)?;
+        sync_note_links_for_sample(&app, origin, &from, Some(&to));
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -8681,9 +8784,11 @@ fn suggest_person_merges(app: AppHandle) -> Result<Vec<ipc::PersonMergeSuggestio
 #[tauri::command]
 async fn delete_person_sample(app: AppHandle, id: String, path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        open_voiceprint_store(&app)?
-            .delete_sample(&id, std::path::Path::new(&path))
-            .map_err(|e| e.to_string())?;
+        let store = open_voiceprint_store(&app)?;
+        let origin = sample_origin_ref(&app, &store, std::path::Path::new(&path));
+        store.delete_sample(&id, std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+        // 删样本 = "这段声音不是他":来源会议里那个簇的关联一并解除(样本↔会议同步)。
+        sync_note_links_for_sample(&app, origin, &id, None);
         // 删完即按剩余样本重算(2026-08-28):此前删样本不动质心,坏声音仍留在档案里
         // 参与识别,用户以为清干净了。重建失败(如库重建进行中)不回滚删除——样本
         // 已删是事实,报错让用户稍后手点「按样本重建」。
