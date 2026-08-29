@@ -8656,6 +8656,45 @@ fn retire_traced_samples_async(app: &AppHandle, person: String, note_id: String,
     });
 }
 
+/// 样本操作的后台跟进(2026-08-29 用户:"删完页面就该响应,其他的异步跑、显示状态"):
+/// 文件操作在命令里同步做完立即返回,重建声纹(要加载模型逐份嵌入)与样本↔会议
+/// 同步放到线程里,进度经 `person_sample_job` 事件通知前端:running → done/failed。
+#[derive(Clone, serde::Serialize)]
+struct PersonSampleJobEvent {
+    person_ids: Vec<String>,
+    /// "running" | "done" | "failed"
+    state: String,
+    message: String,
+}
+
+fn spawn_sample_followup(
+    app: &AppHandle,
+    persons: Vec<String>,
+    origin: Option<ipc::SampleNoteRef>,
+    from: String,
+    to: Option<String>,
+) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let emit = |state: &str, message: String| {
+            let _ = app.emit(
+                "person_sample_job",
+                PersonSampleJobEvent { person_ids: persons.clone(), state: state.into(), message },
+            );
+        };
+        emit("running", String::new());
+        for pid in &persons {
+            if let Err(e) = rebuild_person_blocking(&app, pid) {
+                eprintln!("样本操作后重建 {pid} 失败: {e}");
+                emit("failed", e);
+                return;
+            }
+        }
+        let n = sync_note_links_for_sample(&app, origin, &from, to.as_deref());
+        emit("done", if n > 0 { format!("synced:{n}") } else { String::new() });
+    });
+}
+
 /// 样本改归属(2026-08-28 样本管理):这份样本其实是 to 的声音。搬文件 + 溯源,
 /// 然后**双方都按样本重建**——搬完不重算,from 的质心里还残留着这段声音、to 也
 /// 没吸收它,界面上"归到了"而识别上什么都没变(删样本曾经就是这么坑的)。
@@ -8675,9 +8714,8 @@ async fn move_person_sample(
         let store = open_voiceprint_store(&app)?;
         let origin = sample_origin_ref(&app, &store, std::path::Path::new(&path));
         store.move_sample(&from, std::path::Path::new(&path), &to).map_err(|e| e.to_string())?;
-        rebuild_person_blocking(&app, &from)?;
-        rebuild_person_blocking(&app, &to)?;
-        sync_note_links_for_sample(&app, origin, &from, Some(&to));
+        // 文件已搬,页面可立即刷新;重建双方 + 同步会议关联走后台(person_sample_job 事件)。
+        spawn_sample_followup(&app, vec![from.clone(), to.clone()], origin, from, Some(to));
         Ok(())
     })
     .await
@@ -8787,12 +8825,9 @@ async fn delete_person_sample(app: AppHandle, id: String, path: String) -> Resul
         let store = open_voiceprint_store(&app)?;
         let origin = sample_origin_ref(&app, &store, std::path::Path::new(&path));
         store.delete_sample(&id, std::path::Path::new(&path)).map_err(|e| e.to_string())?;
-        // 删样本 = "这段声音不是他":来源会议里那个簇的关联一并解除(样本↔会议同步)。
-        sync_note_links_for_sample(&app, origin, &id, None);
-        // 删完即按剩余样本重算(2026-08-28):此前删样本不动质心,坏声音仍留在档案里
-        // 参与识别,用户以为清干净了。重建失败(如库重建进行中)不回滚删除——样本
-        // 已删是事实,报错让用户稍后手点「按样本重建」。
-        rebuild_person_blocking(&app, &id)
+        // 文件已删,立即返回让页面响应;重建 + 来源会议解除关联("这段声音不是他")走后台。
+        spawn_sample_followup(&app, vec![id.clone()], origin, id, None);
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -8919,9 +8954,9 @@ fn do_merge_person(
     // 2026-08-29(Codex 复审):合并后 winner 按样本重建,不继承 loser 的旧质心/变体
     // ——样本是唯一真源,质心是样本的函数。重建失败(模型不可用/另一重建在跑)不
     // 回滚合并:库里已是 merge_locked 的加权并入兜底,留痕让用户稍后手点重建。
-    if let Err(e) = rebuild_person_blocking(app, winner) {
-        eprintln!("合并后按样本重建 {winner} 失败(保留加权并入的质心): {e}");
-    }
+    // 重建走后台(person_sample_job 事件),合并本身立即返回——合并的正确性不依赖
+    // 重建完成(库里已是加权并入兜底),重建只是把它精确到样本均值。
+    spawn_sample_followup(app, vec![winner.to_string()], None, loser.to_string(), None);
     Ok(journal_id)
 }
 

@@ -20,6 +20,7 @@
   import { formatDate, formatDuration, speakerColor, speakerInk, type NoteSummary } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
   import PersonPickList from "$lib/PersonPickList.svelte";
+  import { onPersonSampleJob } from "$lib/events";
   import { t } from "$lib/i18n/index.svelte";
 
   // 主从结构的"从":本页只呈现/操作一个人;人物索引在侧栏声纹库页签。
@@ -192,6 +193,30 @@
   let moving = $state(false);
   /** 样本区一次性反馈(改归属/删除完成)。 */
   let sampleMsg = $state("");
+  /** 后台跟进(重建声纹 + 同步会议关联)进行中:文件操作已完成、页面已刷新,
+      这里只是告诉用户"声纹还在重算";done 后再刷一次拿到重算后的会议列表。 */
+  let sampleJobRunning = $state(false);
+  $effect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void onPersonSampleJob((e) => {
+      if (!e.person_ids.includes(personId)) return;
+      if (e.state === "running") {
+        sampleJobRunning = true;
+      } else {
+        sampleJobRunning = false;
+        if (e.state === "failed") error = t("speakers.sampleJobFailed", { e: e.message });
+        void refresh();
+      }
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  });
   async function doMoveSample() {
     const p = person;
     const i = moveSampleIdx;
@@ -206,6 +231,7 @@
       await movePersonSample(p.id, path, to);
       closeAllOps();
       sampleMsg = t("speakers.moveSampleDone", { name: displayName(target) });
+      sampleJobRunning = true;
       recording.bumpPeople();
       await refresh();
     } catch (e) {
@@ -248,6 +274,7 @@
     try {
       await deletePersonSample(p.id, path);
       sampleMsg = t("speakers.sampleDeleted");
+      sampleJobRunning = true;
       recording.bumpPeople();
       await refresh();
     } catch (e) {
@@ -733,7 +760,11 @@
             </li>
           {/each}
         </ul>
-        {#if sampleMsg}<span class="hint">{sampleMsg}</span>{/if}
+        {#if sampleJobRunning}
+          <span class="hint">{t("speakers.sampleJobRunning")}</span>
+        {:else if sampleMsg}
+          <span class="hint">{sampleMsg}</span>
+        {/if}
         <span class="card-hint">{t("speakers.auditionHint")}</span>
       {:else}
         <span class="card-hint">{t("speakers.noSamplesYet")}</span>
