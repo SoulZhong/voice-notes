@@ -8556,19 +8556,30 @@ fn rebuild_person_blocking(app: &AppHandle, id: &str) -> Result<(), String> {
             return Err(tr!("声纹库重建进行中,稍后再试", "A library rebuild is running; try again later"));
         }
     }
-    let r = (|| -> Result<(), String> {
-        let tag = current_speaker_model(app);
-        let mut e = diar::SherpaEmbedder::new(&speaker_model_path_for(&tag))
-            .map_err(|e| tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e))?;
-        vp_store.rebuild_person_from_samples(&resolved, &mut e, &tag).map_err(|e| e.to_string())
-    })();
+    // 嵌入器优先复用常驻缓存(与录制/整库重建同一只):每次新建 SherpaEmbedder 要加载
+    // ONNX、吃满 CPU 一两秒,把 WebView 主线程饿住——用户 8/29 实报"删样本仍卡 2 秒"。
+    // 用完放回;标签不符(切了模型)才现建,且不放回。
+    let tag = current_speaker_model(app);
+    let cache = app.state::<AppState>().embedder_cache.clone();
+    let cached = cache.lock().unwrap().take().filter(|te| te.model() == tag);
+    let (mut embedder, from_cache): (Box<dyn diar::SpeakerEmbedder>, bool) = match cached {
+        Some(te) => (te.into_inner(), true),
+        None => match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
+            Ok(e) => (Box::new(e), false),
+            Err(e) => {
+                let _ctl = REBUILD_CTL.lock().unwrap();
+                REBUILD_RUNNING.store(false, Ordering::SeqCst);
+                return Err(tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e));
+            }
+        },
+    };
+    let r = vp_store.rebuild_person_from_samples(&resolved, embedder.as_mut(), &tag).map_err(|e| e.to_string());
+    // 放回缓存(现建的也放回:下一次就不用再加载了)。
+    let _ = from_cache;
+    stash_model(&cache, retag(&tag, Some(embedder)));
     {
         let _ctl = REBUILD_CTL.lock().unwrap();
         REBUILD_RUNNING.store(false, Ordering::SeqCst);
-    }
-    if r.is_ok() {
-        let st = app.state::<AppState>();
-        *st.embedder_cache.lock().unwrap() = None;
     }
     r
 }

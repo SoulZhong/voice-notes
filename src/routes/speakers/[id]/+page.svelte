@@ -577,10 +577,13 @@
           {/if}
         </div>
         <div class="meta-line">
-          {t("speakers.metaLine", {
+          <span class="stat"><b>{person.sample_paths.length}</b>{t("speakers.statSamples")}</span>
+          <span class="stat"><b>{appearNotes.length}</b>{t("speakers.statMeetings")}</span>
+          <span class="stat-sep" aria-hidden="true"></span>
+          <span>{t("speakers.metaLine", {
             date: formatDate(person.last_seen),
             dur: formatDuration(Math.floor(person.total_ms / 1000)),
-          })}
+          })}</span>
           {#each person.sources as s (s)}
             <span class="badge">{sourceLabel(s)}</span>
           {/each}
@@ -660,54 +663,68 @@
       </div>
     {/if}
 
-    <!-- 试听:确认"这个声纹是谁"的主要手段,给成块的卡而非藏在角标里 -->
-    <section class="card">
-      <div class="card-title">
-        {t("speakers.audition")}
-        {#if person.sample_paths.length > 0}
-          <!-- 污染修复出口:逐份试听、删掉不是本人的,然后按剩余样本整体重算声纹
-               (样本即真相;历史回灌污染随重算清除)。 -->
-          <button class="mini" disabled={rebuilding || recording.isLive} onclick={doRebuildFromSamples}>
-            {rebuilding ? t("speakers.rebuilding") : t("speakers.rebuildFromSamples")}
-          </button>
-        {/if}
-        {#if rebuildMsg}<span class="hint">{rebuildMsg}</span>{/if}
+    <!-- 声纹样本:样本是声纹的唯一真源。区块纵排:标题行(计数 · 状态 · 重建)+ 列表
+         (圆形播放钮 · 样本名/日期 · 来源会议 · 悬停操作)+ 脚注。 -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">
+          {t("speakers.audition")}
+          {#if person.sample_paths.length > 0}<span class="count">{person.sample_paths.length}</span>{/if}
+        </h2>
+        <div class="panel-actions">
+          {#if sampleJobRunning || rebuilding}
+            <span class="status running"><span class="dot" aria-hidden="true"></span>{rebuilding ? t("speakers.rebuilding") : t("speakers.sampleJobRunning")}</span>
+          {:else if sampleMsg || rebuildMsg}
+            <span class="status">{sampleMsg || rebuildMsg}</span>
+          {/if}
+          {#if person.sample_paths.length > 0}
+            <button class="mini quiet" disabled={rebuilding || sampleJobRunning || recording.isLive} title={t("speakers.rebuildTitle")} onclick={doRebuildFromSamples}>
+              {t("speakers.rebuildFromSamples")}
+            </button>
+          {/if}
+        </div>
       </div>
       {#if person.sample_paths.length > 0}
-        <!-- 一行一份样本(2026-08-28 样本管理):试听 · 来源会议 · 归到别人 · 删除。
-             来源会议是"这段声音到底是谁"的第二证据:点进笔记看上下文再定。 -->
         <ul class="sample-list">
           {#each person.sample_paths as sp, i (sp)}
             {@const origin = person.sample_notes[i] ?? null}
-            <li class="sample-row" class:active={moveSampleIdx === i || confirmSampleIdx === i}>
-              <button class="listen" class:playing={playingIdx === i} onclick={() => toggleSample(i)}>
+            {@const date = formatDate(person.sample_dates[i] ?? "")}
+            <li class="sample-row" class:active={moveSampleIdx === i || confirmSampleIdx === i} class:playing={playingIdx === i}>
+              <button
+                class="play"
+                class:playing={playingIdx === i}
+                title={playingIdx === i ? t("speakers.stop") : t("speakers.playSample")}
+                aria-label={playingIdx === i ? t("speakers.stop") : t("speakers.playSample")}
+                onclick={() => toggleSample(i)}
+              >
                 {#if playingIdx === i}
                   <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
-                  {t("speakers.stop")}
                 {:else}
                   <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
                     <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
                   </svg>
-                  {t("speakers.sampleN", { n: i + 1 })}
                 {/if}
               </button>
-              <span class="sample-origin">
-                {#if formatDate(person.sample_dates[i] ?? "") !== "—"}
-                  <span class="listen-date">{formatDate(person.sample_dates[i]).slice(0, 10)}</span>
-                {/if}
-                {#if origin}
-                  <a href="/notes/{origin.note_id}" title={origin.cluster_id ? `${origin.note_id} · ${origin.cluster_id}` : origin.note_id}>
-                    {t("speakers.sampleFrom", { title: origin.title || origin.note_id })}
-                  </a>
-                  {#if origin.inferred}<span class="origin-tag">{t("speakers.sampleFromInferred")}</span>{/if}
-                {:else}
-                  <span class="origin-none">{t("speakers.sampleNoOrigin")}</span>
-                {/if}
-              </span>
-              <span class="sample-ops">
+              <div class="sample-main">
+                <div class="sample-title">
+                  <span class="sample-name">{t("speakers.sampleN", { n: i + 1 })}</span>
+                  {#if date !== "—"}<span class="sample-date">{date.slice(0, 10)}</span>{/if}
+                </div>
+                <div class="sample-sub">
+                  {#if origin}
+                    <a href="/notes/{origin.note_id}" title={origin.cluster_id ? `${origin.note_id} · ${origin.cluster_id}` : origin.note_id}>
+                      {t("speakers.sampleFrom", { title: origin.title || origin.note_id })}
+                    </a>
+                    {#if origin.inferred}<span class="tag">{t("speakers.sampleFromInferred")}</span>{/if}
+                  {:else}
+                    <span class="muted">{t("speakers.sampleNoOrigin")}</span>
+                  {/if}
+                </div>
+              </div>
+              <div class="sample-ops">
                 {#if confirmSampleIdx === i}
-                  <!-- 行内二段确认;删完后端即按剩余样本重算声纹 -->
-                  <button class="mini danger" onclick={() => doDeleteSample(i)}>{t("speakers.deleteSample")}</button>
+                  <span class="confirm-text">{t("speakers.deleteSampleConfirm")}</span>
+                  <button class="mini danger" onclick={() => doDeleteSample(i)}>{t("speakers.confirmDelete")}</button>
                   <button class="mini" onclick={() => (confirmSampleIdx = null)}>{t("speakers.cancel")}</button>
                 {:else}
                   <button
@@ -721,15 +738,20 @@
                     }}>{t("speakers.moveSample")}</button
                   >
                   <button
-                    class="mini quiet"
+                    class="icon-btn danger-hover"
                     title={t("speakers.deleteSample")}
+                    aria-label={t("speakers.deleteSample")}
                     onclick={() => {
                       closeAllOps();
                       confirmSampleIdx = i;
-                    }}>{t("speakers.deleteSample")}</button
+                    }}
                   >
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+                      <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.6 8h4.8l.6-8" />
+                    </svg>
+                  </button>
                 {/if}
-              </span>
+              </div>
               {#if moveSampleIdx === i}
                 <!-- 归到别人:与「合并到…」同一套选人菜单;选定后二段确认 -->
                 <div class="merge-anchor sample-move">
@@ -760,37 +782,42 @@
             </li>
           {/each}
         </ul>
-        {#if sampleJobRunning}
-          <span class="hint">{t("speakers.sampleJobRunning")}</span>
-        {:else if sampleMsg}
-          <span class="hint">{sampleMsg}</span>
-        {/if}
-        <span class="card-hint">{t("speakers.auditionHint")}</span>
+        <p class="panel-foot">{t("speakers.auditionHint")}</p>
       {:else}
-        <span class="card-hint">{t("speakers.noSamplesYet")}</span>
+        <p class="panel-empty">{t("speakers.noSamplesYet")}</p>
       {/if}
     </section>
 
     <!-- 出现过的会议:试听之外确认"认对了人"的第二手段;点击直达笔记 -->
-    <section class="card col">
-      <div class="card-title">{t("speakers.appearTitle")}</div>
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">
+          {t("speakers.appearTitle")}
+          {#if appearNotes.length > 0}<span class="count">{appearNotes.length}</span>{/if}
+        </h2>
+      </div>
       {#if appearNotes.length > 0}
         <ul class="appear-list">
           {#each appearNotes as n (n.id)}
-            <li class="appear-row">
-              <a href="/notes/{n.id}">{n.title}</a>
-              <span class="appear-meta">{formatDate(n.started_at)}</span>
+            <li>
+              <a class="appear-row" href="/notes/{n.id}">
+                <span class="appear-title">{n.title}</span>
+                <span class="appear-meta">{formatDate(n.started_at)}</span>
+                <svg class="chev" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5L10.5 8 6 12.5" /></svg>
+              </a>
             </li>
           {/each}
         </ul>
       {:else}
-        <span class="card-hint">{t("speakers.noAppear")}</span>
+        <p class="panel-empty">{t("speakers.noAppear")}</p>
       {/if}
     </section>
 
     <!-- 管理动作:合并/删除,两段确认;录制中后端会拒,前端同步禁用 -->
-    <section class="card">
-      <div class="card-title">{t("speakers.manage")}</div>
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">{t("speakers.manage")}</h2>
+      </div>
       <div class="ops">
         <div class="merge-anchor">
           <button
@@ -935,107 +962,6 @@
   .mini.quiet {
     color: var(--ink-faint);
   }
-  .listen-date {
-    color: var(--ink-faint);
-    font-size: 0.76rem;
-    font-weight: 400;
-  }
-  /* 样本列表:一行一份(试听 · 来源 · 操作);操作按钮悬停/激活才显影 */
-  .sample-list {
-    list-style: none;
-    margin: 0 0 0.4rem;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-  }
-  .sample-row {
-    position: relative;
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.5rem 0.75rem;
-    padding: 0.35rem 0;
-    border-bottom: 1px solid var(--hairline);
-  }
-  .sample-row:last-child {
-    border-bottom: none;
-  }
-  .sample-origin {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.45em;
-    flex: 1 1 12rem;
-    min-width: 0;
-    font-size: 0.82rem;
-    color: var(--ink-soft);
-  }
-  .sample-origin a {
-    color: var(--ink);
-    text-decoration: none;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .sample-origin a:hover {
-    text-decoration: underline;
-  }
-  .origin-tag,
-  .origin-none {
-    color: var(--ink-faint);
-    font-size: 0.74rem;
-  }
-  .sample-ops {
-    display: inline-flex;
-    gap: 0.35rem;
-    visibility: hidden;
-  }
-  .sample-row:hover .sample-ops,
-  .sample-row.active .sample-ops,
-  .sample-ops:focus-within {
-    visibility: visible;
-  }
-  .sample-move {
-    position: absolute;
-    left: 0;
-    top: 100%;
-    z-index: 5;
-  }
-  /* 列表型卡片(出现过的会议):纵排,标题行与列表上下排布 */
-  .card.col {
-    display: block;
-  }
-  .card.col .card-title {
-    margin-bottom: 0.45rem;
-  }
-  .appear-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    max-height: 14rem;
-    overflow-y: auto;
-  }
-  .appear-row {
-    display: flex;
-    align-items: baseline;
-    gap: 0.6rem;
-    padding: 0.28rem 0;
-  }
-  .appear-row a {
-    color: var(--ink);
-    text-decoration: none;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .appear-row a:hover {
-    color: var(--accent);
-    text-decoration: underline;
-  }
-  .appear-meta {
-    color: var(--ink-faint);
-    font-size: 0.78rem;
-    flex: none;
-  }
   .delete-hint {
     color: var(--warning-ink);
     font-size: 0.78rem;
@@ -1169,48 +1095,294 @@
     font-size: 0.82rem;
     margin: 0.4rem 0 0;
   }
-  /* 卡片区块:surface 底 + rounded-lg,与全应用卡片规范一致 */
-  .card {
+  /* ── 区块(panel):surface 底 + 大圆角,标题行与内容纵排 ── */
+  .panel {
     background: var(--surface);
     border-radius: var(--radius-lg);
-    padding: 0.9rem 1rem;
-    margin-bottom: 0.9rem;
+    padding: 0.85rem 1.1rem 0.9rem;
+    margin-bottom: 0.8rem;
+  }
+  .panel-head {
     display: flex;
     align-items: center;
-    gap: 0.8rem;
-    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 0.75rem;
+    min-height: 1.9rem;
+    margin-bottom: 0.35rem;
   }
-  .card-title {
-    font-size: 0.82rem;
-    font-weight: 500;
-    color: var(--ink-secondary);
-    flex: none;
-    min-width: 4.5rem;
-  }
-  .card-hint {
-    color: var(--ink-faint);
-    font-size: 0.82rem;
-  }
-  /* 试听按钮:secondary 形态,播放中 accent 文字 + 跳动条 */
-  .listen {
+  .panel-title {
+    margin: 0;
     display: inline-flex;
     align-items: center;
-    gap: 0.45em;
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink);
-    border-radius: var(--radius-md);
-    font-size: 0.85rem;
-    font-weight: 500;
-    padding: 0.3em 0.9em;
-    cursor: pointer;
+    gap: 0.45rem;
+    font-size: 0.86rem;
+    font-weight: 600;
+    color: var(--ink-secondary);
+    letter-spacing: 0.01em;
   }
-  .listen:hover {
+  .count {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--ink-faint);
+    background: var(--surface-press);
+    border-radius: var(--radius-full);
+    padding: 0.05em 0.55em;
+    font-variant-numeric: tabular-nums;
+  }
+  .panel-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+  .panel-foot,
+  .panel-empty {
+    margin: 0.55rem 0 0;
+    color: var(--ink-faint);
+    font-size: 0.8rem;
+    line-height: 1.5;
+  }
+  .panel-empty {
+    margin-top: 0.2rem;
+    color: var(--ink-secondary);
+  }
+  /* 状态胶囊:后台在跑时 accent 呼吸点;完成后中性文案,几秒后随下次操作被替换 */
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    font-size: 0.78rem;
+    color: var(--ink-secondary);
+    background: var(--surface-press);
+    border-radius: var(--radius-full);
+    padding: 0.18em 0.7em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 22rem;
+  }
+  .status.running {
+    color: var(--accent);
+    background: var(--accent-tint);
+  }
+  .status .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: breathe 1.2s ease-in-out infinite;
+  }
+  @keyframes breathe {
+    0%, 100% { opacity: 0.35; transform: scale(0.8); }
+    50% { opacity: 1; transform: scale(1); }
+  }
+  /* 头部统计胶囊 */
+  .stat {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.2em;
+    color: var(--ink-secondary);
+  }
+  .stat b {
+    font-weight: 600;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  .stat-sep {
+    width: 1px;
+    height: 0.9em;
+    background: var(--hairline-strong);
+    margin: 0 0.2rem;
+  }
+  /* ── 样本列表:圆形播放钮 · 两行信息 · 悬停操作 ── */
+  .sample-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .sample-row {
+    position: relative;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 0.8rem;
+    padding: 0.5rem 0.45rem;
+    margin: 0 -0.45rem;
+    border-radius: var(--radius-md);
+    border-bottom: 1px solid var(--hairline);
+    transition: background 0.12s ease;
+  }
+  .sample-row:last-child {
+    border-bottom: none;
+  }
+  .sample-row:hover,
+  .sample-row.active {
     background: var(--surface-soft);
   }
-  .listen.playing {
-    color: var(--accent);
+  .sample-row.playing {
+    background: var(--accent-tint);
+  }
+  .play {
+    width: 2.1rem;
+    height: 2.1rem;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--hairline-strong);
+    background: var(--surface-press);
+    color: var(--ink);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease, transform 0.08s ease;
+  }
+  .play:hover {
     border-color: var(--accent);
+    color: var(--accent);
+  }
+  .play:active {
+    transform: scale(0.94);
+  }
+  .play.playing {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--on-accent);
+  }
+  .sample-main {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.12rem;
+  }
+  .sample-title {
+    display: flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    font-size: 0.9rem;
+  }
+  .sample-name {
+    font-weight: 500;
+    color: var(--ink);
+  }
+  .sample-date {
+    color: var(--ink-faint);
+    font-size: 0.76rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .sample-sub {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+    font-size: 0.79rem;
+    color: var(--ink-secondary);
+  }
+  .sample-sub a {
+    color: var(--ink-secondary);
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .sample-sub a:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .tag {
+    flex: none;
+    font-size: 0.7rem;
+    color: var(--ink-faint);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-full);
+    padding: 0 0.45em;
+  }
+  .muted {
+    color: var(--ink-faint);
+  }
+  .sample-ops {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+  .sample-row:hover .sample-ops,
+  .sample-row.active .sample-ops,
+  .sample-ops:focus-within {
+    opacity: 1;
+  }
+  .confirm-text {
+    color: var(--warning-ink);
+    font-size: 0.78rem;
+    margin-right: 0.2rem;
+  }
+  .icon-btn {
+    width: 1.7rem;
+    height: 1.7rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--ink-secondary);
+    cursor: pointer;
+  }
+  .icon-btn:hover {
+    background: var(--surface-press);
+    color: var(--ink);
+  }
+  .icon-btn.danger-hover:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+  .sample-move {
+    position: absolute;
+    left: 2.9rem;
+    top: 100%;
+    z-index: 5;
+  }
+  /* ── 会议列表:整行可点,标题 · 日期 · 箭头 ── */
+  .appear-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 18rem;
+    overflow-y: auto;
+  }
+  .appear-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.42rem 0.45rem;
+    margin: 0 -0.45rem;
+    border-radius: var(--radius-md);
+    color: var(--ink);
+    text-decoration: none;
+    transition: background 0.12s ease;
+  }
+  .appear-row:hover {
+    background: var(--surface-soft);
+  }
+  .appear-row:hover .appear-title {
+    color: var(--accent);
+  }
+  .appear-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.9rem;
+  }
+  .appear-meta {
+    color: var(--ink-faint);
+    font-size: 0.76rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .chev {
+    color: var(--ink-faint);
   }
   .bars {
     display: inline-flex;
