@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dupNameSet, filterPeople, personLabel, recentLabel, sortPeopleAlpha } from "./personPick";
+import { dupNameSet, filterPeople, personLabel, recentLabel, sortPeopleAlpha, sortPeopleBySamples } from "./personPick";
 import type { PersonSummary } from "./people";
 
 const person = (id: string, name = "", lastSeen = "2026-07-31T10:00:00+08:00"): PersonSummary => ({
@@ -9,7 +9,7 @@ const person = (id: string, name = "", lastSeen = "2026-07-31T10:00:00+08:00"): 
   last_seen: lastSeen,
   sources: ["mic"],
   sample_paths: [],
-  sample_dates: [],
+  sample_dates: [], sample_notes: [],
 });
 
 describe("personLabel", () => {
@@ -99,3 +99,24 @@ describe("sortPeopleAlpha", () => {
     expect(people.map((p) => p.id)).toEqual(["P10", "P1", "P2"]);
   });
 });
+
+describe("sortPeopleBySamples", () => {
+  const mk = (name: string, dates: string[]): PersonSummary => ({
+    ...person("P1", name),
+    id: name,
+    sample_paths: dates.map((_, i) => `/s/${name}-${i}.wav`),
+    sample_dates: dates,
+    sample_notes: dates.map(() => null),
+  });
+  it("样本多的在前;同份数按最近样本时间倒序;再同按字母序", () => {
+    const people = [
+      mk("张三", ["2026-08-01T00:00:00+08:00"]),
+      mk("李四", ["2026-08-01T00:00:00+08:00", "2026-08-20T00:00:00+08:00"]),
+      mk("王五", ["2026-07-01T00:00:00+08:00", "2026-08-28T00:00:00+08:00"]),
+      mk("陈博", []),
+      mk("赵六", ["2026-08-01T00:00:00+08:00"]),
+    ];
+    expect(sortPeopleBySamples(people).map((p) => p.name)).toEqual(["王五", "李四", "张三", "赵六", "陈博"]);
+  });
+});
+

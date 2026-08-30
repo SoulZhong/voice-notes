@@ -17,7 +17,10 @@
 //! - 库里的主质心不参与判定(每次都用样本现算),所以结果不受"库当前脏不脏"
 //!   影响,量的是**样本 + 模型 + 判定规则**这三者的合力。
 //!
-//! 用法: speaker_loso_eval <data_root> <speaker_model.onnx> [--variants]
+//! 用法: speaker_loso_eval <data_root> <speaker_model.onnx> [--variants | --multi]
+//!
+//! `--multi` 按多质心表示建画廊(主质心 + 支撑 ≥3 份的子质心各一席,取 max),
+//! 对应识别方法 multi_centroid;与默认单均值并排比较召回/错认。
 //!
 //! `--variants` 按**校准前的旧表示**建画廊(主质心 + 每份样本各当一份会话变体),
 //! 用于跟当前表示做对照。生产早已不这么写库,这个开关只为评测存在。
@@ -26,7 +29,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use app_lib::diar::{SherpaEmbedder, SpeakerEmbedder};
-use app_lib::store::{seed_clusters, PersonCentroid, VoiceprintStore};
+use app_lib::store::{cluster_sub_centroids, seed_clusters, seed_clusters_multi, seed_clusters_with_variants, PersonCentroid, VoiceprintStore};
 
 /// 探针视作长段:样本本就 ≥10s(MIN_SAMPLE_MS),段长闸恒过。
 const PROBE_SAMPLES: usize = 48_000;
@@ -87,10 +90,12 @@ impl Tally {
 fn main() {
     let mut args = std::env::args().skip(1);
     let (Some(root), Some(model)) = (args.next(), args.next()) else {
-        eprintln!("用法: speaker_loso_eval <data_root> <speaker_model.onnx> [--variants]");
+        eprintln!("用法: speaker_loso_eval <data_root> <speaker_model.onnx> [--variants | --multi]");
         std::process::exit(2);
     };
-    let old_variants = args.any(|a| a == "--variants");
+    let flags: Vec<String> = args.collect();
+    let old_variants = flags.iter().any(|a| a == "--variants");
+    let multi = flags.iter().any(|a| a == "--multi");
     let store = VoiceprintStore::new(root.into());
     let vp = store.load();
     if vp.people.is_empty() {
@@ -130,6 +135,9 @@ fn main() {
 
     let mut t = Tally::default();
     let mut wrongs: Vec<String> = Vec::new();
+    let mut abstains: Vec<String> = Vec::new();
+    // 弃权明细默认不打(几十行噪音);校准差距门时置 LOSO_SHOW_ABSTAIN=1 看弃权落在谁头上。
+    let show_abstain = std::env::var_os("LOSO_SHOW_ABSTAIN").is_some();
     let probe_owners: Vec<&String> = embs.keys().filter(|k| embs[*k].len() >= 2).collect();
     let probe_count: usize = probe_owners.iter().map(|k| embs[*k].len()).sum();
 
@@ -153,7 +161,18 @@ fn main() {
                 };
                 person.session_centroids.clear();
                 person.centroids.clear();
+                person.sub_centroids.clear();
                 let Some(m) = mean_unit(&kept) else { continue };
+                // 多质心表示:其余样本按相似度聚成子质心(≥3 份支撑),与生产 rebuild 同一函数。
+                let subs: Vec<PersonCentroid> = if multi {
+                    let owned: Vec<Vec<f32>> = kept.iter().map(|v| (*v).clone()).collect();
+                    cluster_sub_centroids(&owned)
+                        .into_iter()
+                        .map(|(v, c)| PersonCentroid { vec: v, count: c, seen: String::new() })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 // 旧表示:每份样本再写一份 count=1 的会话变体(校准前 rebuild 的做法)。
                 let variants: Vec<PersonCentroid> = if old_variants {
                     kept.iter()
@@ -177,11 +196,21 @@ fn main() {
                         },
                     );
                     if !variants.is_empty() {
-                        person.session_centroids.insert(s, variants.clone());
+                        person.session_centroids.insert(s.clone(), variants.clone());
+                    }
+                    if !subs.is_empty() {
+                        person.sub_centroids.insert(s, subs.clone());
                     }
                 }
             }
-            let seeds = seed_clusters(&g);
+            // 旧表示对照要显式取变体席位:生产 seed_clusters 已只取主质心。
+            let seeds = if old_variants {
+                seed_clusters_with_variants(&g)
+            } else if multi {
+                seed_clusters_multi(&g)
+            } else {
+                seed_clusters(&g)
+            };
             let mut r = app_lib::diar::registry::SpeakerRegistry::with_seeds(&[], &seeds);
             let got = r.assign(&own[held], "mic", PROBE_SAMPLES).and_then(|cid| {
                 r.speakers().into_iter().find(|s| s.id == cid).and_then(|s| s.person)
@@ -194,6 +223,30 @@ fn main() {
                     label(got.as_deref().unwrap())
                 ));
             }
+            if got.is_none() && show_abstain {
+                // 每人取最高分席位,列前两名:看弃权是差距门拦的(两人贴得近)
+                // 还是本就不过阈。
+                let mut per: BTreeMap<&str, f32> = BTreeMap::new();
+                for sd in &seeds {
+                    if let Some(u) = normalize(&sd.centroid) {
+                        let sim: f32 = own[held].iter().zip(&u).map(|(a, b)| a * b).sum();
+                        let e = per.entry(sd.person.as_str()).or_insert(f32::MIN);
+                        if sim > *e {
+                            *e = sim;
+                        }
+                    }
+                }
+                let mut top: Vec<(&str, f32)> = per.into_iter().collect();
+                top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let show: Vec<String> =
+                    top.iter().take(2).map(|(p, s)| format!("{} {:.3}", label(p), s)).collect();
+                abstains.push(format!(
+                    "  {} 的第 {} 份样本 → 弃权  [{}]",
+                    label(owner),
+                    held + 1,
+                    show.join(" / ")
+                ));
+            }
             t.add(got.as_deref(), owner);
         }
     }
@@ -202,7 +255,7 @@ fn main() {
     println!(
         "画廊 {} 人(单样本者作干扰项留在库中),表示 = {}",
         embs.len(),
-        if old_variants { "旧·主质心+每样本一变体" } else { "今·仅样本均值" }
+        if old_variants { "旧·主质心+每样本一变体" } else if multi { "多质心·主质心+≥3份支撑的子质心" } else { "今·仅样本均值" }
     );
     print!(
         "判定规则(裸分地板 {:.2} / z {:.1} / 快路 {:.2}): ",
@@ -215,6 +268,12 @@ fn main() {
         println!("\n认错明细({} 条):", wrongs.len());
         for w in &wrongs {
             println!("{w}");
+        }
+    }
+    if !abstains.is_empty() {
+        println!("\n弃权明细({} 条,LOSO_SHOW_ABSTAIN=1):", abstains.len());
+        for a in &abstains {
+            println!("{a}");
         }
     }
 }

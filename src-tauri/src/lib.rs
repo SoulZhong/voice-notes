@@ -280,8 +280,14 @@ fn load_voiceprint_seeds_for(app: &AppHandle, cur: &str) -> Vec<crate::diar::reg
         eprintln!("声纹库模型标签({})与当前选型({cur})不一致,本场跳过种子注入(重建完成后恢复)", vp.embedding_model);
         return Vec::new();
     }
-    // 种子构建下沉 store::seed_clusters(主质心 + 会话状态变体,同人多种子取 max 命中)。
-    store::seed_clusters(&vp)
+    // 种子构建下沉 store::seed_clusters(只取主质心;会话变体 2026-08-29 起不再成席)。
+    // 识别方法 multi_centroid 时再加子质心席位(store::seed_clusters_multi)。
+    let method = app.path().app_data_dir().map(|d| settings::load(&d).speaker_match).unwrap_or_default();
+    if method == diar::registry::SPEAKER_MATCH_MULTI_CENTROID {
+        store::seed_clusters_multi(&vp)
+    } else {
+        store::seed_clusters(&vp)
+    }
 }
 
 // abort_or_finalize 已随 writer 所有权迁入 lifecycle actor(actor.rs::abort_owned,
@@ -4351,6 +4357,13 @@ fn do_assign_note_speaker_person_with(
             person_id: resolved.clone(),
         },
     })?;
+    // 样本↔会议反向同步:先前关联的是**另一个有名字的人** → 他从这簇截的样本退掉。
+    // 无名先前人物走 spawn_feedback 的 MergePrior(整人并入目标,样本随之迁移),不在此处理。
+    if let Some((pid, pname)) = &prior {
+        if pid != &resolved && !pname.is_empty() {
+            retire_traced_samples_async(app, pid.clone(), note_id.to_string(), speaker_id.to_string());
+        }
+    }
     if split_born {
         // 确认才入库:只有用户刚试听过的那段(audited_seq 且确属该说话人)进库。
         let audited = audited_seq.and_then(|q| {
@@ -4607,7 +4620,12 @@ fn clear_note_speaker_person(
     // 复核、账本误撤)根源全在这里。砍掉撤销任务,这些问题不是被堵住,是不存在。
     // 代价:库里那个人多留一段本不该有的样本。见
     // docs/superpowers/specs/2026-08-19-voiceprint-model-space-design.md
-    let _ = (linked, seqs);
+    // 2026-08-29 样本↔会议同步:质心回灌仍不撤,但**有溯源的样本文件退掉并按样本
+    // 重建**——样本是真源,退掉样本再重建,等价于把这段声音从他的声纹里拿走。
+    let _ = seqs;
+    if let Some(pid) = linked {
+        retire_traced_samples_async(&app, pid, note_id, speaker_id);
+    }
     Ok(())
 }
 
@@ -8490,24 +8508,310 @@ fn open_voiceprint_store(app: &AppHandle) -> Result<store::VoiceprintStore, Stri
 /// （merge 已把 loser 移出 people），无需再过一遍 resolve。
 /// 按 last_seen 降序返回（BTreeMap 原生是 P1,P10,P2… 字典序，对用户毫无意义）——
 /// 侧栏索引、选人面板、合并菜单三处同源，排序统一放这里。
+/// 一份样本的来源会议:溯源 receipt 真值优先;没有的按「文件时间 ≈ 会议结束时间」
+/// 推断——样本是停止录制那一刻写下的,所以取结束时间最接近、且偏差 ≤ 10 分钟的
+/// 那场(停止到样本落盘之间还有转码/入库,几分钟内正常);更远的不猜,给 None。
+fn sample_note_ref(
+    store: &store::VoiceprintStore,
+    notes: &[store::NoteSummary],
+    path: &std::path::Path,
+    mtime: Option<chrono::DateTime<chrono::Local>>,
+) -> Option<ipc::SampleNoteRef> {
+    sample_note_ref_within(store, notes, path, mtime, 10 * 60)
+}
+
+/// 同上,推断窗口可调:展示用 10 分钟(宁可多标"按时间推测"),**同步动笔记用 2 分钟**
+/// (Codex P2:相邻两场或落盘延迟时猜错场会改错簇;实测样本与会议结束时间差全为 0 秒,
+/// 同步用 30 秒窗口,相邻两场结束时间差不可能小于一场的最短时长)。
+fn sample_note_ref_within(
+    store: &store::VoiceprintStore,
+    notes: &[store::NoteSummary],
+    path: &std::path::Path,
+    mtime: Option<chrono::DateTime<chrono::Local>>,
+    max_gap_secs: i64,
+) -> Option<ipc::SampleNoteRef> {
+    if let Some((note_id, cluster_id)) = store.sample_origin(path) {
+        let title = notes.iter().find(|n| n.id == note_id).map(|n| n.title.clone()).unwrap_or_default();
+        return Some(ipc::SampleNoteRef { note_id, title, cluster_id: Some(cluster_id), inferred: false });
+    }
+    let mt = mtime?;
+    let mut best: Option<(i64, &store::NoteSummary)> = None;
+    for n in notes {
+        let Ok(start) = chrono::DateTime::parse_from_rfc3339(&n.started_at) else { continue };
+        let end = start + chrono::Duration::seconds(n.duration_secs.unwrap_or(0) as i64);
+        let gap = (mt.with_timezone(&chrono::Utc) - end.with_timezone(&chrono::Utc)).num_seconds().abs();
+        if gap <= max_gap_secs && best.is_none_or(|(g, _)| gap < g) {
+            best = Some((gap, n));
+        }
+    }
+    best.map(|(_, n)| ipc::SampleNoteRef { note_id: n.id.clone(), title: n.title.clone(), cluster_id: None, inferred: true })
+}
+
+/// 按样本重建一人声纹的阻塞实现(rebuild_person_voiceprint / 删样本 / 样本改归属
+/// 共用):占 REBUILD_RUNNING 槽,成功后清嵌入器缓存。
+fn rebuild_person_blocking(app: &AppHandle, id: &str) -> Result<(), String> {
+    let root = data_root(app).map_err(|e| e.to_string())?;
+    let vp_store = store::VoiceprintStore::new(root);
+    let vp = vp_store.load();
+    let Some(resolved) = store::VoiceprintStore::resolve(&vp, id).map(str::to_string) else {
+        return Err(tr!("声纹库中没有该人物: {id}", "No such person: {id}", id = id));
+    };
+    if vp.people.get(&resolved).is_some_and(|p| p.voiceprint_quarantined) {
+        return Err(tr!(
+            "该人物正被拆分流程隔离,请先完成或撤销拆分",
+            "Person is quarantined by a split; finish or undo it first"
+        ));
+    }
+    // 占重建槽:有别的重建在跑(全库重建/上一次样本操作的跟进)就等它,最多 2 分钟
+    // (Codex P1:立刻失败会让"文件已删、质心没重算、会议没同步"永久留在库里)。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let acquired = {
+            let _ctl = REBUILD_CTL.lock().unwrap();
+            !REBUILD_RUNNING.swap(true, Ordering::SeqCst)
+        };
+        if acquired {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(tr!("声纹库重建进行中,稍后再试", "A library rebuild is running; try again later"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    // 嵌入器优先复用常驻缓存(与录制/整库重建同一只):每次新建 SherpaEmbedder 要加载
+    // ONNX、吃满 CPU 一两秒,把 WebView 主线程饿住——用户 8/29 实报"删样本仍卡 2 秒"。
+    // 用完放回;标签不符(切了模型)才现建,且不放回。
+    let tag = current_speaker_model(app);
+    let cache = app.state::<AppState>().embedder_cache.clone();
+    let cached = cache.lock().unwrap().take().filter(|te| te.model() == tag);
+    let (mut embedder, from_cache): (Box<dyn diar::SpeakerEmbedder>, bool) = match cached {
+        Some(te) => (te.into_inner(), true),
+        None => match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
+            Ok(e) => (Box::new(e), false),
+            Err(e) => {
+                let _ctl = REBUILD_CTL.lock().unwrap();
+                REBUILD_RUNNING.store(false, Ordering::SeqCst);
+                return Err(tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e));
+            }
+        },
+    };
+    let r = vp_store.rebuild_person_from_samples(&resolved, embedder.as_mut(), &tag).map_err(|e| e.to_string());
+    // 放回缓存(现建的也放回:下一次就不用再加载了)。
+    let _ = from_cache;
+    stash_model(&cache, retag(&tag, Some(embedder)));
+    {
+        let _ctl = REBUILD_CTL.lock().unwrap();
+        REBUILD_RUNNING.store(false, Ordering::SeqCst);
+    }
+    r
+}
+
+/// 一份样本的来源会议(溯源真值或按时间推断),供改归属/删除前先取——文件搬走或
+/// 删掉之后就取不到了。
+fn sample_origin_ref(app: &AppHandle, store: &store::VoiceprintStore, path: &std::path::Path) -> Option<ipc::SampleNoteRef> {
+    let notes = notes_dir(app).map(|d| store::NoteStore::new(d).list()).unwrap_or_default();
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok().map(chrono::DateTime::<chrono::Local>::from);
+    sample_note_ref_within(store, &notes, path, mtime, 30)
+}
+
+/// 样本↔会议同步(2026-08-29 用户:"更新样本,对应出现的会议也要更新"):样本改归属/
+/// 删除后,来源会议里产出这份样本的说话人簇跟着改派给 to / 解除关联,否则人物页
+/// 「出现过的会议」还按旧关联在列。溯源真值只动那一个簇;按时间推断的来源不知道
+/// 是哪个簇,则动该场所有关联到 from 的簇(那场里"是 from 的声音"的簇就是它)。
+/// 录制中的笔记跳过(writer 独占)。返回改动的簇数;失败只记日志——样本操作已完成,
+/// 关联同步是增值层。
+fn sync_note_links_for_sample(app: &AppHandle, origin: Option<ipc::SampleNoteRef>, from: &str, to: Option<&str>) -> usize {
+    let Some(origin) = origin else { return 0 };
+    let Ok(dir) = notes_dir(app) else { return 0 };
+    let Ok(note) = store::NoteStore::new(dir).load(&origin.note_id) else { return 0 };
+    let vp = match open_voiceprint_store(app) {
+        Ok(s) => s.load(),
+        Err(_) => return 0,
+    };
+    // from 解析不到(已被删除/并走)就不动笔记(Codex P1):否则"关联到 from"的判据会退化
+    // 成"person_id 为空/悬空",把该场所有未关联簇整批改派给 to。
+    let Some(from_r) = store::VoiceprintStore::resolve(&vp, from).map(str::to_string) else {
+        eprintln!("样本↔会议同步跳过:{from} 已不在库中");
+        return 0;
+    };
+    let linked_to_from = |m: &store::SpeakerMeta| {
+        m.person_id
+            .as_deref()
+            .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
+            .is_some_and(|r| r == from_r)
+    };
+    // 只动**此刻仍关联到 from** 的簇(Codex P1):用户在异步任务落地前已手工改派给第三
+    // 人的簇不覆盖——样本操作是"这段声音不是 from",不是"这簇一定归 to"。
+    // (簇 id, 读到的原样 person_id):后者作 CAS 期望值,落地时不等即拒绝。
+    let clusters: Vec<(String, String)> = match &origin.cluster_id {
+        Some(c) => note
+            .speakers
+            .get(c)
+            .filter(|m| linked_to_from(m))
+            .and_then(|m| m.person_id.clone())
+            .map(|raw| vec![(c.clone(), raw)])
+            .unwrap_or_default(),
+        None => note
+            .speakers
+            .iter()
+            .filter(|(_, m)| linked_to_from(m))
+            .filter_map(|(k, m)| m.person_id.clone().map(|raw| (k.clone(), raw)))
+            .collect(),
+    };
+    if app.state::<AppState>().session.lock().unwrap().as_ref().is_some_and(|s| s.note_id == origin.note_id) {
+        eprintln!("样本↔会议同步跳过:{} 正在录制", origin.note_id);
+        return 0;
+    }
+    let mut n = 0;
+    for (speaker_id, expect) in clusters {
+        // CAS 落地(Codex 复审 P1):actor 内锁里比对"仍是读到的那个人"才写,用户在
+        // 读取与落地之间改派给第三人的簇会被拒绝而不是覆盖。
+        let op = lifecycle::machine::EditOp::SetPersonIf {
+            id: origin.note_id.clone(),
+            speaker_id: speaker_id.clone(),
+            expect,
+            person_id: to.map(str::to_string),
+        };
+        match app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote { op }) {
+            Ok(()) => n += 1,
+            Err(e) => eprintln!("样本↔会议同步未落地({}/{speaker_id}): {e}", origin.note_id),
+        }
+    }
+    n
+}
+
+/// 反向同步:笔记里把某簇改派/解除时,旧人从这簇截下的样本退掉并重建旧人声纹
+/// (否则那段声音还留在旧人档案里参与识别——P11-5.wav 那种重复件就是这么来的)。
+/// 只处理有溯源真值的样本;后台线程执行,失败只记日志。
+fn retire_traced_samples_async(app: &AppHandle, person: String, note_id: String, cluster_id: String) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Ok(store) = open_voiceprint_store(&app) else { return };
+        // 复核(Codex P1):任务排队期间用户可能已把这簇改回给同一个人——那他的样本
+        // 就不该退。只有簇此刻不再归他时才动手。
+        let still_his = notes_dir(&app)
+            .ok()
+            .and_then(|d| store::NoteStore::new(d).load(&note_id).ok())
+            .and_then(|n| n.speakers.get(&cluster_id).and_then(|m| m.person_id.clone()))
+            .and_then(|pid| store::VoiceprintStore::resolve(&store.load(), &pid).map(str::to_string))
+            .is_some_and(|r| store::VoiceprintStore::resolve(&store.load(), &person).is_some_and(|p| p == r));
+        if still_his {
+            return;
+        }
+        let paths = store.samples_traced_to(&person, &note_id, &cluster_id);
+        if paths.is_empty() {
+            return;
+        }
+        // 已知残余(Codex 复审 P1,接受):复核与删除跨两个存储(笔记 / 声纹库),做不成
+        // 一把锁内的原子;窗口是"复核通过后到删除这几毫秒内用户又改回",且后果只是
+        // 少一份样本(声纹随重建仍正确),不值得把两个锁嵌套起来。
+        for p in &paths {
+            if let Err(e) = store.delete_sample(&person, p) {
+                eprintln!("退掉旧人样本失败({person} {}): {e}", p.display());
+            }
+        }
+        eprintln!("笔记改派:退掉 {person} 来自 {note_id}/{cluster_id} 的 {} 份样本,重建声纹", paths.len());
+        if let Err(e) = rebuild_person_blocking(&app, &person) {
+            eprintln!("退样本后重建 {person} 失败: {e}");
+        }
+    });
+}
+
+/// 样本操作的后台跟进(2026-08-29 用户:"删完页面就该响应,其他的异步跑、显示状态"):
+/// 文件操作在命令里同步做完立即返回,重建声纹(要加载模型逐份嵌入)与样本↔会议
+/// 同步放到线程里,进度经 `person_sample_job` 事件通知前端:running → done/failed。
+#[derive(Clone, serde::Serialize)]
+struct PersonSampleJobEvent {
+    person_ids: Vec<String>,
+    /// "running" | "done" | "failed"
+    state: String,
+    message: String,
+}
+
+fn spawn_sample_followup(
+    app: &AppHandle,
+    persons: Vec<String>,
+    origin: Option<ipc::SampleNoteRef>,
+    from: String,
+    to: Option<String>,
+) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let emit = |state: &str, message: String| {
+            let _ = app.emit(
+                "person_sample_job",
+                PersonSampleJobEvent { person_ids: persons.clone(), state: state.into(), message },
+            );
+        };
+        emit("running", String::new());
+        for pid in &persons {
+            if let Err(e) = rebuild_person_blocking(&app, pid) {
+                eprintln!("样本操作后重建 {pid} 失败: {e}");
+                emit("failed", e);
+                return;
+            }
+        }
+        let n = sync_note_links_for_sample(&app, origin, &from, to.as_deref());
+        emit("done", if n > 0 { format!("synced:{n}") } else { String::new() });
+    });
+}
+
+/// 样本改归属(2026-08-28 样本管理):这份样本其实是 to 的声音。搬文件 + 溯源,
+/// 然后**双方都按样本重建**——搬完不重算,from 的质心里还残留着这段声音、to 也
+/// 没吸收它,界面上"归到了"而识别上什么都没变(删样本曾经就是这么坑的)。
+/// 录制中拒绝(重建要占嵌入器,且实时 registry 的种子已注入)。
+#[tauri::command]
+async fn move_person_sample(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    from: String,
+    path: String,
+    to: String,
+) -> Result<(), String> {
+    if state.session.lock().unwrap().is_some() {
+        return Err(tr!("录制中不能改样本归属", "Cannot move samples while recording"));
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        if app.state::<AppState>().session.lock().unwrap().is_some() {
+            return Err(tr!("录制中不能改样本归属", "Cannot move samples while recording"));
+        }
+        let store = open_voiceprint_store(&app)?;
+        let origin = sample_origin_ref(&app, &store, std::path::Path::new(&path));
+        store.move_sample(&from, std::path::Path::new(&path), &to).map_err(|e| e.to_string())?;
+        // 文件已搬,页面可立即刷新;重建双方 + 同步会议关联走后台(person_sample_job 事件)。
+        spawn_sample_followup(&app, vec![from.clone(), to.clone()], origin, from, Some(to));
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
     let store = open_voiceprint_store(&app)?;
     let vp = store.load();
+    // 样本↔会议关联要查笔记清单(标题、时间);一次读出全库共用。
+    let notes = notes_dir(&app).map(|d| store::NoteStore::new(d).list()).unwrap_or_default();
     let mut people: Vec<ipc::PersonSummary> = vp
         .people
         .iter()
         .map(|(id, p)| {
             let sample_paths = store.sample_paths_existing(id);
             // 样本录制日期 = 文件 mtime(停止录制时写入,≈该场会议时间);取不到给空串。
-            let sample_dates = sample_paths
+            let sample_mtimes: Vec<Option<chrono::DateTime<chrono::Local>>> = sample_paths
                 .iter()
                 .map(|p| {
                     std::fs::metadata(p)
                         .and_then(|m| m.modified())
-                        .map(|t| chrono::DateTime::<chrono::Local>::from(t).to_rfc3339())
-                        .unwrap_or_default()
+                        .ok()
+                        .map(chrono::DateTime::<chrono::Local>::from)
                 })
+                .collect();
+            let sample_dates = sample_mtimes.iter().map(|t| t.map(|t| t.to_rfc3339()).unwrap_or_default()).collect();
+            let sample_notes = sample_paths
+                .iter()
+                .zip(&sample_mtimes)
+                .map(|(sp, mt)| sample_note_ref(&store, &notes, sp, *mt))
                 .collect();
             ipc::PersonSummary {
                 id: id.clone(),
@@ -8517,6 +8821,7 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
                 sources: p.centroids.keys().cloned().collect(),
                 sample_paths: sample_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
                 sample_dates,
+                sample_notes,
             }
         })
         .collect();
@@ -8579,10 +8884,26 @@ fn suggest_person_merges(app: AppHandle) -> Result<Vec<ipc::PersonMergeSuggestio
 /// 删除声纹库人物的一份录音样本（详情页试听区,录坏/混音的样本可单独删）。
 /// 样本不参与识别（认人靠质心），删除不影响准确率;路径归属校验在 store 层。
 #[tauri::command]
-fn delete_person_sample(app: AppHandle, id: String, path: String) -> Result<(), String> {
-    open_voiceprint_store(&app)?
-        .delete_sample(&id, std::path::Path::new(&path))
-        .map_err(|e| e.to_string())
+async fn delete_person_sample(app: AppHandle, state: State<'_, AppState>, id: String, path: String) -> Result<(), String> {
+    // 录制中拒绝(Codex P1):会话已注入删除前的种子,停录 upsert 会把旧结果写回库,
+    // 删除等于白删;与 move_person_sample 同口径。
+    if state.session.lock().unwrap().is_some() {
+        return Err(tr!("录制中不能删除样本", "Cannot delete samples while recording"));
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        // 进闭包再查一次(Codex 复审 P1):检查到删除之间有毫秒级窗口,开录后再删等于白删。
+        if app.state::<AppState>().session.lock().unwrap().is_some() {
+            return Err(tr!("录制中不能删除样本", "Cannot delete samples while recording"));
+        }
+        let store = open_voiceprint_store(&app)?;
+        let origin = sample_origin_ref(&app, &store, std::path::Path::new(&path));
+        store.delete_sample(&id, std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+        // 文件已删,立即返回让页面响应;重建 + 来源会议解除关联("这段声音不是他")走后台。
+        spawn_sample_followup(&app, vec![id.clone()], origin, id, None);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 改库里人物的显示名：只影响后续会话的种子姓名与笔记侧只读 join，不涉及本场
@@ -8677,63 +8998,25 @@ fn do_merge_person(
     winner: &str,
     origin: &str,
     similarity: Option<f32>,
-    // **带标签的实例**:合并要写质心,标签必须与算这些质心的那份权重同源。此前是
-    // 加载时读一次设置、几秒后落库时再读一次当空间标签,期间切完模型的话,旧嵌入器
-    // 算出的向量会顶着新标签通过门禁,并据此永久删掉超额样本(codex review 实现轮四 P2)。
-    emb: &mut Option<diar::TaggedEmbedder>,
 ) -> Result<String, String> {
     let root = data_root(app).map_err(|e| e.to_string())?;
     let store = store::VoiceprintStore::new(root.clone());
     let loser_had_samples = !store.sample_paths_existing(loser).is_empty();
-    let overflow = store.sample_paths_existing(loser).len()
-        + store.sample_paths_existing(winner).len()
-        > store::MAX_SAMPLES;
-    if overflow && emb.is_none() {
-        // 标签与权重出自同一次设置读取,之后一路带着走。
-        let tag = current_speaker_model(app);
-        match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
-            Ok(e) => *emb = Some(diar::TaggedEmbedder::new(tag, Box::new(e))),
-            // 加载失败不缓存"已尝试":同批后续超限条目会重试加载——模型损坏是罕见态,重试成本可接受,不为它引入毒化标记。
-            Err(e) => eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}"),
-        }
-    }
-    // 模型加载耗秒级:落库前最后一查,「合并中开录」的种子错配窗口收到毫秒级。
-    // apply 逐条调用本函数,等价获得逐条重查。
     if app.state::<AppState>().session.lock().unwrap().is_some() {
         return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
     }
     let now = chrono::Local::now().to_rfc3339();
-    // 先取标签再借出嵌入器(借用检查:后者是可变借用)。
-    // 有嵌入器 → 标签取自它(要写新质心,必须同源)。没有嵌入器 → 这次不算任何向量,
-    // merge_journaled 的契约要求传**库当前标签**;传设置标签的话,换模型重建还没跑完
-    // 的窗口里,一次不超样本上限的普通合并会被门禁误拒(codex review 实现轮五 P2)。
-    let model_tag = emb
-        .as_ref()
-        .map(|e| e.model().to_string())
-        .unwrap_or_else(|| store.load().embedding_model.clone());
+    let model_tag = store.load().embedding_model.clone();
     let journal_id = store
-        .merge_journaled(
-            loser,
-            winner,
-            emb.as_mut().map(|e| e as &mut dyn diar::SpeakerEmbedder),
-            origin,
-            similarity,
-            &now,
-            // 标签取自嵌入器自身。没有嵌入器时不写质心,标签取当前选型即可
-            // (merge_journaled 内部仍会与库比对)。
-            &model_tag,
-        )
+        .merge_journaled(loser, winner, None, origin, similarity, &now, &model_tag)
         .map_err(|e| e.to_string())?;
     if !loser_had_samples {
         match notes_dir(app) {
             Ok(nroot) => match cut_person_sample_from_notes(&nroot, loser) {
                 Some(sample) => {
-                    // 兜底样本走 for_merge 变体:不触发日志失效(是合并动作的一部分)。
                     if let Err(e) = store.append_sample_for_merge(winner, &sample) {
                         eprintln!("合并兜底样本写入失败({loser}->{winner},不影响合并): {e}");
                     }
-                    // 回执卡左栏"合并时的原声":同一段兜底截声也落进本次合并日志的
-                    // loser 快照副本,不然左栏永远"无可试听的快照"。
                     store.write_journal_cut_sample(&journal_id, loser, &sample);
                 }
                 None => eprintln!("合并兜底:未能从笔记音频截到 {loser} 的样本(可能无笔记/无音频)"),
@@ -8741,6 +9024,12 @@ fn do_merge_person(
             Err(e) => eprintln!("合并兜底样本跳过(notes_dir 不可用): {e}"),
         }
     }
+    // 2026-08-29(Codex 复审):合并后 winner 按样本重建,不继承 loser 的旧质心/变体
+    // ——样本是唯一真源,质心是样本的函数。重建失败(模型不可用/另一重建在跑)不
+    // 回滚合并:库里已是 merge_locked 的加权并入兜底,留痕让用户稍后手点重建。
+    // 重建走后台(person_sample_job 事件),合并本身立即返回——合并的正确性不依赖
+    // 重建完成(库里已是加权并入兜底),重建只是把它精确到样本均值。
+    spawn_sample_followup(app, vec![winner.to_string()], None, loser.to_string(), None);
     Ok(journal_id)
 }
 
@@ -8756,17 +9045,16 @@ async fn merge_person(
     if state.session.lock().unwrap().is_some() {
         return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
     }
-    // 重活(样本超限时现场加载声纹模型+逐份嵌入挑选、loser 无样本时扫笔记截声)
+    // 重活(合并后按样本重建声纹要加载模型逐份嵌入、loser 无样本时扫笔记截声)
     // 走 spawn_blocking,别冻主线程——同步命令在 Tauri v2 里跑在主线程,这些秒级
     // 活会冻结整个 WebView。
     tauri::async_runtime::spawn_blocking(move || {
-        let mut emb = None;
         // 异步化后检查与重活之间有秒级窗口(模型加载),落库前再查一次,把
         // 「合并中开录」的种子错配窗口缩到微秒级。
         if app.state::<AppState>().session.lock().unwrap().is_some() {
             return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
         }
-        let journal_id = do_merge_person(&app, &loser, &winner, "manual", None, &mut emb)?;
+        let journal_id = do_merge_person(&app, &loser, &winner, "manual", None)?;
         refresh_qwen_hotwords_cache(&app);
         let root = data_root(&app).map_err(|e| e.to_string())?;
         queue_person_graph_rebuild(&app, root, &tr!("人物合并", "Person merge"))?;
@@ -8782,44 +9070,9 @@ async fn merge_person(
 /// REBUILD_RUNNING 互斥全库重建;隔离中的人物拒绝(拆分流程自会处理)。
 #[tauri::command]
 async fn rebuild_person_voiceprint(app: AppHandle, id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        let root = data_root(&app).map_err(|e| e.to_string())?;
-        let vp_store = store::VoiceprintStore::new(root);
-        let vp = vp_store.load();
-        let Some(resolved) = store::VoiceprintStore::resolve(&vp, &id).map(str::to_string) else {
-            return Err(tr!("声纹库中没有该人物: {id}", "No such person: {id}", id = id));
-        };
-        if vp.people.get(&resolved).is_some_and(|p| p.voiceprint_quarantined) {
-            return Err(tr!(
-                "该人物正被拆分流程隔离,请先完成或撤销拆分",
-                "Person is quarantined by a split; finish or undo it first"
-            ));
-        }
-        {
-            let _ctl = REBUILD_CTL.lock().unwrap();
-            if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
-                return Err(tr!("声纹库重建进行中,稍后再试", "A library rebuild is running; try again later"));
-            }
-        }
-        let r = (|| -> Result<(), String> {
-            let tag = current_speaker_model(&app);
-            let mut e = diar::SherpaEmbedder::new(&speaker_model_path_for(&tag))
-                .map_err(|e| tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e))?;
-            vp_store.rebuild_person_from_samples(&resolved, &mut e, &tag).map_err(|e| e.to_string())
-        })();
-        {
-            let _ctl = REBUILD_CTL.lock().unwrap();
-            REBUILD_RUNNING.store(false, Ordering::SeqCst);
-        }
-        // 嵌入器缓存作废:质心已换血,种子须按新库重取。
-        if r.is_ok() {
-            let st = app.state::<AppState>();
-            *st.embedder_cache.lock().unwrap() = None;
-        }
-        r
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || rebuild_person_blocking(&app, &id))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -8869,22 +9122,19 @@ fn receipt_of(journal: &store::MergeJournal, e: &store::MergeJournalEntry) -> ip
     }
 }
 
-/// 整理·自动归并:strong 档且 loser 未命名且不在拒绝名单的建议逐条落日志后合并,
-/// 其余留给人工。录制中不动库(建议仍只读算出返回,审阅流此时只读浏览)。单条
-/// 失败不挡整批:该条降级人工,eprintln 留痕。
+/// 整理·合并建议(曾名"自动归并")。**2026-08-29 起不再自动落库**:strong 档也只是
+/// 建议,applied 恒空——「确认才入库」(PR#181)之后自动归并是最后一条无人确认就
+/// 改写身份库的路径,P11 事故里 m-P374/m-P448/m-P481 三次自动归并正是把一次误合并
+/// 滚成整档污染的推手(Codex 复审:流程不调 ≠ 代码层禁用)。命令名与返回结构保留,
+/// 前端整理页不用改;录制中同样只读。
 #[tauri::command]
 async fn apply_confident_merges(
     app: AppHandle,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> Result<ipc::ConfidentMergeOutcome, String> {
-    // 录制中检查须在进 spawn_blocking 前同步做完(State 不能进闭包);结果以 bool
-    // 搬进闭包,闭包内按 live 分支——录制中仍要"只读算建议"，不落库。
-    let live = state.session.lock().unwrap().is_some();
-    // 重活(建议计算+样本超限时现场加载声纹模型逐条嵌入挑选、loser 无样本时扫笔记
-    // 截声)走 spawn_blocking,别冻主线程。
     tauri::async_runtime::spawn_blocking(move || {
         let root = data_root(&app).map_err(|e| e.to_string())?;
-        let store = store::VoiceprintStore::new(root.clone());
+        let store = store::VoiceprintStore::new(root);
         let vp = store.load();
         let sugs = store::suggest_merges(&vp);
         let to_ipc = |s: &store::MergeSuggestion| ipc::PersonMergeSuggestion {
@@ -8896,84 +9146,7 @@ async fn apply_confident_merges(
             source: s.source.clone(),
             salience: s.salience,
         };
-        if live {
-            return Ok(ipc::ConfidentMergeOutcome {
-                applied: vec![],
-                remaining: sugs.iter().map(to_ipc).collect(),
-            });
-        }
-        // 异步化后 live 快照与此处之间有秒级窗口(建议计算等重活),进"落库分支"前
-        // 再查一次;命中则和 live 分支同样只读返回 remaining,不报错——自动归并是
-        // 后台增值行为,不该在用户开录时弹出错误。
-        if app.state::<AppState>().session.lock().unwrap().is_some() {
-            return Ok(ipc::ConfidentMergeOutcome {
-                applied: vec![],
-                remaining: sugs.iter().map(to_ipc).collect(),
-            });
-        }
-        let journal = store::MergeJournal::new(root.clone());
-        let deny = journal.auto_denylist();
-        let (autos, manual) = store::confident_picks(&vp, sugs, &deny);
-        let mut remaining: Vec<ipc::PersonMergeSuggestion> = manual.iter().map(to_ipc).collect();
-        let mut applied = Vec::new();
-        let mut merged: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut emb = None;
-        for s in autos {
-            // 撤销/拆回的 deny_auto 可能落在本轮快照之后:每条落库前重读名单,
-            // 用户刚撤销的 pair 不许被同一轮自动归并打回(重读是小文件,廉价)。
-            let deny_now = journal.auto_denylist();
-            let pair = format!("{}>{}", s.loser, s.winner);
-            let rev = format!("{}>{}", s.winner, s.loser);
-            if deny_now.iter().any(|d| d == &pair || d == &rev) {
-                remaining.push(to_ipc(&s));
-                continue;
-            }
-            match do_merge_person(&app, &s.loser, &s.winner, "auto", Some(s.similarity), &mut emb) {
-                Ok(jid) => {
-                    merged.insert(s.loser.clone());
-                    match journal.entry(&jid) {
-                        Ok(e) => applied.push(receipt_of(&journal, &e)),
-                        Err(err) => {
-                            eprintln!("自动归并回执读取失败({jid}): {err}");
-                            // 合并已发生,不能从响应里消失:按建议数据合成兜底回执
-                            // (time 空串;list_merge_receipts 仍是真值源)。方法只要 id,
-                            // 条目读不回也能列副本。
-                            applied.push(ipc::MergeReceipt {
-                                journal_id: jid.clone(),
-                                time: String::new(),
-                                origin: "auto".into(),
-                                loser: s.loser.clone(),
-                                loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
-                                winner: s.winner.clone(),
-                                winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
-                                similarity: Some(s.similarity),
-                                loser_sample_paths: journal
-                                    .sample_copies(&jid, "loser")
-                                    .iter()
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .collect(),
-                                winner_sample_paths: journal
-                                    .sample_copies(&jid, "winner")
-                                    .iter()
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .collect(),
-                                invalid_reason: None,
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("自动归并失败({}->{}),留给人工: {err}", s.loser, s.winner);
-                    remaining.push(to_ipc(&s));
-                }
-            }
-        }
-        // 本轮已被自动合并吃掉的 id 不能再出现在人工建议里(loser 已消失,点了必错)。
-        remaining.retain(|s| !merged.contains(&s.loser) && !merged.contains(&s.winner));
-        if !applied.is_empty() {
-            queue_person_graph_rebuild(&app, root, &tr!("自动归并", "Automatic merge"))?;
-        }
-        Ok(ipc::ConfidentMergeOutcome { applied, remaining })
+        Ok(ipc::ConfidentMergeOutcome { applied: vec![], remaining: sugs.iter().map(to_ipc).collect() })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -10834,6 +11007,7 @@ pub fn run() {
             delete_person,
             rebuild_person_voiceprint,
             delete_person_sample,
+            move_person_sample,
             suggest_person_merges,
             apply_confident_merges,
             mark_speaker_multi,

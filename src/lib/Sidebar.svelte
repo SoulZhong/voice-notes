@@ -18,7 +18,7 @@
     type NoteSummary,
   } from "$lib/notes";
   import { listPeople, type PersonSummary } from "$lib/people";
-  import { filterPeople, sortPeopleAlpha } from "$lib/personPick";
+  import { filterPeople, sortPeopleAlpha, sortPeopleBySamples } from "$lib/personPick";
   import { tidy } from "$lib/tidy.svelte";
   import { buildTidyQueue, splitArchive } from "$lib/tidyQueue";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
@@ -152,7 +152,8 @@
   });
   const peopleFiltered = $derived(filterPeople(peopleSorted, peopleQuery));
   const peopleUnnamed = $derived(peopleFiltered.filter((p) => !p.name));
-  const peopleNamed = $derived(peopleFiltered.filter((p) => p.name));
+  // 已命名组:样本份数降序、最近样本收录时间降序(2026-08-30 用户要求);未命名组仍按编号。
+  const peopleNamed = $derived(sortPeopleBySamples(peopleFiltered.filter((p) => p.name)));
 
   /** 「概览与整理」徽标:待拍板的活(有效回执+建议+同名组+无样本);失效存档不计。 */
   const tidyBadge = $derived(

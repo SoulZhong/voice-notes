@@ -2316,48 +2316,28 @@
         </button>
       </div>
 
-      {#if effectiveView === "refined"}
-        <!-- 修订稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
-             可直接改名/从会议搭子选人:改名同步声纹库,选人采用库中现名。
-             Aing 中禁编辑(管线随后整写 refined.json,后端同款 guard 兜底)。 -->
-        <SpeakerChips
-          speakers={note.speakers}
-          noteId={id}
-          editable={!refining}
-          counts={segCounts}
-          {people}
-          onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId, lastAuditioned[sid]) : undefined}
-          onMarkMulti={canEdit ? runAutoSplit : undefined}
-          onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
-          onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
-          onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
-          previewingId={preview?.sid ?? null}
-          onRenamed={() => {
-            refresh();
-            recording.bumpNotes();
-          }}
-        />
-      {:else}
-        <!-- 原始稿说话人条:改名仍是笔记内本地名;选人关联(写 speakers.json person_id)
-             与修订稿同一面板,录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
-        <SpeakerChips
-          speakers={note.speakers}
-          noteId={id}
-          editable={true}
-          counts={segCounts}
-          people={canEdit ? people : undefined}
-          onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId, lastAuditioned[sid]) : undefined}
-          onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
-          onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
-          onMarkMulti={canEdit ? runAutoSplit : undefined}
-          onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
-          previewingId={preview?.sid ?? null}
-          onRenamed={() => {
-            refresh();
-            recording.bumpNotes();
-          }}
-        />
-      {/if}
+      <!-- 说话人条:修订稿与原始逐字稿同一份 speakers.json、同一套交互,不随视图切换变化
+           (2026-08-28 用户实报:修订稿上不可点、逐字稿上可点)。改名/选人/取消关联
+           只写 speakers.json,Aing 整写的是 aing.json,互不相扰,故 Aing 中照常可编;
+           删除与标记多人后端在 Aing 中拒绝(管线随后整写会引用旧表项),前端同口径隐藏。
+           录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
+      <SpeakerChips
+        speakers={note.speakers}
+        noteId={id}
+        editable={true}
+        counts={segCounts}
+        people={canEdit ? people : undefined}
+        onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId, lastAuditioned[sid]) : undefined}
+        onDelete={canEdit && !refining ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
+        onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
+        onMarkMulti={canEdit && !refining ? runAutoSplit : undefined}
+        onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
+        previewingId={preview?.sid ?? null}
+        onRenamed={() => {
+          refresh();
+          recording.bumpNotes();
+        }}
+      />
 
       {#if autoSplitRunning}
         <div class="banner">

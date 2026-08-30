@@ -204,3 +204,11 @@ export type SourceHealthEvent = {
 export function onSourceHealth(cb: (e: SourceHealthEvent) => void) {
   return listen<SourceHealthEvent>("source_health", (ev) => cb(ev.payload));
 }
+
+/** 样本操作(删除/归到别人/合并)的后台跟进:重建声纹 + 样本↔会议同步。
+    state: running → done | failed;message 失败时是后端文案。person_ids 是涉及的人物。 */
+export type PersonSampleJobEvent = { person_ids: string[]; state: string; message: string };
+export function onPersonSampleJob(cb: (e: PersonSampleJobEvent) => void) {
+  return listen<PersonSampleJobEvent>("person_sample_job", (ev) => cb(ev.payload));
+}
+

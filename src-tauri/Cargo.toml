@@ -183,6 +183,11 @@ path = "src/bin/speaker_loso_eval.rs"
 required-features = ["devtools"]
 
 [[bin]]
+name = "reidentify_eval"
+path = "src/bin/reidentify_eval.rs"
+required-features = ["devtools"]
+
+[[bin]]
 name = "speaker_eval"
 path = "src/bin/speaker_eval.rs"
 required-features = ["devtools"]

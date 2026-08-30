@@ -24,10 +24,22 @@ pub const AUTO_ENROLL_MS: u64 = 10_000;
 pub const MIN_SAMPLE_MS: u64 = 10_000;
 
 /// 每人录音样本上限。样本按会议逐份累积(试听区分"哪场的声音"),合并时双方样本
-/// 合池、按声纹多样性保留(见 merge_with_embedder);超出上限的不再写/合并时按
-/// "保留最不相似的组合"丢弃,防止长期使用无界膨胀(每份 ≤15s 16k s16 ≈ 480KB,
-/// 10 份 ≈ 4.8MB/人封顶)。
-pub const MAX_SAMPLES: usize = 10;
+/// 合池、超额按 select_balanced_recent 保留;超出上限的不再写。
+///
+/// 2026-08-29 由 10 提到 30(用户:"10 份丢了太多长尾")。单均值表示下样本越多均值
+/// 越稳,且不同设备/场景的声音都有机会进均值;存储 30 × ≈480KB ≈ 14MB/人封顶,
+/// 不是问题。真正的代价是重建耗时(每份嵌入几百毫秒),由 EmbedCache 按内容哈希
+/// 缓存兜住——审库时删一份只重算 0 份。
+pub const MAX_SAMPLES: usize = 30;
+
+/// 子质心最少支撑样本数。少于此的簇不成席——一份装错人的样本单独成席就是 8/23
+/// 校准清掉的那根"永久认领触角";3 份同向的错样本概率低得多,且用户审库时更容易
+/// 一起听出来。
+pub const SUB_CENTROID_MIN_SUPPORT: usize = 3;
+/// 子质心聚类的平均连接合并阈值(余弦):两簇均值相似度 ≥ 此值即并簇。同人不同
+/// 设备/场景的样本余弦常落在 0.3~0.6(2026-08-23 量得同人中位 0.44),取 0.55 让
+/// "同一条件"的样本聚在一起、不同条件分开;待 speaker_loso_eval --multi 校准。
+pub const SUB_CENTROID_LINK_THRESHOLD: f32 = 0.55;
 
 /// resolve 跟随 redirects 链的步数上限。merge 已做链条压扁,正常情况下一跳到底;
 /// 这里是纯防御性上限,防止任何异常写入(例如手工改坏文件成环)导致死循环。
@@ -63,6 +75,13 @@ pub struct Person {
     pub centroids: BTreeMap<String, PersonCentroid>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub session_centroids: BTreeMap<String, Vec<PersonCentroid>>,
+    /// 子质心(2026-08-29,多质心匹配):按样本重建时把该人样本按相似度聚成若干簇,
+    /// **支撑样本 ≥ SUB_CENTROID_MIN_SUPPORT 的簇**各留一个归一化均值(count=支撑数)。
+    /// 只在识别方法为 multi_centroid 时成种子席位;与 session_centroids 的区别:
+    /// 后者是"一场一份"的历史堆积(已停写),前者是样本的确定性函数——样本变了
+    /// 重建即重算,没有独立的写入口,所以不会像变体那样被一份脏样本单独劫持。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sub_centroids: BTreeMap<String, Vec<PersonCentroid>>,
     #[serde(default)]
     pub total_ms: u64,
     #[serde(default)]
@@ -278,12 +297,9 @@ impl VoiceprintStore {
     /// redirects 记 loser->winner 且把既有指向 loser 的项一并改指 winner(压扁链条)。
     ///
     /// 录音样本随合并**合池保留**:双方样本合计 ≤ MAX_SAMPLES 时全部保留(loser 的迁入
-    /// winner 空槽);超额时按**声纹多样性**挑保留集——对每份样本算嵌入,farthest-point
-    /// 贪心保留彼此最不相似的 MAX_SAMPLES 份(样本的价值是"这个人听起来的不同样子",
-    /// 留最不相似的组合比按时间/槽位序保留信息量大),winner 侧未入选的也会删。嵌入
-    /// 不可得(embedder=None/模型损坏/文件读失败)的样本排最后按序补位,全部不可得时
-    /// 即退化为旧行为。文件操作 best-effort,失败不回滚已保存的库——样本是试听增值层,
-    /// 库结构一致性优先。
+    /// winner 空槽);超额时按 select_balanced_recent(双方按比例、各留最新)保留,
+    /// winner 侧未入选的也会删(合并日志已有副本)。文件操作 best-effort,失败不回滚
+    /// 已保存的库——样本是试听增值层,库结构一致性优先。
     ///
     /// 调用方必须已持 vp_guard(merge_with_embedder 的薄包装、merge_journaled 的
     /// 快照+合并同锁场景)。
@@ -291,7 +307,9 @@ impl VoiceprintStore {
         &self,
         loser: &str,
         winner: &str,
-        mut embedder: Option<&mut dyn crate::diar::SpeakerEmbedder>,
+        // 2026-08-29 起淘汰不再算嵌入(见样本归并段);参数保留是为了不动几十处
+        // 调用签名,合并后的质心重算由命令层 rebuild_person_from_samples 负责。
+        _embedder: Option<&mut dyn crate::diar::SpeakerEmbedder>,
     ) -> anyhow::Result<()> {
         let mut vp = self.load();
         if loser == winner {
@@ -301,30 +319,13 @@ impl VoiceprintStore {
         {
             let winner_person =
                 vp.people.get_mut(winner).ok_or_else(|| anyhow::anyhow!("未知人物: {winner}"))?;
+            // 2026-08-29(Codex 复审):loser 的质心只做加权并入主质心,**不再降级成
+            // winner 的会话变体**,loser 自己的变体也不带过来——变体在 max 匹配下是
+            // 独立的"认领触角",合并进来的若是错人(P11 事故正是一串误合并),脏质心
+            // 就永久活在 winner 档案里。命令层合并后会按样本重建 winner,这里的加权
+            // 并入只是"重建不可用"时的兜底。
             for (source, lc) in &loser_person.centroids {
                 merge_centroid(winner_person, source, lc.clone());
-                // loser 主质心降级为 winner 的会话变体:合并常见于"同一人不同状态被
-                // 拆开",被并一方的状态画像正是要保留可匹配的信息。
-                let mut v = lc.clone();
-                if v.seen.is_empty() {
-                    v.seen = loser_person.last_seen.clone();
-                }
-                winner_person.session_centroids.entry(source.clone()).or_default().push(v);
-            }
-            for (source, list) in &loser_person.session_centroids {
-                winner_person
-                    .session_centroids
-                    .entry(source.clone())
-                    .or_default()
-                    .extend(list.iter().cloned());
-            }
-            // 变体归序截容:seen 升序(空串=最老的历史数据沉底优先淘汰),超限挤最旧。
-            for list in winner_person.session_centroids.values_mut() {
-                list.sort_by(|a, b| a.seen.cmp(&b.seen));
-                let overflow = list.len().saturating_sub(SESSION_CENTROIDS_MAX);
-                if overflow > 0 {
-                    list.drain(0..overflow);
-                }
             }
             winner_person.total_ms += loser_person.total_ms;
             if winner_person.name.is_empty() && !loser_person.name.is_empty() {
@@ -350,17 +351,13 @@ impl VoiceprintStore {
         let l_paths = self.sample_paths_existing(loser);
         let mut keep_loser: Vec<PathBuf> = l_paths.clone();
         if w_paths.len() + l_paths.len() > MAX_SAMPLES {
-            // 超额:全体候选(winner 在前,loser 在后——嵌入全不可得时的兜底序即旧行为)
-            // 算嵌入,按多样性选保留集。
-            let all: Vec<&PathBuf> = w_paths.iter().chain(l_paths.iter()).collect();
-            let embs: Vec<Option<Vec<f32>>> = all
-                .iter()
-                .map(|p| embedder.as_deref_mut().and_then(|e| embed_wav_sample(p, e)))
-                .collect();
-            let keep = select_diverse(&embs, MAX_SAMPLES);
-            // winner 侧未入选的就地删(腾出槽位),loser 侧只迁移入选的。
-            for (i, p) in w_paths.iter().enumerate() {
-                if !keep.contains(&i) {
+            // 超额:按「双方按比例、各取最新」保留(select_balanced_recent)。曾按声纹
+            // 多样性(farthest-point)挑"彼此最不像"的——那等于主动保留错人/噪声样本
+            // (2026-08-29 Codex 复审定性为 bug)。被淘汰的文件已随合并日志快照留副本,
+            // 撤销可还原,这里删的是槽位不是证据。
+            let (keep_w, keep_l) = select_balanced_recent(&w_paths, &l_paths, MAX_SAMPLES);
+            for p in &w_paths {
+                if !keep_w.contains(p) {
                     if let Err(e) = std::fs::remove_file(p) {
                         eprintln!("声纹样本淘汰失败({winner},不影响库): {e}");
                     } else {
@@ -368,14 +365,8 @@ impl VoiceprintStore {
                     }
                 }
             }
-            keep_loser = l_paths
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| keep.contains(&(w_paths.len() + i)))
-                .map(|(_, p)| p.clone())
-                .collect();
             for lp in &l_paths {
-                if !keep_loser.contains(lp) {
+                if !keep_l.contains(lp) {
                     if let Err(e) = std::fs::remove_file(lp) {
                         eprintln!("声纹样本淘汰失败({loser},不影响库): {e}");
                     } else {
@@ -383,6 +374,7 @@ impl VoiceprintStore {
                     }
                 }
             }
+            keep_loser = keep_l;
         }
         // 迁移保留的 loser 样本进 winner 空槽(容量经上面淘汰后必然足够)。
         for lp in keep_loser {
@@ -734,6 +726,10 @@ impl VoiceprintStore {
         for sample in self.sample_paths_existing(id) {
             if let Err(e) = std::fs::remove_file(&sample) {
                 eprintln!("声纹样本删除失败({id},不影响库): {e}");
+            } else {
+                // 溯源 receipt 一并清(Codex P2):否则留一堆指向不存在文件的条目,
+                // 槽位被别人复用后还会把新文件错标成"来自那篇"。
+                super::sample_trace::on_sample_deleted(&self.root, &sample);
             }
         }
         Ok(())
@@ -1050,6 +1046,7 @@ impl VoiceprintStore {
         let mut vp = self.load();
         let ids: Vec<String> = vp.people.keys().cloned().collect();
         let mut rebuilt = 0usize;
+        let mut cache = EmbedCache::load(&self.root, model_tag);
         for id in ids {
             if vp.people.get(&id).is_some_and(|p| p.voiceprint_quarantined) {
                 // 隔离人物不重算,只清空:他的样本可能就是混杂音频,重算等于把污染
@@ -1057,15 +1054,18 @@ impl VoiceprintStore {
                 let person = vp.people.get_mut(&id).expect("刚枚举的 key");
                 person.centroids.clear();
                 person.session_centroids.clear();
+                person.sub_centroids.clear();
                 continue;
             }
             let embs: Vec<Vec<f32>> = self
                 .sample_paths_existing(&id)
                 .iter()
-                .filter_map(|p| embed_wav_sample(p, e))
+                .filter_map(|p| cache.get_or_embed(p, e))
                 .collect();
+            let subs = cluster_sub_centroids(&embs);
             let person = vp.people.get_mut(&id).expect("刚枚举的 key");
             person.session_centroids.clear();
+            person.sub_centroids.clear();
             if embs.is_empty() {
                 person.centroids.clear();
                 continue;
@@ -1103,9 +1103,17 @@ impl VoiceprintStore {
                     .centroids
                     .insert(src.clone(), PersonCentroid { vec: mean.clone(), count, seen: String::new() });
             }
+            if !subs.is_empty() {
+                let list: Vec<PersonCentroid> =
+                    subs.iter().map(|(v, c)| PersonCentroid { vec: v.clone(), count: *c, seen: String::new() }).collect();
+                for src in person.centroids.keys().cloned().collect::<Vec<_>>() {
+                    person.sub_centroids.insert(src, list.clone());
+                }
+            }
             rebuilt += 1;
         }
         vp.embedding_model = model_tag.to_string();
+        cache.save();
         self.save(&vp)?;
         super::merge_journal::MergeJournal::new(self.root.clone())
             .invalidate_all("声纹库已按新模型重建");
@@ -1150,8 +1158,9 @@ impl VoiceprintStore {
         let paths = self.sample_paths_existing(id);
         let mut embs: Vec<Vec<f32>> = Vec::new();
         let mut total_ms = 0u64;
+        let mut cache = EmbedCache::load(&self.root, model);
         for p in &paths {
-            if let Some(v) = embed_wav_sample(p, e) {
+            if let Some(v) = cache.get_or_embed(p, e) {
                 embs.push(v);
             }
             if let Ok(r) = hound::WavReader::open(p) {
@@ -1161,9 +1170,12 @@ impl VoiceprintStore {
                 }
             }
         }
+        cache.save();
+        let subs = cluster_sub_centroids(&embs);
         let person = vp.people.get_mut(id).expect("上面已校验存在");
         person.session_centroids.clear();
         person.centroids.clear();
+        person.sub_centroids.clear();
         person.total_ms = total_ms;
         person.last_seen = String::new();
         if !embs.is_empty() {
@@ -1184,10 +1196,70 @@ impl VoiceprintStore {
                 "mic".into(),
                 PersonCentroid { vec: mean, count, seen: String::new() },
             );
+            if !subs.is_empty() {
+                person.sub_centroids.insert(
+                    "mic".into(),
+                    subs.iter().map(|(v, c)| PersonCentroid { vec: v.clone(), count: *c, seen: String::new() }).collect(),
+                );
+            }
         }
         self.save(&vp)?;
         journal.invalidate(&[id], "已退回样本基线重算", None);
         Ok(())
+    }
+
+    /// 把某人的一份录音样本改归属到另一人(试听纠错:样本装错人了)。文件搬进对方
+    /// 首个空槽,溯源同步;双方的合并回执作废。**不动质心**——调用方(命令层)随后
+    /// 按样本重建双方,样本才是真相。持 vp_guard 与 merge/delete 串行。
+    /// 返回落地后的新路径。对方满员(MAX_SAMPLES)拒绝而非静默丢弃:用户是来救
+    /// 一份样本的,不是来删它的。
+    /// 已知缺口(Codex P2,暂不做):rename 与溯源更新之间没有 WAL,进程恰在其间崩溃会留下
+    /// "文件已搬、receipt 仍指旧路径"——后果只是该样本退化为无溯源(按时间推断),不丢文件。
+    pub fn move_sample(&self, from: &str, path: &std::path::Path, to: &str) -> anyhow::Result<PathBuf> {
+        let _guard = vp_guard();
+        let vp = self.load();
+        let Some(from) = Self::resolve(&vp, from).map(str::to_string) else {
+            anyhow::bail!("未知人物: {from}");
+        };
+        let Some(to) = Self::resolve(&vp, to).map(str::to_string) else {
+            anyhow::bail!("未知人物: {to}");
+        };
+        anyhow::ensure!(from != to, "样本已经属于该人物");
+        if !self.sample_paths_existing(&from).iter().any(|p| p == path) {
+            anyhow::bail!("不是该人物的样本文件");
+        }
+        let Some(dest) = self.next_free_sample_slot(&to) else {
+            anyhow::bail!("对方样本已满({MAX_SAMPLES} 份),先删掉对方一份再归入");
+        };
+        std::fs::rename(path, &dest)?;
+        super::sample_trace::on_sample_moved(&self.root, path, &dest, &to);
+        self.journal_invalidate(&[&from, &to], "此人样本随后有变动");
+        Ok(dest)
+    }
+
+    /// 某人名下、溯源到某场某簇的现存样本文件(样本↔会议双向同步用:笔记里把说话人
+    /// 改派/解除时,旧人从那簇截的样本要跟着退掉)。只读不加锁。
+    pub fn samples_traced_to(&self, person: &str, note_id: &str, cluster_id: &str) -> Vec<PathBuf> {
+        let resolved = Self::resolve(&self.load(), person).map(str::to_string);
+        super::sample_trace::load(&self.root)
+            .receipts
+            .into_iter()
+            .filter(|r| r.note_id == note_id && r.cluster_id == cluster_id)
+            .filter(|r| Some(&r.person_id) == resolved.as_ref() || r.person_id == person)
+            .map(|r| self.root.join(r.path))
+            .filter(|p| p.exists())
+            .collect()
+    }
+
+    /// 样本文件 → 溯源 receipt(note_id, cluster_id)。无溯源(2026-08-20 之前写下的
+    /// 老样本)返回 None,由调用方按时间推断。只读不加锁。
+    pub fn sample_origin(&self, path: &std::path::Path) -> Option<(String, String)> {
+        let rel = path.strip_prefix(&self.root).ok()?.to_string_lossy().replace('\\', "/");
+        super::sample_trace::load(&self.root)
+            .receipts
+            .into_iter()
+            .find(|r| r.path == rel)
+            .map(|r| (r.note_id, r.cluster_id))
     }
 
     /// 库内「无录音样本」的人数——切换嵌入模型前供前端预告:这些人 rebuild_for_model
@@ -1307,7 +1379,6 @@ impl VoiceprintStore {
                 merge_centroid(person, &source, incoming);
                 person.total_ms += snap.total_ms;
                 person.last_seen = now.to_string();
-                push_session_centroid(person, &source, &snap.centroid, snap.count.max(1), snap.total_ms, now);
                 push_receipt(&snap.id, &resolved, &source, snap.count.max(1), snap.total_ms, false, &snap.centroid);
                 touched.push(resolved.clone());
             } else if snap.total_ms >= AUTO_ENROLL_MS && !snap.centroid.is_empty() {
@@ -1318,16 +1389,16 @@ impl VoiceprintStore {
                     source.clone(),
                     PersonCentroid { vec: snap.centroid.clone(), count: snap.count.max(1), seen: String::new() },
                 );
-                let mut person = Person {
+                let person = Person {
                     name: String::new(),
                     centroids,
                     session_centroids: BTreeMap::new(),
+                sub_centroids: BTreeMap::new(),
                     total_ms: snap.total_ms,
                     last_seen: now.to_string(),
                     emails: Vec::new(),
                     voiceprint_quarantined: false,
                 };
-                push_session_centroid(&mut person, &source, &snap.centroid, snap.count.max(1), snap.total_ms, now);
                 vp.people.insert(id.clone(), person);
                 push_receipt(&snap.id, &id, &source, snap.count.max(1), snap.total_ms, true, &snap.centroid);
                 new_links.insert(snap.id.clone(), id);
@@ -1408,7 +1479,6 @@ impl VoiceprintStore {
                 PersonCentroid { vec: centroid.clone(), count: (*count).max(1), seen: String::new() },
             );
             person.total_ms += total_ms;
-            push_session_centroid(person, source, centroid, (*count).max(1), *total_ms, now);
         }
         person.last_seen = now.to_string();
         let person_after = serde_json::to_string(person)?;
@@ -1432,6 +1502,7 @@ impl VoiceprintStore {
                 name: name.to_string(),
                 centroids: BTreeMap::new(),
                 session_centroids: BTreeMap::new(),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 0,
                 last_seen: now.to_string(),
                 emails: Vec::new(),
@@ -1536,25 +1607,6 @@ pub struct FeedbackApplied {
     pub person_after: String,
 }
 
-/// 会话质心入环:本场净增量够料(≥SESSION_CENTROID_MIN_MS)才记为一个"状态代表";
-/// Vec 序即时间序,超限挤最旧。
-fn push_session_centroid(
-    person: &mut Person,
-    source: &str,
-    vec: &[f32],
-    count: u64,
-    total_ms: u64,
-    now: &str,
-) {
-    if total_ms < SESSION_CENTROID_MIN_MS || vec.is_empty() {
-        return;
-    }
-    let list = person.session_centroids.entry(source.to_string()).or_default();
-    list.push(PersonCentroid { vec: vec.to_vec(), count, seen: now.to_string() });
-    if list.len() > SESSION_CENTROIDS_MAX {
-        list.remove(0);
-    }
-}
 
 /// 已封禁的样本内容 hash(sha256 hex)。打标流程删除混杂样本时写入;此后任何
 /// 恢复路径(合并日志把样本副本拷回、撤销回放)遇到同 hash 的文件一律跳过——
@@ -1588,10 +1640,28 @@ pub fn sample_content_hash(path: &std::path::Path) -> Option<String> {
     Some(hex::encode(Sha256::digest(&bytes)))
 }
 
-/// 声纹库 → 开录/Aing 种子(纯函数):每人每信道的主质心 + 各会话质心各成一个种子
-/// 簇——同一个人不同状态各有代表向量,任一被命中即认出此人(匹配取 max 的簇级
-/// 实现,registry 本就支持同 person 多种子簇)。已被合并/悬空引用剔除。
+/// 声纹库 → 开录/Aing 种子(纯函数):每人每信道**只取主质心**。已被合并/悬空引用剔除。
+///
+/// 2026-08-29(Codex 复审):此前会话变体也各成一席、取 max 命中——但变体的写入口
+/// (入库/回灌/合并)已全部停掉,只剩历史数据;若还消费它们,"样本重建=单均值"只在
+/// 重建那一刻成立,用几天又漂回多变体。生产只认主质心,变体字段留给撤销快照与旧
+/// 表示评测(seed_clusters_with_variants)。
 pub fn seed_clusters(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster> {
+    seed_clusters_inner(vp, false, false)
+}
+
+/// 多质心匹配(识别方法 multi_centroid):主质心 + 各子质心各一席(同人取 max)。
+/// 子质心是样本的确定性函数且要求 ≥3 份支撑,见 Person::sub_centroids。
+pub fn seed_clusters_multi(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster> {
+    seed_clusters_inner(vp, false, true)
+}
+
+/// 旧表示(主质心 + 会话变体各一席),**仅供评测工具对照**,生产不用。
+pub fn seed_clusters_with_variants(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster> {
+    seed_clusters_inner(vp, true, false)
+}
+
+fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool, with_sub: bool) -> Vec<crate::diar::registry::SeedCluster> {
     let mut seeds = Vec::new();
     for (id, person) in &vp.people {
         if VoiceprintStore::resolve(vp, id) != Some(id.as_str()) {
@@ -1609,6 +1679,22 @@ pub fn seed_clusters(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster
                 source: src.clone(),
             });
         }
+        if with_sub {
+            for (src, list) in &person.sub_centroids {
+                for c in list {
+                    seeds.push(crate::diar::registry::SeedCluster {
+                        person: id.clone(),
+                        name: person.name.clone(),
+                        centroid: c.vec.clone(),
+                        count: c.count,
+                        source: src.clone(),
+                    });
+                }
+            }
+        }
+        if !with_variants {
+            continue;
+        }
         for (src, list) in &person.session_centroids {
             for c in list {
                 seeds.push(crate::diar::registry::SeedCluster {
@@ -1624,69 +1710,47 @@ pub fn seed_clusters(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster
     seeds
 }
 
-/// 样本保留集选择:给定各样本的嵌入(None=取不到),容量 k,返回保留下标(升序)。
-/// 原则=最大化两两不相似(farthest-point 贪心):种子取相似度最低的一对,之后每轮
-/// 选"与已选集合的最大相似度最小"者。嵌入缺失的样本排最后按原序补位——能比对的
-/// 优先按多样性选,比不了的听天由命;全部缺失时退化为按原序取前 k(=旧行为)。
-pub(crate) fn select_diverse(embs: &[Option<Vec<f32>>], k: usize) -> Vec<usize> {
-    let n = embs.len();
-    if n <= k {
-        return (0..n).collect();
+/// 合并超额时的样本保留集:双方按份数比例分配容量(少的一方至少 2 份,只要它有),
+/// 各自按文件时间取最新。返回 (winner 保留, loser 保留)。
+///
+/// 为什么不按声纹多样性:合并前的样本没有可信度标记,"彼此最不像"优先保留的正是
+/// 错人/噪声;为什么不"谁像均值留谁":合并的典型场景是同一人换了设备被拆成两档,
+/// 少数派(loser)恰是新条件,按共识淘汰会把合并想加进来的东西删掉。按比例+最新
+/// 是两者之间最不需要额外信息的取舍;等样本带上确认/条件元数据再做分层保留。
+pub(crate) fn select_balanced_recent(
+    winner: &[PathBuf],
+    loser: &[PathBuf],
+    cap: usize,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let total = winner.len() + loser.len();
+    if total <= cap {
+        return (winner.to_vec(), loser.to_vec());
     }
-    let unit: Vec<Option<Vec<f32>>> =
-        embs.iter().map(|e| e.as_ref().and_then(|v| normalize(v))).collect();
-    let valid: Vec<usize> = (0..n).filter(|&i| unit[i].is_some()).collect();
-    let mut picked: Vec<usize> = Vec::new();
-
-    if valid.len() >= 2 {
-        let sim = |a: usize, b: usize| -> f32 {
-            let (x, y) = (unit[a].as_ref().unwrap(), unit[b].as_ref().unwrap());
-            x.iter().zip(y).map(|(p, q)| p * q).sum()
-        };
-        // 种子:最不相似的一对(平手取下标序,保证确定性)。
-        let (mut si, mut sj, mut smin) = (valid[0], valid[1], f32::INFINITY);
-        for (ai, &a) in valid.iter().enumerate() {
-            for &b in &valid[ai + 1..] {
-                let s = sim(a, b);
-                if s < smin {
-                    (si, sj, smin) = (a, b, s);
-                }
-            }
-        }
-        picked.push(si);
-        if picked.len() < k {
-            picked.push(sj);
-        }
-        // 贪心扩:每轮加入"与已选的最大相似度最小"者。
-        while picked.len() < k {
-            let cand = valid
-                .iter()
-                .filter(|i| !picked.contains(i))
-                .min_by(|&&a, &&b| {
-                    let ma = picked.iter().map(|&p| sim(a, p)).fold(f32::NEG_INFINITY, f32::max);
-                    let mb = picked.iter().map(|&p| sim(b, p)).fold(f32::NEG_INFINITY, f32::max);
-                    ma.total_cmp(&mb)
-                })
-                .copied();
-            match cand {
-                Some(c) => picked.push(c),
-                None => break, // 有效样本用尽,余量给无嵌入的补
-            }
-        }
-    } else if valid.len() == 1 {
-        picked.push(valid[0]);
+    let mut lq = if loser.is_empty() { 0 } else { (cap * loser.len() + total / 2) / total };
+    if !loser.is_empty() {
+        lq = lq.max(2.min(loser.len())).min(loser.len());
     }
-    // 无嵌入的按原序补满容量。
-    for i in 0..n {
-        if picked.len() >= k {
-            break;
-        }
-        if unit[i].is_none() && !picked.contains(&i) {
-            picked.push(i);
-        }
+    let mut wq = cap.saturating_sub(lq).min(winner.len());
+    if wq + lq < cap {
+        lq = (cap - wq).min(loser.len());
+        wq = cap.saturating_sub(lq).min(winner.len());
     }
-    picked.sort_unstable();
-    picked
+    let newest = |paths: &[PathBuf], n: usize| -> Vec<PathBuf> {
+        let mut v: Vec<(std::time::SystemTime, usize, PathBuf)> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let t = std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                (t, i, p.clone())
+            })
+            .collect();
+        // 最新在前;同时刻按槽位序保先到。
+        v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut out: Vec<PathBuf> = v.into_iter().take(n).map(|x| x.2).collect();
+        out.sort_by_key(|p| paths.iter().position(|q| q == p));
+        out
+    };
+    (newest(winner, wq), newest(loser, lq))
 }
 
 /// 嵌入前响度归一的目标 RMS。样本横跨不同增益时代(输入音量修复前后/AGC 演进),
@@ -1704,6 +1768,126 @@ pub(crate) fn normalize_loudness(samples: &mut [f32]) {
     let scale = (EMBED_TARGET_RMS / rms).min(0.99 / peak.max(1e-6));
     for x in samples.iter_mut() {
         *x *= scale;
+    }
+}
+
+/// 把一个人的样本嵌入(已归一化)按平均连接层次聚类成子质心。返回支撑数 ≥
+/// SUB_CENTROID_MIN_SUPPORT 的簇 (归一化均值, 支撑数),按支撑数降序;若全部样本
+/// 聚成一个簇(等于主质心)则返回空——子质心只在"确实分出了不同条件"时才有意义。
+pub fn cluster_sub_centroids(embs: &[Vec<f32>]) -> Vec<(Vec<f32>, u64)> {
+    let n = embs.len();
+    if n < SUB_CENTROID_MIN_SUPPORT {
+        return Vec::new();
+    }
+    let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+    // 簇 = (成员下标, 未归一化的和向量)
+    let mut clusters: Vec<(Vec<usize>, Vec<f32>)> = embs.iter().enumerate().map(|(i, v)| (vec![i], v.clone())).collect();
+    loop {
+        let mut best: Option<(usize, usize, f32)> = None;
+        for i in 0..clusters.len() {
+            let ui = normalize(&clusters[i].1);
+            for j in (i + 1)..clusters.len() {
+                let uj = normalize(&clusters[j].1);
+                if let (Some(a), Some(b)) = (&ui, &uj) {
+                    let sim = dot(a, b);
+                    if sim >= SUB_CENTROID_LINK_THRESHOLD && best.map_or(true, |(_, _, s)| sim > s) {
+                        best = Some((i, j, sim));
+                    }
+                }
+            }
+        }
+        let Some((i, j, _)) = best else { break };
+        let (mj, sj) = clusters.remove(j);
+        clusters[i].0.extend(mj);
+        for (acc, x) in clusters[i].1.iter_mut().zip(&sj) {
+            *acc += x;
+        }
+    }
+    if clusters.len() <= 1 {
+        return Vec::new();
+    }
+    let mut out: Vec<(Vec<f32>, u64)> = clusters
+        .into_iter()
+        .filter(|(m, _)| m.len() >= SUB_CENTROID_MIN_SUPPORT)
+        .filter_map(|(m, sum)| normalize(&sum).map(|u| (u, m.len() as u64)))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
+/// 样本嵌入缓存:key = 样本文件内容 sha256,value = 归一化嵌入;整文件绑定一个模型
+/// 标签,换模型即整体作废。放 `voiceprints/.embed_cache.json`,纯加速层——缺失/损坏
+/// 等于全部重算,不影响正确性。为什么要它:MAX_SAMPLES 提到 30 后,每删/搬一份
+/// 样本都按样本重建,30 份 × 几百毫秒一次就是十几秒;按内容哈希缓存后只算新样本。
+struct EmbedCache {
+    path: PathBuf,
+    model: String,
+    entries: BTreeMap<String, Vec<f32>>,
+    dirty: bool,
+    /// 本次会话命中/写入过的 hash:超限收缩时只留这些(Codex P2:只增不删会无限长)。
+    touched: std::collections::BTreeSet<String>,
+}
+
+/// 缓存条目上限:MAX_SAMPLES × 200 人量级的 3 倍余量;超过即只保留本次触碰过的。
+const EMBED_CACHE_MAX_ENTRIES: usize = 20_000;
+
+#[derive(Serialize, Deserialize, Default)]
+struct EmbedCacheFile {
+    model: String,
+    entries: BTreeMap<String, Vec<f32>>,
+}
+
+impl EmbedCache {
+    fn load(root: &std::path::Path, model: &str) -> Self {
+        let path = root.join("voiceprints").join(".embed_cache.json");
+        let file: EmbedCacheFile = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let entries = if file.model == model { file.entries } else { BTreeMap::new() };
+        Self { path, model: model.to_string(), entries, dirty: false, touched: Default::default() }
+    }
+
+    /// 命中即返回;未命中则嵌入并记入(嵌入失败不记,下次再试)。
+    fn get_or_embed(&mut self, p: &std::path::Path, e: &mut dyn crate::diar::SpeakerEmbedder) -> Option<Vec<f32>> {
+        let hash = sample_content_hash(p)?;
+        if let Some(v) = self.entries.get(&hash) {
+            self.touched.insert(hash);
+            return Some(v.clone());
+        }
+        let v = embed_wav_sample(p, e)?; // 失败不进 touched/entries,下次再试
+        self.touched.insert(hash.clone());
+        self.entries.insert(hash, v.clone());
+        self.dirty = true;
+        Some(v)
+    }
+
+    /// best-effort 落盘(原子写);失败只打日志——下次重建多算几份而已。
+    fn save(&mut self) {
+        if self.entries.len() > EMBED_CACHE_MAX_ENTRIES {
+            let touched = std::mem::take(&mut self.touched);
+            self.entries.retain(|h, _| touched.contains(h));
+            if self.entries.len() > EMBED_CACHE_MAX_ENTRIES {
+                self.entries.clear(); // 触碰集本身就超限:整体作废,下次全算(缓存只是加速层)
+            }
+            self.dirty = true;
+        }
+        if !self.dirty {
+            return;
+        }
+        let file = EmbedCacheFile { model: self.model.clone(), entries: self.entries.clone() };
+        let tmp = self.path.with_extension("json.tmp");
+        let r = (|| -> anyhow::Result<()> {
+            if let Some(d) = self.path.parent() {
+                std::fs::create_dir_all(d)?;
+            }
+            std::fs::write(&tmp, serde_json::to_string(&file)?)?;
+            std::fs::rename(&tmp, &self.path)?;
+            Ok(())
+        })();
+        if let Err(err) = r {
+            eprintln!("样本嵌入缓存落盘失败(不影响库,下次重算): {err}");
+        }
     }
 }
 
@@ -2603,32 +2787,9 @@ mod tests {
         assert!((silent[0] - 1e-5).abs() < 1e-9);
     }
 
+    /// 2026-08-29:入库/回灌/合并都不再写会话变体——档案就是一个主质心。
     #[test]
-    fn upsert_records_session_centroids_with_gate_and_ring_cap() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = VoiceprintStore::new(tmp.path().to_path_buf());
-        let links = store
-            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t0", MODEL)
-            .unwrap();
-        let pid = links["S1"].clone();
-        assert_eq!(store.load().people[&pid].session_centroids["mic"].len(), 1, "入库场即第一份变体");
-
-        // 净增量 <10s 的场不记变体;≥10s 的记,环形上限 5(挤最旧)。
-        store.upsert_from_session(&[snap("Sx", vec![0.9, 0.1], 2, &["mic"], Some(&pid), 5_000)], "t-short", MODEL).unwrap();
-        assert_eq!(store.load().people[&pid].session_centroids["mic"].len(), 1, "短场不记");
-        for i in 0..6 {
-            store
-                .upsert_from_session(&[snap("Sx", vec![1.0, i as f32 * 0.1], 3, &["mic"], Some(&pid), 12_000)], &format!("t{}", i + 1), MODEL)
-                .unwrap();
-        }
-        let list = &store.load().people[&pid].session_centroids["mic"];
-        assert_eq!(list.len(), SESSION_CENTROIDS_MAX);
-        assert_eq!(list[0].seen, "t2", "最旧的(t0/t1)被挤出");
-        assert_eq!(list.last().unwrap().seen, "t6");
-    }
-
-    #[test]
-    fn merge_demotes_loser_main_centroid_to_winner_variant() {
+    fn upsert_and_merge_never_write_session_variants() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let links = store
@@ -2637,24 +2798,30 @@ mod tests {
                     snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
                     snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
                 ],
-                "t1",
-            MODEL,
+                "t0",
+                MODEL,
             )
             .unwrap();
-        let (loser, winner) = (links["S1"].clone(), links["S2"].clone());
-        store.merge(&loser, &winner).unwrap();
-        let vp = store.load();
-        let variants = &vp.people[&winner].session_centroids["mic"];
-        // winner 自己的入库变体 + loser 的入库变体 + loser 主质心降级 = 3
-        assert_eq!(variants.len(), 3, "{variants:?}");
-        assert!(
-            variants.iter().any(|v| { let u = normalize(&v.vec).unwrap(); u[0] > 0.99 }),
-            "loser 的状态向量([1,0])必须以变体形式保留"
-        );
+        let (a, b) = (links["S1"].clone(), links["S2"].clone());
+        for i in 0..3 {
+            store
+                .upsert_from_session(&[snap("Sx", vec![1.0, i as f32 * 0.1], 3, &["mic"], Some(&a), 12_000)], &format!("t{}", i + 1), MODEL)
+                .unwrap();
+        }
+        assert!(store.load().people[&a].session_centroids.is_empty(), "入库不写变体");
+        store
+            .reinforce_feedback(&a, &[("mic".into(), vec![0.9, 0.1], 4, 20_000)], "t9", MODEL)
+            .unwrap();
+        assert!(store.load().people[&a].session_centroids.is_empty(), "回灌不写变体");
+        store.merge(&a, &b).unwrap();
+        let w = &store.load().people[&b];
+        assert!(w.session_centroids.is_empty(), "合并不把 loser 质心降级成变体");
+        let u = normalize(&w.centroids["mic"].vec).unwrap();
+        assert!(u[0] > 0.0 && u[1] > 0.0, "loser 主质心以加权并入方式进入主质心(兜底): {u:?}");
     }
 
     #[test]
-    fn seed_clusters_include_session_variants_and_skip_dangling() {
+    fn seed_clusters_take_main_centroid_only_and_skip_dangling() {
         let mut vp = Voiceprints::default();
         let pc = |x: f32, y: f32| PersonCentroid { vec: vec![x, y], count: 5, seen: "t".into() };
         vp.people.insert(
@@ -2663,6 +2830,7 @@ mod tests {
                 name: "张三".into(),
                 centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0))]),
                 session_centroids: BTreeMap::from([("mic".to_string(), vec![pc(0.0, 1.0), pc(0.7, 0.7)])]),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 60_000,
                 last_seen: "t".into(),
                 emails: Vec::new(),
@@ -2671,12 +2839,14 @@ mod tests {
         );
         vp.redirects.insert("P2".into(), "P1".into()); // 悬空/重定向不产种子
         let seeds = seed_clusters(&vp);
-        assert_eq!(seeds.len(), 3, "主质心 1 + 变体 2");
+        assert_eq!(seeds.len(), 1, "生产种子只取主质心,历史变体不再成席");
         assert!(seeds.iter().all(|s| s.person == "P1" && s.name == "张三"));
+        assert_eq!(seed_clusters_with_variants(&vp).len(), 3, "旧表示(评测用)仍是主质心 1 + 变体 2");
     }
 
     /// 跨信道种子只走归一化通道(Task 2)的前提:种子簇要知道自己质心来自哪个
-    /// 信道。P1 有 mic 主质心 + system 会话变体 → 两个种子各带各的信道来源。
+    /// 信道。P1 有 mic 与 system 两个主质心 → 两个种子各带各的信道来源
+    /// (2026-08-29 起会话变体不成席,信道语义只经主质心表达)。
     #[test]
     fn seed_clusters_carry_channel_source() {
         let mut vp = Voiceprints::default();
@@ -2685,8 +2855,9 @@ mod tests {
             "P1".into(),
             Person {
                 name: "张三".into(),
-                centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0))]),
-                session_centroids: BTreeMap::from([("system".to_string(), vec![pc(0.0, 1.0)])]),
+                centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0)), ("system".to_string(), pc(0.0, 1.0))]),
+                session_centroids: BTreeMap::new(),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 60_000,
                 last_seen: "t".into(),
                 emails: Vec::new(),
@@ -2710,6 +2881,7 @@ mod tests {
                 name: "张三".into(),
                 centroids: BTreeMap::from([("mic".to_string(), pc(0.0, 1.0))]),
                 session_centroids: BTreeMap::from([("mic".to_string(), vec![pc(1.0, 0.0)])]),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 60_000,
                 last_seen: "t".into(),
                 emails: Vec::new(),
@@ -2721,6 +2893,7 @@ mod tests {
             Person {
                 name: String::new(),
                 centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0))]),
+                sub_centroids: BTreeMap::new(),
                 total_ms: 12_000,
                 last_seen: "t".into(),
                 ..Default::default()
@@ -2801,6 +2974,68 @@ mod tests {
         let c = &vp.people[&pc];
         assert_eq!(c.name, "无样本的人", "无样本者 people 记录(名字)完整保留");
         assert!(c.centroids.is_empty(), "无样本者质心已清空(新空间无从匹配)");
+    }
+
+    /// 样本改归属(2026-08-28):文件进对方空槽、溯源跟着走、原主人少一份;
+    /// 外来路径/同一人/对方满员一律拒绝且不动文件。
+    #[test]
+    fn move_sample_relocates_file_and_trace_and_rejects_bad_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(
+                &[
+                    snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                    snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                ],
+                "t1",
+                MODEL,
+            )
+            .unwrap();
+        let (a, b) = (links["S1"].clone(), links["S2"].clone());
+        store.append_sample(&a, &[0.5; 16]).unwrap();
+        store.append_sample(&a, &[0.25; 16]).unwrap();
+        let a_paths = store.sample_paths_existing(&a);
+        assert_eq!(a_paths.len(), 2);
+        // 给第 2 份挂上溯源,验证搬家后 receipt 跟着改路径与归属
+        let rel = a_paths[1].strip_prefix(tmp.path()).unwrap().to_string_lossy().into_owned();
+        super::super::sample_trace::wal_complete(
+            tmp.path(),
+            super::super::sample_trace::SampleReceipt {
+                receipt_id: "r1".into(),
+                note_id: "n1".into(),
+                cluster_id: "S9".into(),
+                person_id: a.clone(),
+                path: rel,
+                content_hash: "h".into(),
+                at: "t".into(),
+            },
+        )
+        .unwrap();
+
+        // 同一人:拒绝
+        assert!(store.move_sample(&a, &a_paths[1], &a).is_err());
+        // 外来路径:拒绝
+        let foreign = tmp.path().join("innocent.wav");
+        std::fs::write(&foreign, b"x").unwrap();
+        assert!(store.move_sample(&a, &foreign, &b).is_err());
+        assert!(foreign.exists());
+
+        let dest = store.move_sample(&a, &a_paths[1], &b).unwrap();
+        assert!(dest.exists());
+        assert!(!a_paths[1].exists());
+        assert_eq!(store.sample_paths_existing(&a).len(), 1);
+        assert_eq!(store.sample_paths_existing(&b), vec![dest.clone()]);
+        assert_eq!(store.sample_origin(&dest), Some(("n1".into(), "S9".into())));
+        assert_eq!(store.sample_origin(&a_paths[1]), None);
+
+        // 对方满员:拒绝,文件留在原处
+        for _ in 0..MAX_SAMPLES {
+            store.append_sample(&a, &[0.75; 16]).unwrap();
+        }
+        assert_eq!(store.sample_paths_existing(&a).len(), MAX_SAMPLES);
+        assert!(store.move_sample(&b, &dest, &a).is_err());
+        assert!(dest.exists());
     }
 
     #[test]
@@ -2887,8 +3122,10 @@ mod tests {
         }
     }
 
+    /// 合并超额:不再按"最不像"挑(会优先保留错人样本),而是双方按比例、各留最新。
+    /// winner 满 10、loser 1 → loser 至少留 2 份(只有 1 份则留 1),winner 淘汰最旧。
     #[test]
-    fn merge_with_embedder_keeps_most_dissimilar_samples() {
+    fn merge_overflow_keeps_loser_samples_balanced_by_recency() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let snaps = vec![
@@ -2897,44 +3134,64 @@ mod tests {
         ];
         let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let (loser, winner) = (links["S1"].clone(), links["S2"].clone());
-        // winner 满员 10 份、全是同一声线(恒定直流);loser 1 份独特声线(交替方波)。
-        // 旧行为会因 winner 满员直接丢掉 loser 的独特样本;多样性挑选必须留下它。
         for _ in 0..MAX_SAMPLES {
             store.append_sample(&winner, &vec![0.1; 16_000]).unwrap();
         }
+        let w_before = store.sample_paths_existing(&winner);
+        // 把 winner 第 1 槽做旧,保证它是"最旧"而非依赖写入毫秒序。
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        filetime_set(&w_before[0], old);
         let square: Vec<f32> = (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
         store.append_sample(&loser, &square).unwrap();
 
-        let mut e = FlipEmbedder;
-        store
-            .merge_with_embedder(&loser, &winner, Some(&mut e as &mut dyn crate::diar::SpeakerEmbedder), MODEL)
-            .unwrap();
+        store.merge(&loser, &winner).unwrap();
 
         let kept = store.sample_paths_existing(&winner);
         assert_eq!(kept.len(), MAX_SAMPLES, "保留数=上限");
         assert!(store.sample_paths_existing(&loser).is_empty());
-        // 独特声线的那份必须幸存(方波含负采样,直流样本全为正)。
-        let has_unique = kept.iter().any(|p| {
+        let has_loser = kept.iter().any(|p| {
             let mut r = hound::WavReader::open(p).unwrap();
             r.samples::<i16>().filter_map(|s| s.ok()).any(|v| v < 0)
         });
-        assert!(has_unique, "最不相似的样本必须保留,不能按槽位序丢弃: {kept:?}");
+        assert!(has_loser, "loser 的样本必须进 winner: {kept:?}");
+        let oldest_survived = kept.iter().any(|p| {
+            std::fs::metadata(p).and_then(|m| m.modified()).map(|t| t <= old + std::time::Duration::from_secs(1)).unwrap_or(false)
+        });
+        assert!(!oldest_survived, "winner 侧淘汰的应是最旧的那份");
+    }
+
+    fn filetime_set(p: &std::path::Path, t: std::time::SystemTime) {
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(t).unwrap();
     }
 
     #[test]
-    fn select_diverse_prefers_dissimilar_and_backfills_missing() {
-        let v = |x: f32, y: f32| Some(vec![x, y]);
-        // 3 选 2:两份近同 + 一份正交 → 保留正交那份 + 近同二选一。
-        let picked = select_diverse(&[v(1.0, 0.0), v(0.99, 0.01), v(0.0, 1.0)], 2);
-        assert!(picked.contains(&2), "{picked:?}");
-        assert_eq!(picked.len(), 2);
-        // 容量足够:全保留。
-        assert_eq!(select_diverse(&[v(1.0, 0.0), None], 5), vec![0, 1]);
-        // 嵌入缺失排最后补位:2 个有效正交 + 2 个 None,取 3 → 两个有效 + 第一个 None。
-        let picked = select_diverse(&[None, v(1.0, 0.0), None, v(0.0, 1.0)], 3);
-        assert_eq!(picked, vec![0, 1, 3], "有效优先,None 按原序补第一个: {picked:?}");
-        // 全部缺失:退化为按原序取前 k(旧行为)。
-        assert_eq!(select_diverse(&[None, None, None], 2), vec![0, 1]);
+    fn select_balanced_recent_splits_capacity_and_keeps_newest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, age_s: u64| -> PathBuf {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            filetime_set(&p, std::time::SystemTime::now() - std::time::Duration::from_secs(age_s));
+            p
+        };
+        let w: Vec<PathBuf> = (0..8).map(|i| mk(&format!("w{i}"), 1000 - i as u64)).collect(); // w7 最新
+        let l: Vec<PathBuf> = (0..4).map(|i| mk(&format!("l{i}"), 500 - i as u64)).collect(); // l3 最新
+        let (kw, kl) = select_balanced_recent(&w, &l, 10);
+        // 4/12*10 ≈ 3 → loser 3 份,winner 7 份;各取最新。
+        assert_eq!(kl.len(), 3, "{kl:?}");
+        assert_eq!(kw.len(), 7, "{kw:?}");
+        assert!(!kl.contains(&l[0]), "loser 最旧的被淘汰");
+        assert!(!kw.contains(&w[0]), "winner 最旧的被淘汰");
+        // 少数派保底 2 份:winner 20 份、loser 1 份 → loser 留 1(只有 1);loser 2 份 → 留 2。
+        let big: Vec<PathBuf> = (0..12).map(|i| mk(&format!("b{i}"), 100 + i as u64)).collect();
+        let one = vec![mk("one", 5)];
+        assert_eq!(select_balanced_recent(&big, &one, 10).1.len(), 1);
+        let two = vec![mk("two0", 5), mk("two1", 6)];
+        let (kw2, kl2) = select_balanced_recent(&big, &two, 10);
+        assert_eq!(kl2.len(), 2);
+        assert_eq!(kw2.len(), 8);
+        // 容量足够:原样。
+        assert_eq!(select_balanced_recent(&w[..2], &l[..2], 10), (w[..2].to_vec(), l[..2].to_vec()));
     }
 
     #[test]
@@ -4092,6 +4349,81 @@ mod tests {
         assert!(p.voiceprint_quarantined, "重算不动隔离标记(解除另有入口)");
     }
 
+    /// 子质心聚类:两组各 3 份、彼此正交 → 两个子质心;全部同向 → 空(等于主质心);
+    /// 3+2 → 只有 3 份那组成席;不足 3 份 → 空。
+    #[test]
+    fn cluster_sub_centroids_requires_support_and_separation() {
+        let a = |x: f32| normalize(&vec![1.0, x, 0.0]).unwrap();
+        let b = |x: f32| normalize(&vec![0.0, x, 1.0]).unwrap();
+        let two_groups = vec![a(0.05), a(0.1), a(-0.05), b(0.05), b(0.1), b(-0.05)];
+        let subs = cluster_sub_centroids(&two_groups);
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert!(subs.iter().all(|(_, c)| *c == 3));
+        assert!(subs.iter().any(|(v, _)| v[0] > 0.9) && subs.iter().any(|(v, _)| v[2] > 0.9));
+
+        let one_group = vec![a(0.05), a(0.1), a(-0.05), a(0.02), a(0.08)];
+        assert!(cluster_sub_centroids(&one_group).is_empty(), "全同向不出子质心");
+
+        let three_two = vec![a(0.05), a(0.1), a(-0.05), b(0.05), b(0.1)];
+        let subs = cluster_sub_centroids(&three_two);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].1, 3);
+
+        assert!(cluster_sub_centroids(&[a(0.0), b(0.0)]).is_empty());
+    }
+
+    /// 重建写子质心(≥3 份支撑),且只有 multi 种子才把它们当席位。
+    #[test]
+    fn rebuild_writes_sub_centroids_and_only_multi_seeds_use_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        store.upsert_from_session(&[snap("S1", vec![1.0, 0.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t", MODEL).unwrap();
+        let pid = store.load().people.keys().next().unwrap().clone();
+        // 6 份内容各异的样本(嵌入缓存按内容哈希,必须不同)
+        for k in 0..6u32 {
+            let amp = 0.2 + k as f32 * 0.05;
+            let wav: Vec<f32> = (0..16_000).map(|i| if (i / (k as usize + 1)) % 2 == 0 { amp } else { -amp }).collect();
+            store.append_sample(&pid, &wav).unwrap();
+        }
+        let a = |x: f32| Ok(normalize(&vec![1.0, x, 0.0]).unwrap());
+        let b = |x: f32| Ok(normalize(&vec![0.0, x, 1.0]).unwrap());
+        let mut e = crate::diar::MockEmbedder::new(vec![a(0.05), a(0.1), a(-0.05), b(0.05), b(0.1), b(-0.05)]);
+        store.rebuild_person_from_samples(&pid, &mut e, MODEL).unwrap();
+        let vp = store.load();
+        let p = &vp.people[&pid];
+        assert_eq!(p.sub_centroids["mic"].len(), 2, "两组各 3 份 → 两个子质心");
+        assert_eq!(seed_clusters(&vp).len(), 1, "默认种子只有主质心");
+        assert_eq!(seed_clusters_multi(&vp).len(), 3, "multi 种子 = 主质心 + 2 子质心");
+        assert!(seed_clusters_multi(&vp).iter().all(|s| s.person == pid));
+    }
+
+    /// 嵌入缓存:同内容第二次不再调模型;换模型标签整体作废。
+    #[test]
+    fn embed_cache_hits_by_content_hash_and_resets_on_model_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let square: Vec<f32> = (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        store.upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t", MODEL).unwrap();
+        let pid = store.load().people.keys().next().unwrap().clone();
+        store.append_sample(&pid, &square).unwrap();
+        let path = store.sample_paths_existing(&pid)[0].clone();
+
+        // 第一次:未命中,mock 被调用一次并落盘。
+        let mut e = crate::diar::MockEmbedder::new(vec![Ok(vec![0.0, 1.0])]);
+        let mut c = EmbedCache::load(tmp.path(), MODEL);
+        assert_eq!(c.get_or_embed(&path, &mut e).unwrap(), vec![0.0, 1.0]);
+        c.save();
+        assert!(tmp.path().join("voiceprints/.embed_cache.json").exists());
+        // 第二次:命中,mock 队列已空(再调会 Err),仍返回缓存值。
+        let mut e2 = crate::diar::MockEmbedder::new(vec![]);
+        let mut c2 = EmbedCache::load(tmp.path(), MODEL);
+        assert_eq!(c2.get_or_embed(&path, &mut e2).unwrap(), vec![0.0, 1.0]);
+        // 换模型:作废,需重算。
+        let mut e3 = crate::diar::MockEmbedder::new(vec![Ok(vec![1.0, 0.0])]);
+        let mut c3 = EmbedCache::load(tmp.path(), "other-model");
+        assert_eq!(c3.get_or_embed(&path, &mut e3).unwrap(), vec![1.0, 0.0]);
+    }
+
     /// 样本基线 = 所有样本的平均,**没有状态变体**。
     ///
     /// 这条钉的是 2026-08-23 那次校准的核心语义:一份样本 ≠ 一场出场。曾经重建会把
@@ -4105,9 +4437,11 @@ mod tests {
         // fixture 已给 P1 塞了一份占位样本,换成两份可嵌入的真 wav:嵌入分别是
         // [1,0] 与 [0,1],均值方向应是 [√½,√½]。
         std::fs::remove_file(tmp.path().join("voiceprints/P1.wav")).unwrap();
+        // 两份内容必须不同:嵌入按内容哈希缓存,同内容同嵌入(那才是对的)。
         let square: Vec<f32> = (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        let square2: Vec<f32> = (0..16_000).map(|i| if i % 4 < 2 { 0.4 } else { -0.4 }).collect();
         store.append_sample("P1", &square).unwrap();
-        store.append_sample("P1", &square).unwrap();
+        store.append_sample("P1", &square2).unwrap();
         assert_eq!(store.sample_paths_existing("P1").len(), 2, "前置:两份样本都在");
 
         let mut e = crate::diar::MockEmbedder::new(vec![Ok(vec![1.0, 0.0]), Ok(vec![0.0, 1.0])]);

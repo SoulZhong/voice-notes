@@ -20,7 +20,7 @@ use app_lib::diar::registry::{
     SeedCluster, SpeakerRegistry, SEED_ASSIGN_RAW_FLOOR, SEED_ASSIGN_THRESHOLD, SEED_ASSIGN_Z,
     SEED_KNN_K, SPEAKER_MATCH_KNN_VOTE, SPEAKER_MATCH_NEAREST,
 };
-use app_lib::store::{seed_clusters, PersonCentroid, VoiceprintStore};
+use app_lib::store::{seed_clusters_with_variants, PersonCentroid, VoiceprintStore};
 
 /// registry::SNORM_MIN_COHORT 是 pub(crate),此处同值复刻(评测器与生产共用
 /// 语义,若那边改动,下方的生产代码互验会立刻失配报错,不会静默漂移)。
@@ -254,7 +254,7 @@ fn main() {
                 // (codex 终审 P2)。
                 let mut vp2 = vp.clone();
                 vp2.people.get_mut(pid).unwrap().session_centroids.get_mut(src).unwrap().remove(i);
-                let seeds = seed_clusters(&vp2);
+                let seeds = seed_clusters_with_variants(&vp2);
                 // 口径B(主质心近似退混):raw ≈ main*mc − var*vc 后归一;mc ≤ vc
                 // 或退化则整席拿掉。注意这不是合并的严格逆——merge_centroid 每次
                 // 合并后都归一,模长已丢,残留方向可能仍偏向探针(利 nearest)或
@@ -289,7 +289,7 @@ fn main() {
                         }
                     }
                 }
-                let seeds_b = seed_clusters(&vp3);
+                let seeds_b = seed_clusters_with_variants(&vp3);
                 let old_clean = production_match(&seeds_b, &probe, src, SPEAKER_MATCH_NEAREST);
                 let new_clean = production_match(&seeds_b, &probe, src, SPEAKER_MATCH_KNN_VOTE);
                 old_b.add(&old_clean, pid);
@@ -299,7 +299,7 @@ fn main() {
                 // 席位,绝对值偏悲观,但杜绝任何方向残留。
                 let mut vp4 = vp2.clone();
                 vp4.people.get_mut(pid).unwrap().centroids.remove(src);
-                let seeds_c = seed_clusters(&vp4);
+                let seeds_c = seed_clusters_with_variants(&vp4);
                 old_c.add(&production_match(&seeds_c, &probe, src, SPEAKER_MATCH_NEAREST), pid);
                 new_c.add(&production_match(&seeds_c, &probe, src, SPEAKER_MATCH_KNN_VOTE), pid);
                 let eval_seeds = build_eval_seeds(&seeds);

@@ -130,6 +130,9 @@ export const zh = {
     "推荐 · 与库中最相似的一份声纹比对认人;历史数据离线评测准确率最高",
   "settings.speakerMatch.knnVoteDesc":
     "实验 · 取最相近的 5 份声纹按人投票,需同一人多份采集形成共识;每人样本少时会不如最近邻",
+  "settings.speakerMatch.multiCentroid": "多质心",
+  "settings.speakerMatch.multiCentroidDesc":
+    "实验 · 每人除整体声纹外,再按样本聚出耳机/外放/远场等子声纹(每个至少 3 份样本支撑),命中任一即认人;样本少的人与最近邻相同",
 
   // —— 声纹模型 ——
   "settings.speaker.label": "声纹模型",
@@ -338,6 +341,9 @@ export const en = {
     "Recommended · Match against the single most similar voiceprint; highest accuracy in offline evaluation on historical data",
   "settings.speakerMatch.knnVoteDesc":
     "Experimental · The 5 nearest voiceprints vote per person; needs multiple samples per person to form a consensus, weaker than Nearest when samples are sparse",
+  "settings.speakerMatch.multiCentroid": "Multi-centroid",
+  "settings.speakerMatch.multiCentroidDesc":
+    "Experimental · Besides the overall voiceprint, cluster each person's samples into sub-voiceprints (headset / speakerphone / far-field, each backed by ≥3 samples); matching any of them identifies the person. Same as Nearest for people with few samples",
 
   "settings.speaker.label": "Voiceprint model",
   "settings.speaker.campplusDesc":

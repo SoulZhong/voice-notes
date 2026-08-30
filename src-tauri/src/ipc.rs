@@ -165,12 +165,25 @@ pub struct PersonSummary {
     pub total_ms: u64,
     pub last_seen: String,
     pub sources: Vec<String>,
-    /// 录音样本绝对路径列表(按会议逐份累积,至多 MAX_SAMPLES;合并会带入对方的样本)。
+    /// 录音样本绝对路径列表(按会议逐份累积,至多 MAX_SAMPLES=30;合并会带入对方的样本)。
     /// 空 = 库中无样本(旧数据/写失败),前端据此决定是否显示「试听」。
     pub sample_paths: Vec<String>,
     /// 与 sample_paths 一一对应的录制日期(文件 mtime,RFC3339;取不到给空串)。
     /// 样本文件在会议停止时写入,mtime≈该场会议时间,足够做「哪场的声音」标注。
     pub sample_dates: Vec<String>,
+    /// 与 sample_paths 一一对应的来源会议(样本↔会议关联,2026-08-28):有溯源
+    /// receipt 的取真值;没有的(8/20 之前的老样本)按文件时间≈会议结束时间推断
+    /// 并标 inferred;推不出给 None。
+    pub sample_notes: Vec<Option<SampleNoteRef>>,
+}
+
+/// 一份样本的来源会议。cluster_id 只有溯源真值才有(推断时不知道是哪个簇)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleNoteRef {
+    pub note_id: String,
+    pub title: String,
+    pub cluster_id: Option<String>,
+    pub inferred: bool,
 }
 
 /// 相关笔记(笔记详情页「相关笔记」区):与当前笔记共享 Aing 实体的其他笔记 + 共享实体数。

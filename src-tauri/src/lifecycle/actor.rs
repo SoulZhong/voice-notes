@@ -177,6 +177,9 @@ fn run_edit(app: &AppHandle, op: EditOp, refining_ids: &[String]) -> Result<(), 
         EditOp::AssignPersonIf { id, speaker_id, person_id } => store
             .assign_speaker_person_if(&id, &speaker_id, &person_id)
             .map_err(|e| e.to_string()),
+        EditOp::SetPersonIf { id, speaker_id, expect, person_id } => store
+            .set_speaker_person_if(&id, &speaker_id, &expect, person_id.as_deref())
+            .map_err(|e| e.to_string()),
         EditOp::SplitReassign { id, moves, op_id } => {
             store.batch_set_segment_speaker(&id, &moves, &op_id).map_err(|e| e.to_string())
         }

@@ -156,6 +156,8 @@ pub enum EditOp {
     ReleaseReservedSpeakers { id: String, op_id: String },
     /// 条件关联(拆分收尾):当前关联非空且非目标人物即拒,锁内 CAS。
     AssignPersonIf { id: String, speaker_id: String, person_id: String },
+    /// CAS 改派/解除(样本↔会议同步):当前 person_id 原样等于 expect 才写;None=解除。
+    SetPersonIf { id: String, speaker_id: String, expect: String, person_id: Option<String> },
     /// 拆分批量改派:逐段 CAS 原 speaker,一段不符整体拒绝(已到新值=已完成,幂等)。
     SplitReassign { id: String, moves: Vec<(u64, String, String)>, op_id: String },
 }
