@@ -109,6 +109,9 @@
     showFragments = false;
     editingId = null;
     actionErr = null;
+    // 试听记录/勾选随笔记复位(Codex P2):各篇 seq 都从 0 起,带过去会把上一篇听过的段当本篇的。
+    lastPlayed = {};
+    sampleSel = [];
   });
   /** 少于 3 个碎片不值得折叠:展开钮本身比一两枚 chip 更占地。 */
   const collapsible = $derived(fragmentIds.length >= 3);

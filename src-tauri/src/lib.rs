@@ -4375,20 +4375,24 @@ fn do_assign_note_speaker_person_with(
         }
     }
     if split_born {
-        // 确认才入库:只有用户刚试听过的那段(audited_seq 且确属该说话人)进库。
-        let audited = audited_seq.and_then(|q| {
-            note.segments.iter().find(|s| s.seq == q && s.speaker.as_deref() == Some(speaker_id)).cloned()
-        });
-        if let Some(seg) = audited {
-            // audited 单段是唯一被试听确认的料:不拼其它段(拆分簇未确认段有混杂
-            // 风险),不足 10s 会被时长门拒——如实跳过,总好过拿未确认段凑数。
+        // 确认才入库:只有用户确认过的段进库——勾选了「作为样本」的段(Codex P1:此前
+        // 拆分产物忽略了勾选),否则刚试听过的那一段(audited_seq)。都须确属该说话人。
+        let owned = |q: u64| note.segments.iter().find(|s| s.seq == q && s.speaker.as_deref() == Some(speaker_id)).cloned();
+        let picks: Vec<store::SegmentRecord> = if !selected_seqs.is_empty() {
+            selected_seqs.iter().filter_map(|q| owned(*q)).collect()
+        } else {
+            audited_seq.and_then(owned).into_iter().collect()
+        };
+        if !picks.is_empty() {
+            // 不拼其它段(拆分簇未确认段有混杂风险),不足 10s 会被时长门拒——如实
+            // 跳过,总好过拿未确认段凑数。
             spawn_confirmed_sample(
                 app,
                 note_id.to_string(),
                 speaker_id.to_string(),
                 resolved,
                 note.segments.clone(),
-                vec![seg],
+                picks,
                 true,
             );
         }
