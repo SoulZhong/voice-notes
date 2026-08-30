@@ -8521,7 +8521,8 @@ fn sample_note_ref(
 }
 
 /// 同上,推断窗口可调:展示用 10 分钟(宁可多标"按时间推测"),**同步动笔记用 2 分钟**
-/// (Codex P2:相邻两场或落盘延迟时猜错场会改错簇;实测样本与会议结束时间差全为 0 秒)。
+/// (Codex P2:相邻两场或落盘延迟时猜错场会改错簇;实测样本与会议结束时间差全为 0 秒,
+/// 同步用 30 秒窗口,相邻两场结束时间差不可能小于一场的最短时长)。
 fn sample_note_ref_within(
     store: &store::VoiceprintStore,
     notes: &[store::NoteSummary],
@@ -8610,7 +8611,7 @@ fn rebuild_person_blocking(app: &AppHandle, id: &str) -> Result<(), String> {
 fn sample_origin_ref(app: &AppHandle, store: &store::VoiceprintStore, path: &std::path::Path) -> Option<ipc::SampleNoteRef> {
     let notes = notes_dir(app).map(|d| store::NoteStore::new(d).list()).unwrap_or_default();
     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok().map(chrono::DateTime::<chrono::Local>::from);
-    sample_note_ref_within(store, &notes, path, mtime, 120)
+    sample_note_ref_within(store, &notes, path, mtime, 30)
 }
 
 /// 样本↔会议同步(2026-08-29 用户:"更新样本,对应出现的会议也要更新"):样本改归属/
@@ -8641,27 +8642,39 @@ fn sync_note_links_for_sample(app: &AppHandle, origin: Option<ipc::SampleNoteRef
     };
     // 只动**此刻仍关联到 from** 的簇(Codex P1):用户在异步任务落地前已手工改派给第三
     // 人的簇不覆盖——样本操作是"这段声音不是 from",不是"这簇一定归 to"。
-    let clusters: Vec<String> = match &origin.cluster_id {
-        Some(c) => note.speakers.get(c).filter(|m| linked_to_from(m)).map(|_| vec![c.clone()]).unwrap_or_default(),
-        None => note.speakers.iter().filter(|(_, m)| linked_to_from(m)).map(|(k, _)| k.clone()).collect(),
+    // (簇 id, 读到的原样 person_id):后者作 CAS 期望值,落地时不等即拒绝。
+    let clusters: Vec<(String, String)> = match &origin.cluster_id {
+        Some(c) => note
+            .speakers
+            .get(c)
+            .filter(|m| linked_to_from(m))
+            .and_then(|m| m.person_id.clone())
+            .map(|raw| vec![(c.clone(), raw)])
+            .unwrap_or_default(),
+        None => note
+            .speakers
+            .iter()
+            .filter(|(_, m)| linked_to_from(m))
+            .filter_map(|(k, m)| m.person_id.clone().map(|raw| (k.clone(), raw)))
+            .collect(),
     };
     if app.state::<AppState>().session.lock().unwrap().as_ref().is_some_and(|s| s.note_id == origin.note_id) {
         eprintln!("样本↔会议同步跳过:{} 正在录制", origin.note_id);
         return 0;
     }
     let mut n = 0;
-    for speaker_id in clusters {
-        let op = match to {
-            Some(t) => lifecycle::machine::EditOp::AssignPerson {
-                id: origin.note_id.clone(),
-                speaker_id: speaker_id.clone(),
-                person_id: t.to_string(),
-            },
-            None => lifecycle::machine::EditOp::ClearPerson { id: origin.note_id.clone(), speaker_id: speaker_id.clone() },
+    for (speaker_id, expect) in clusters {
+        // CAS 落地(Codex 复审 P1):actor 内锁里比对"仍是读到的那个人"才写,用户在
+        // 读取与落地之间改派给第三人的簇会被拒绝而不是覆盖。
+        let op = lifecycle::machine::EditOp::SetPersonIf {
+            id: origin.note_id.clone(),
+            speaker_id: speaker_id.clone(),
+            expect,
+            person_id: to.map(str::to_string),
         };
         match app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote { op }) {
             Ok(()) => n += 1,
-            Err(e) => eprintln!("样本↔会议同步失败({}/{speaker_id}): {e}", origin.note_id),
+            Err(e) => eprintln!("样本↔会议同步未落地({}/{speaker_id}): {e}", origin.note_id),
         }
     }
     n
@@ -8689,6 +8702,9 @@ fn retire_traced_samples_async(app: &AppHandle, person: String, note_id: String,
         if paths.is_empty() {
             return;
         }
+        // 已知残余(Codex 复审 P1,接受):复核与删除跨两个存储(笔记 / 声纹库),做不成
+        // 一把锁内的原子;窗口是"复核通过后到删除这几毫秒内用户又改回",且后果只是
+        // 少一份样本(声纹随重建仍正确),不值得把两个锁嵌套起来。
         for p in &paths {
             if let Err(e) = store.delete_sample(&person, p) {
                 eprintln!("退掉旧人样本失败({person} {}): {e}", p.display());
@@ -8756,6 +8772,9 @@ async fn move_person_sample(
         return Err(tr!("录制中不能改样本归属", "Cannot move samples while recording"));
     }
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        if app.state::<AppState>().session.lock().unwrap().is_some() {
+            return Err(tr!("录制中不能改样本归属", "Cannot move samples while recording"));
+        }
         let store = open_voiceprint_store(&app)?;
         let origin = sample_origin_ref(&app, &store, std::path::Path::new(&path));
         store.move_sample(&from, std::path::Path::new(&path), &to).map_err(|e| e.to_string())?;
@@ -8872,6 +8891,10 @@ async fn delete_person_sample(app: AppHandle, state: State<'_, AppState>, id: St
         return Err(tr!("录制中不能删除样本", "Cannot delete samples while recording"));
     }
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        // 进闭包再查一次(Codex 复审 P1):检查到删除之间有毫秒级窗口,开录后再删等于白删。
+        if app.state::<AppState>().session.lock().unwrap().is_some() {
+            return Err(tr!("录制中不能删除样本", "Cannot delete samples while recording"));
+        }
         let store = open_voiceprint_store(&app)?;
         let origin = sample_origin_ref(&app, &store, std::path::Path::new(&path));
         store.delete_sample(&id, std::path::Path::new(&path)).map_err(|e| e.to_string())?;

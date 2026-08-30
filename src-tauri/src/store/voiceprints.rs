@@ -1851,11 +1851,12 @@ impl EmbedCache {
     /// 命中即返回;未命中则嵌入并记入(嵌入失败不记,下次再试)。
     fn get_or_embed(&mut self, p: &std::path::Path, e: &mut dyn crate::diar::SpeakerEmbedder) -> Option<Vec<f32>> {
         let hash = sample_content_hash(p)?;
-        self.touched.insert(hash.clone());
         if let Some(v) = self.entries.get(&hash) {
+            self.touched.insert(hash);
             return Some(v.clone());
         }
-        let v = embed_wav_sample(p, e)?;
+        let v = embed_wav_sample(p, e)?; // 失败不进 touched/entries,下次再试
+        self.touched.insert(hash.clone());
         self.entries.insert(hash, v.clone());
         self.dirty = true;
         Some(v)
@@ -1866,6 +1867,9 @@ impl EmbedCache {
         if self.entries.len() > EMBED_CACHE_MAX_ENTRIES {
             let touched = std::mem::take(&mut self.touched);
             self.entries.retain(|h, _| touched.contains(h));
+            if self.entries.len() > EMBED_CACHE_MAX_ENTRIES {
+                self.entries.clear(); // 触碰集本身就超限:整体作废,下次全算(缓存只是加速层)
+            }
             self.dirty = true;
         }
         if !self.dirty {

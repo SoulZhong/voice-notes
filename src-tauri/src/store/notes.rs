@@ -448,6 +448,39 @@ impl NoteStore {
         write_speakers_atomic(&dir, &speakers)
     }
 
+    /// CAS 改派/解除(样本↔会议同步用):仅当该说话人当前 person_id **原样**等于
+    /// expect_person 才写 person_id(None=解除)。同步任务是"这段声音不是 from"的推论,
+    /// 落地前用户若已把簇改给第三人,CAS 拒绝、不覆盖最新人工结果(Codex 复审 P1)。
+    /// 幂等:已是目标值直接 Ok。
+    pub fn set_speaker_person_if(
+        &self,
+        id: &str,
+        speaker_id: &str,
+        expect_person: &str,
+        person_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        let meta = speakers
+            .get_mut(speaker_id)
+            .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
+        if meta.person_id.as_deref() == person_id {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            meta.person_id.as_deref() == Some(expect_person),
+            "说话人 {speaker_id} 的关联已被改动,同步不覆盖"
+        );
+        meta.person_id = person_id.map(str::to_string);
+        if person_id.is_some() {
+            meta.name = String::new();
+            meta.hint_person = None;
+        }
+        write_speakers_atomic(&dir, &speakers)
+    }
+
     /// 打「多人混杂」标(打标流程的笔记侧半步)。置位同时清掉 person_id:一个混杂簇
     /// 挂着单人关联本身就是错的,留着会继续把段落显示成那个人。幂等。
     pub fn set_multi_speaker(&self, id: &str, speaker_id: &str) -> anyhow::Result<()> {
@@ -1576,6 +1609,27 @@ mod tests {
         assert_eq!(n.speakers["S1"].name, "", "本地名仍为空 → 显示回落到「新说话人 N」");
         assert_eq!(n.segments[0].speaker.as_deref(), Some("S1"), "段落归属一律不动");
         assert_eq!(n.segments[1].speaker.as_deref(), Some("S3"), "他人不受影响");
+    }
+
+    /// 样本↔会议同步的 CAS:期望值命中才改派/解除;被改成别人则拒绝不覆盖;幂等。
+    #[test]
+    fn set_speaker_person_if_is_cas_and_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(tmp.path(), &[("甲", Some("S1"))], &["S1"]);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        store.assign_speaker_person(&id, "S1", "P7").unwrap();
+        // 期望 P7 → 改派 P9
+        store.set_speaker_person_if(&id, "S1", "P7", Some("P9")).unwrap();
+        assert_eq!(store.load(&id).unwrap().speakers["S1"].person_id.as_deref(), Some("P9"));
+        // 期望仍写 P7(已过期)→ 拒绝,现值不动
+        assert!(store.set_speaker_person_if(&id, "S1", "P7", None).is_err());
+        assert_eq!(store.load(&id).unwrap().speakers["S1"].person_id.as_deref(), Some("P9"));
+        // 幂等:目标已是现值,期望值错也不报错
+        assert!(store.set_speaker_person_if(&id, "S1", "P0", Some("P9")).is_ok());
+        // 期望 P9 → 解除
+        store.set_speaker_person_if(&id, "S1", "P9", None).unwrap();
+        assert_eq!(store.load(&id).unwrap().speakers["S1"].person_id, None);
+        assert!(store.set_speaker_person_if(&id, "S99", "P9", None).is_err(), "未知说话人拒绝");
     }
 
     #[test]
