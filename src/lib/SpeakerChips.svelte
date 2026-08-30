@@ -20,6 +20,7 @@
     previewClips,
     onPreviewClip,
     previewingSeq,
+    onDetachClip,
     onDelete,
     onUnlink,
     onMarkMulti,
@@ -42,11 +43,11 @@
     onRenamed?: () => void;
     /** 改名落点(可选)。缺省走笔记内 renameSpeaker;修订稿视图传 renameRefinedSpeaker
         (改名同步声纹库)。 */
-    onRename?: (id: string, name: string) => Promise<void>;
+    onRename?: (id: string, name: string, sample?: { auditedSeq?: number; selectedSeqs: number[] }) => Promise<void>;
     /** 会议搭子人物列表(可选)。传入(连同 onPick)则编辑面板附带人物区,
         点选即把该说话人关联到库中人物。 */
     people?: PersonSummary[];
-    onPick?: (id: string, personId: string) => Promise<void>;
+    onPick?: (id: string, personId: string, sample?: { auditedSeq?: number; selectedSeqs: number[] }) => Promise<void>;
     /** 试听(可选)。传入则编辑面板附「试听他的声音」行——不听声音没法确认
         「说话人 N」是谁。点击播该说话人的代表片段,重复点击换一段;
         面板保持展开,听完可直接改名/选人。 */
@@ -57,6 +58,8 @@
         最长的几段(带时间点/时长),面板逐段列出、各自可播;传入时取代 onPreview 单钮。 */
     previewClips?: (id: string) => { seq: number; start_ms: number; end_ms: number }[];
     onPreviewClip?: (id: string, seq: number) => void;
+    /** 「这段不是此人」:把该段单独拆成新说话人(不依赖聚类,段内混杂/别人插话时用)。 */
+    onDetachClip?: (id: string, seq: number) => Promise<void>;
     /** 正在播放的片段 seq(高亮那一行)。 */
     previewingSeq?: number | null;
     /** 删除(可选,仅原始逐字稿视图传入)。表项移除,名下段落回到未标注;
@@ -71,6 +74,12 @@
   } = $props();
 
   let editingId = $state<string | null>(null);
+  /** 试听面板里勾选「作为样本」的段 seq(2026-08-30 用户:只把听过、最有代表性的段入库)。
+      随面板打开复位;为空则后端按旧规则(最后试听段优先 + 最长补足)。 */
+  let sampleSel = $state<number[]>([]);
+  /** 面板内最后播放过的段(作为 auditedSeq 传给后端)。 */
+  let lastPlayed = $state<Record<string, number>>({});
+  const sampleOf = (id: string) => ({ auditedSeq: lastPlayed[id], selectedSeqs: sampleSel });
   let editingName = $state("");
   /** 用户是否已敲过字:预填的现名不参与人物过滤(否则一打开列表就只剩自己)。 */
   let editingDirty = $state(false);
@@ -100,6 +109,9 @@
     showFragments = false;
     editingId = null;
     actionErr = null;
+    // 试听记录/勾选随笔记复位(Codex P2):各篇 seq 都从 0 起,带过去会把上一篇听过的段当本篇的。
+    lastPlayed = {};
+    sampleSel = [];
   });
   /** 少于 3 个碎片不值得折叠:展开钮本身比一两枚 chip 更占地。 */
   const collapsible = $derived(fragmentIds.length >= 3);
@@ -135,6 +147,7 @@
 
   function beginEdit(id: string) {
     editingId = id;
+    sampleSel = [];
     editingName = speakers[id]?.name ?? "";
     editingDirty = false;
     dupPending = null;
@@ -179,7 +192,9 @@
 
   /** 实际改名落点:外部没接管(onRename)就走笔记内 renameSpeaker。 */
   const doRename = (id: string, name: string) =>
-    onRename ? onRename(id, name) : renameSpeaker(noteId, id, name);
+    onRename
+      ? onRename(id, name, sampleOf(id))
+      : renameSpeaker(noteId, id, name, lastPlayed[id], sampleSel.length ? sampleSel : undefined);
 
   async function commitEdit() {
     if (!editingId || dupPending) return;
@@ -208,7 +223,7 @@
     if (!d) return;
     cancelEdit();
     await run(async () => {
-      await onPick?.(d.id, d.person.id);
+      await onPick?.(d.id, d.person.id, sampleOf(d.id));
     });
   }
 
@@ -221,9 +236,10 @@
   }
 
   async function commitPick(id: string, personId: string) {
+    const sample = sampleOf(id);
     cancelEdit();
     await run(async () => {
-      await onPick?.(id, personId);
+      await onPick?.(id, personId, sample);
     });
   }
 
@@ -346,7 +362,8 @@
                       <div class="clips-title">{t("speakers.chipClipsTitle", { n: clips.length })}</div>
                       {#each clips as c, i (c.seq)}
                         {@const playing = previewingId === id && previewingSeq === c.seq}
-                        <button class="row clip" class:playing onclick={() => onPreviewClip(id, c.seq)}>
+                        <div class="clip-line" class:playing class:picked={sampleSel.includes(c.seq)}>
+                        <button class="row clip" class:playing onclick={() => { lastPlayed[id] = c.seq; onPreviewClip(id, c.seq); }}>
                           {#if playing}
                             <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
                           {:else}
@@ -359,8 +376,37 @@
                           <span class="row-sub">{t("speakers.chipClipDur", { s: Math.round((c.end_ms - c.start_ms) / 1000) })}</span>
                           {#if playing}<span class="row-sub accent">{t("speakers.chipClipPlaying")}</span>{/if}
                         </button>
+                        <label class="clip-pick" title={t("speakers.chipClipPickTitle")}>
+                          <input
+                            type="checkbox"
+                            checked={sampleSel.includes(c.seq)}
+                            onchange={(e) => {
+                              const on = (e.currentTarget as HTMLInputElement).checked;
+                              sampleSel = on ? [...sampleSel.filter((q) => q !== c.seq), c.seq] : sampleSel.filter((q) => q !== c.seq);
+                            }}
+                          />
+                          <span>{t("speakers.chipClipPick")}</span>
+                        </label>
+                        {#if onDetachClip}
+                          <button
+                            class="clip-detach"
+                            title={t("speakers.chipClipDetachTitle")}
+                            aria-label={t("speakers.chipClipDetach")}
+                            onclick={() => run(() => onDetachClip(id, c.seq))}
+                          >
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3.5h3v3M13 3.5L8.5 8M6 3.5H3v9h9V10" /></svg>
+                          </button>
+                        {/if}
+                        </div>
                       {/each}
-                      <div class="clips-hint">{t("speakers.chipClipsHint")}</div>
+                      {#if sampleSel.length > 0}
+                        {@const secs = Math.round(clips.filter((c) => sampleSel.includes(c.seq)).reduce((a, c) => a + (c.end_ms - c.start_ms), 0) / 1000)}
+                        <div class="clips-hint" class:warn={secs < 10}>
+                          {secs < 10 ? t("speakers.chipClipsSelShort", { n: sampleSel.length, s: secs }) : t("speakers.chipClipsSel", { n: sampleSel.length, s: secs })}
+                        </div>
+                      {:else}
+                        <div class="clips-hint">{t("speakers.chipClipsHint")}</div>
+                      {/if}
                     </div>
                   {/if}
                 {:else if onPreview}
@@ -611,6 +657,54 @@
   }
   .clips-hint {
     line-height: 1.45;
+  }
+  .clip-line {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    border-radius: var(--radius-md);
+  }
+  .clip-line.picked {
+    background: var(--surface-soft);
+  }
+  .clip-line .row.clip {
+    flex: 1 1 auto;
+    width: auto;
+  }
+  .clip-pick {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25em;
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    cursor: pointer;
+    white-space: nowrap;
+    padding: 0 0.3rem;
+  }
+  .clip-pick input {
+    accent-color: var(--accent);
+    margin: 0;
+  }
+  .clip-detach {
+    width: 1.5rem;
+    height: 1.5rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--ink-faint);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    margin-right: 0.25rem;
+  }
+  .clip-detach:hover {
+    color: var(--ink);
+    background: var(--surface-press);
+  }
+  .clips-hint.warn {
+    color: var(--warning-ink);
   }
   .row.clip {
     padding: 0.3rem 0.55rem;
