@@ -970,6 +970,15 @@
     player.seek(seekFix(seg.start_ms, segSource));
     player.play();
   }
+  /** 「这段不是此人」:把该段单独拆成新说话人——段内混杂/别人插话时聚类拆不开,人来指。 */
+  async function detachClip(_sid: string, seq: number) {
+    const seg = segBySeq.get(seq);
+    if (!seg) return;
+    if (preview?.seq === seq) endPreview("detach");
+    await setSegmentSpeaker(id, seq, seg.text, "new");
+    refresh();
+    recording.bumpNotes();
+  }
   /** 单钮试听(兼容入口):播第一段;已在播则换下一段。 */
   function previewSpeaker(sid: string) {
     const clips = previewClips(sid);
@@ -2347,7 +2356,11 @@
         editable={true}
         counts={segCounts}
         people={canEdit ? people : undefined}
-        onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId, lastAuditioned[sid]) : undefined}
+        onPick={canEdit
+          ? (sid, personId, sample) =>
+              assignNoteSpeakerPerson(id, sid, personId, sample?.auditedSeq ?? lastAuditioned[sid], sample?.selectedSeqs?.length ? sample.selectedSeqs : undefined)
+          : undefined}
+        onDetachClip={canEdit ? detachClip : undefined}
         onDelete={canEdit && !refining ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
         onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
         onMarkMulti={canEdit && !refining ? runAutoSplit : undefined}

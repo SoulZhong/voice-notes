@@ -4303,9 +4303,18 @@ fn assign_note_speaker_person(
     speaker_id: String,
     person_id: String,
     audited_seq: Option<u64>,
+    // 用户在试听面板勾选的「作为样本」段(2026-08-30):非空则样本**只**由这些段构成。
+    selected_seqs: Option<Vec<u64>>,
 ) -> Result<(), String> {
     reject_if_active(&state, &note_id)?;
-    do_assign_note_speaker_person_with(&app, &note_id, &speaker_id, &person_id, audited_seq)
+    do_assign_note_speaker_person_with(
+        &app,
+        &note_id,
+        &speaker_id,
+        &person_id,
+        audited_seq,
+        selected_seqs.as_deref().unwrap_or(&[]),
+    )
 }
 
 /// 关联的可复用本体:命令壳与 identify 建议确认(apply_identify_suggestion)共用。
@@ -4317,7 +4326,7 @@ fn do_assign_note_speaker_person(
     speaker_id: &str,
     person_id: &str,
 ) -> Result<(), String> {
-    do_assign_note_speaker_person_with(app, note_id, speaker_id, person_id, None)
+    do_assign_note_speaker_person_with(app, note_id, speaker_id, person_id, None, &[])
 }
 
 /// 「确认才入库」版本(2026-08-22-one-click-split-design.md):拆分产物说话人
@@ -4330,6 +4339,7 @@ fn do_assign_note_speaker_person_with(
     speaker_id: &str,
     person_id: &str,
     audited_seq: Option<u64>,
+    selected_seqs: &[u64],
 ) -> Result<(), String> {
     let vp = open_voiceprint_store(app)?.load();
     let Some(resolved) = store::VoiceprintStore::resolve(&vp, person_id).map(str::to_string) else {
@@ -4396,8 +4406,25 @@ fn do_assign_note_speaker_person_with(
         // 2026-08-30 用户问"样本是最具代表性的吗":用户刚试听过的那一段(audited_seq)
         // 是他亲耳确认过"这是这个人"的音频,优先做样本核心,其余按最长补足 10s——
         // 此前只按最长挑,最长的段恰好混了别人时,样本就带着别人的声音入库。
-        let mut picks = pick_confirmed_sample_segs(&pool);
-        if let Some(seq) = audited_seq {
+        // 用户明确勾选了「作为样本」的段(2026-08-30):样本只由这些段构成,不再按最长
+        // 补——"我听过的最有代表性的那几段,而不是全部"。合计不足 10s 则不入库并留痕
+        // (前端勾选时已提示合计秒数)。
+        let selected: Vec<store::SegmentRecord> = selected_seqs
+            .iter()
+            .filter_map(|q| pool.iter().find(|s| s.seq == *q).cloned())
+            .collect();
+        let mut picks = if !selected.is_empty() {
+            let total: u64 = selected.iter().map(|s| s.end_ms.saturating_sub(s.start_ms)).sum();
+            if total < store::AUTO_ENROLL_MS {
+                eprintln!("确认样本跳过({person_id}):勾选段合计 {total}ms < 10s,不入库(未按最长补)");
+                Vec::new()
+            } else {
+                selected
+            }
+        } else {
+            pick_confirmed_sample_segs(&pool)
+        };
+        if let Some(seq) = audited_seq.filter(|_| selected_seqs.is_empty()) {
             if let Some(a) = pool.iter().find(|s| s.seq == seq) {
                 picks.retain(|s| s.seq != seq);
                 picks.insert(0, a.clone());
@@ -8158,7 +8185,14 @@ fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(),
 /// 永远是笔记局部身份,以后录到也认不出。
 /// 规则:库里恰有一个同名人 → 关联它;没有 → 建人再关联;重名多于一个 → 跳过
 /// 并日志(自动挑人必错,让用户走关联动线亲自选)。非活动会话时调用。
-fn enroll_named_speaker(app: &AppHandle, note_id: &str, speaker_id: &str, name: &str) {
+fn enroll_named_speaker(
+    app: &AppHandle,
+    note_id: &str,
+    speaker_id: &str,
+    name: &str,
+    audited_seq: Option<u64>,
+    selected_seqs: &[u64],
+) {
     let run = || -> anyhow::Result<()> {
         let root = notes_dir(app)?;
         let note = store::NoteStore::new(root).load(note_id)?;
@@ -8178,7 +8212,9 @@ fn enroll_named_speaker(app: &AppHandle, note_id: &str, speaker_id: &str, name: 
                 return Ok(());
             }
         };
-        if let Err(e) = do_assign_note_speaker_person(app, note_id, speaker_id, &target) {
+        if let Err(e) =
+            do_assign_note_speaker_person_with(app, note_id, speaker_id, &target, audited_seq, selected_seqs)
+        {
             if created {
                 // 与 apply_identify_suggestion 同款收尾:刚建的空人别留孤儿
                 let _ = vp_store.delete_person_if_empty(&target);
@@ -8205,7 +8241,7 @@ pub(crate) fn spawn_enroll_named_speakers(app: &AppHandle, note_id: String) {
         let Ok(note) = store::NoteStore::new(root).load(&note_id) else { return };
         for (sid, m) in &note.speakers {
             if !m.name.trim().is_empty() && m.person_id.is_none() && !m.split_born {
-                enroll_named_speaker(&app, &note_id, sid, m.name.trim());
+                enroll_named_speaker(&app, &note_id, sid, m.name.trim(), None, &[]);
             }
         }
     });
@@ -8218,6 +8254,8 @@ fn rename_speaker(
     note_id: String,
     speaker_id: String,
     name: String,
+    audited_seq: Option<u64>,
+    selected_seqs: Option<Vec<u64>>,
 ) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
@@ -8249,7 +8287,7 @@ fn rename_speaker(
     })?;
     // 命名即确认(codex 末轮 P1):无主说话人得名 → 转正入库(建人/唯一同名关联,
     // 带样本与回灌);已有关联者只改显示名,不动库。
-    enroll_named_speaker(&app, &note_id, &speaker_id, name);
+    enroll_named_speaker(&app, &note_id, &speaker_id, name, audited_seq, selected_seqs.as_deref().unwrap_or(&[]));
     Ok(())
 }
 

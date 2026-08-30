@@ -274,8 +274,9 @@ export const resumeRecording = (noteId: string) => invoke<void>("resume_recordin
 /** 删除笔记内说话人:表项移除,名下段落回到未标注。只动本笔记,不碰人物库。 */
 export const deleteNoteSpeaker = (noteId: string, speakerId: string) =>
   invoke<void>("delete_note_speaker", { noteId, speakerId });
-export const renameSpeaker = (noteId: string, speakerId: string, name: string) =>
-  invoke<void>("rename_speaker", { noteId, speakerId, name });
+/** 改名(命名即入库时,auditedSeq/selectedSeqs 决定样本料:勾选段优先、其次试听段)。 */
+export const renameSpeaker = (noteId: string, speakerId: string, name: string, auditedSeq?: number, selectedSeqs?: number[]) =>
+  invoke<void>("rename_speaker", { noteId, speakerId, name, auditedSeq: auditedSeq ?? null, selectedSeqs: selectedSeqs ?? null });
 /** 导出到用户选定路径(保存对话框),返回落盘绝对路径。preferRefined=真且修订稿
  * 在盘时导修订稿(所见即所得)。 */
 export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean, dest: string) =>
@@ -359,7 +360,16 @@ export const assignNoteSpeakerPerson = (
   personId: string,
   /** 用户刚试听过的段 seq(「确认才入库」):拆分产物说话人只把这一段存进声纹库。 */
   auditedSeq?: number,
-) => invoke<void>("assign_note_speaker_person", { noteId, speakerId, personId, auditedSeq: auditedSeq ?? null });
+  /** 用户在试听面板勾选「作为样本」的段:非空则样本只由这些段构成(合计需 ≥10s)。 */
+  selectedSeqs?: number[],
+) =>
+  invoke<void>("assign_note_speaker_person", {
+    noteId,
+    speakerId,
+    personId,
+    auditedSeq: auditedSeq ?? null,
+    selectedSeqs: selectedSeqs ?? null,
+  });
 
 /** 解除原始稿说话人与声纹库人物的关联:清 person_id,显示回落到「新说话人 N」。
     表项与段落归属都不动——与删除说话人不是一回事。
