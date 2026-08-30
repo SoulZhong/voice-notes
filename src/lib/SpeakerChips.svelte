@@ -17,6 +17,9 @@
     onPick,
     onPreview,
     previewingId,
+    previewClips,
+    onPreviewClip,
+    previewingSeq,
     onDelete,
     onUnlink,
     onMarkMulti,
@@ -50,6 +53,12 @@
     onPreview?: (id: string) => void;
     /** 正在试听的说话人 id(供行内提示「播放中,点击换一段」)。 */
     previewingId?: string | null;
+    /** 显式片段试听(2026-08-30 用户反馈"再点一次换下一段"不可发现):给出该说话人
+        最长的几段(带时间点/时长),面板逐段列出、各自可播;传入时取代 onPreview 单钮。 */
+    previewClips?: (id: string) => { seq: number; start_ms: number; end_ms: number }[];
+    onPreviewClip?: (id: string, seq: number) => void;
+    /** 正在播放的片段 seq(高亮那一行)。 */
+    previewingSeq?: number | null;
     /** 删除(可选,仅原始逐字稿视图传入)。表项移除,名下段落回到未标注;
         只动本笔记,不碰人物库。面板内二段确认。 */
     onDelete?: (id: string) => Promise<void>;
@@ -106,6 +115,17 @@
     const over = r.right - (window.innerWidth - 8);
     if (over > 0) el.style.left = `-${Math.min(over, Math.max(0, r.left - 8))}px`;
   });
+
+  /** 片段时间点 mm:ss / h:mm:ss。 */
+  function clockOf(ms: number): string {
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const mm = String(m).padStart(2, "0");
+    const ss = String(sec).padStart(2, "0");
+    return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  }
 
   // 非 null 分支与徽章共用同一兜底逻辑;source 参数在此分支无关,固定传 "mic"。
   const label = (id: string) => speakerLabel(id, "mic", speakers);
@@ -309,7 +329,41 @@
               </div>
             {:else}
               {#if !editingDirty}
-                {#if onPreview}
+                {#if previewClips && onPreviewClip}
+                  {@const clips = previewClips(id)}
+                  {#if clips.length === 0}
+                    <div class="row row-off">
+                      <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M5 3.5v9l7.5-4.5z" />
+                      </svg>
+                      {t("speakers.chipPreview")}
+                      <span class="row-sub">{t("speakers.chipPreviewEmpty")}</span>
+                    </div>
+                  {:else}
+                    <!-- 片段列表:最长的几段各成一行,时间点 + 时长,正在播的高亮。听清哪段
+                         就据此改名/选人,那段会成为这个人的声纹样本(与后端 audited_seq 一致)。 -->
+                    <div class="clips">
+                      <div class="clips-title">{t("speakers.chipClipsTitle", { n: clips.length })}</div>
+                      {#each clips as c, i (c.seq)}
+                        {@const playing = previewingId === id && previewingSeq === c.seq}
+                        <button class="row clip" class:playing onclick={() => onPreviewClip(id, c.seq)}>
+                          {#if playing}
+                            <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
+                          {:else}
+                            <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                              <path d="M5 3.5v9l7.5-4.5z" />
+                            </svg>
+                          {/if}
+                          <span class="clip-idx">{i + 1}</span>
+                          <span class="clip-at">{clockOf(c.start_ms)}</span>
+                          <span class="row-sub">{t("speakers.chipClipDur", { s: Math.round((c.end_ms - c.start_ms) / 1000) })}</span>
+                          {#if playing}<span class="row-sub accent">{t("speakers.chipClipPlaying")}</span>{/if}
+                        </button>
+                      {/each}
+                      <div class="clips-hint">{t("speakers.chipClipsHint")}</div>
+                    </div>
+                  {/if}
+                {:else if onPreview}
                   {#if counts && !counts[id]}
                     <!-- 名下已无段落(如拆分后清空的原始说话人):试听无物可放,静默
                          没反应会被当成坏了(2026-08-22 用户实测)——置灰并说明白。 -->
@@ -541,6 +595,62 @@
   }
   .row:hover {
     background: var(--surface-soft);
+  }
+  /* 片段列表(显式试听) */
+  .clips {
+    padding: 0.15rem 0 0.25rem;
+    border-top: 1px solid var(--hairline);
+    border-bottom: 1px solid var(--hairline);
+    margin: 0.2rem 0;
+  }
+  .clips-title,
+  .clips-hint {
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    padding: 0.2rem 0.55rem;
+  }
+  .clips-hint {
+    line-height: 1.45;
+  }
+  .row.clip {
+    padding: 0.3rem 0.55rem;
+    font-size: 0.84rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .row.clip.playing {
+    background: var(--accent-tint);
+    color: var(--accent);
+  }
+  .clip-idx {
+    width: 1.1em;
+    color: var(--ink-faint);
+    font-size: 0.74rem;
+  }
+  .clip-at {
+    font-weight: 500;
+  }
+  .row-sub.accent {
+    color: var(--accent);
+  }
+  .bars {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 2px;
+    width: 14px;
+    height: 12px;
+  }
+  .bars span {
+    width: 2.5px;
+    border-radius: 1px;
+    background: currentColor;
+    animation: chipEq 0.9s ease-in-out infinite;
+  }
+  .bars span:nth-child(1) { height: 60%; }
+  .bars span:nth-child(2) { height: 100%; animation-delay: 0.25s; }
+  .bars span:nth-child(3) { height: 75%; animation-delay: 0.5s; }
+  @keyframes chipEq {
+    0%, 100% { transform: scaleY(0.5); }
+    50% { transform: scaleY(1); }
   }
   .row-icon {
     color: var(--ink-secondary);

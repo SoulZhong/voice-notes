@@ -4393,7 +4393,25 @@ fn do_assign_note_speaker_person_with(
             .filter(|s| s.speaker.as_deref() == Some(speaker_id))
             .cloned()
             .collect();
-        let picks = pick_confirmed_sample_segs(&pool);
+        // 2026-08-30 用户问"样本是最具代表性的吗":用户刚试听过的那一段(audited_seq)
+        // 是他亲耳确认过"这是这个人"的音频,优先做样本核心,其余按最长补足 10s——
+        // 此前只按最长挑,最长的段恰好混了别人时,样本就带着别人的声音入库。
+        let mut picks = pick_confirmed_sample_segs(&pool);
+        if let Some(seq) = audited_seq {
+            if let Some(a) = pool.iter().find(|s| s.seq == seq) {
+                picks.retain(|s| s.seq != seq);
+                picks.insert(0, a.clone());
+                // 试听段进来后,后面的段只补到累计够 10s 为止(段保持完整,与
+                // pick_confirmed_sample_segs 同一"拼到刚够"语义;Codex P2 指出这不是精确
+                // 截断——最后一段整段保留,样本可能略超 10s,ASR 段本就短,接受)。
+                let mut acc = 0u64;
+                picks.retain(|s| {
+                    let keep = acc < store::AUTO_ENROLL_MS;
+                    acc += s.end_ms.saturating_sub(s.start_ms);
+                    keep
+                });
+            }
+        }
         spawn_confirmed_sample(
             app,
             note_id.to_string(),

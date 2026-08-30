@@ -588,7 +588,7 @@
       从 playing 翻转**推断**"用户暂停"两次修两次漏:play() 是乐观置位,Rust 心跳在
       seek 生效、play 未生效的间隙采到 playing=false,armed 拦不住——preview 被清,
       段尾边界消失,整篇一直放(2026-08-20/21 用户两次实测)。 */
-  let preview = $state<{ sid: string; idx: number; endMs: number } | null>(null);
+  let preview = $state<{ sid: string; idx: number; seq: number; endMs: number } | null>(null);
   /** 试听强制停表:按样本时长走墙钟,到点仍在试听态就硬停。响应式段尾边界已三轮
       "修好又复发"(2026-08-20 两次、08-21 一次用户实测),失效环节始终未坐实
       (事件链/边界比较/暂停失败均有嫌疑);墙钟不依赖位置事件与响应式依赖追踪,
@@ -910,7 +910,7 @@
     const seg = note?.segments.find((s) => s.seq === seq);
     if (!seg || !player) return;
     const segSource = segSourceAt(seg.start_ms);
-    preview = { sid: "__split", idx: 0, endMs: seekFix(seg.end_ms, segSource) };
+    preview = { sid: "__split", idx: 0, seq, endMs: seekFix(seg.end_ms, segSource) };
     armPreviewWatchdog(seg.end_ms - seg.start_ms);
     // 独奏该段所在轨:多轨混音下另一条轨的同时段声音会一起响(fix 分支合入后接上)。
     player.soloTrack(seg.source ?? null);
@@ -924,7 +924,8 @@
     void refreshMultiOps();
   }
 
-  function previewSpeaker(sid: string) {
+  /** 该说话人的试听候选:最长的 5 段源段(修订稿一律回落到源段,见下)。 */
+  function previewClips(sid: string): { seq: number; start_ms: number; end_ms: number }[] {
     // **修订稿一律回落到源段**。修订稿的段落是「不连续源段的合并」,却只记一个
     // start_ms~end_ms 的大范围;照那个范围连续播,中间别人说的话会原样放出来。
     // 2026-08-20 在一篇真实笔记上实测:472 个段落里 466 个(99%)的时间范围内夹着
@@ -933,7 +934,7 @@
     // 一波说话人:两个视图的 sid 都是原始稿说话人,直接取其原始段;修订稿旧文档
     // 映射不回 S 的遗留 id 才退回「段落 source_seqs 还原」。
     const direct = displaySegments.filter((s) => s.speaker === sid);
-    const segs = (
+    return (
       direct.length > 0
         ? direct
         : (refined?.paragraphs ?? [])
@@ -943,15 +944,25 @@
             .filter((s) => s !== undefined)
     )
       .sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms))
-      .slice(0, 5);
-    if (segs.length === 0 || !player) return;
-    const idx = preview?.sid === sid ? (preview.idx + 1) % segs.length : 0;
-    const seg = segs[idx];
+      .slice(0, 5)
+      .map((s) => ({ seq: s.seq, start_ms: s.start_ms, end_ms: s.end_ms }));
+  }
+  /** 播放指定片段(面板片段列表点选;2026-08-30 起不再"再点一次换下一段")。 */
+  function previewSpeakerClip(sid: string, seq: number) {
+    const clips = previewClips(sid);
+    const idx = clips.findIndex((c) => c.seq === seq);
+    if (idx < 0 || !player) return;
+    if (preview?.sid === sid && preview.seq === seq) {
+      endPreview("toggle");
+      return;
+    }
+    const seg = segBySeq.get(seq);
+    if (!seg) return;
     // endMs 与 seek 同一套修正(codex P2):停止条件比较的是修正后的 playerMs,
     // 边界不修正会让试听提前一个首帧偏移量截停。
     const segSource = segSourceAt(seg.start_ms);
     lastAuditioned[sid] = seg.seq;
-    preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource) };
+    preview = { sid, idx, seq, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource) };
     armPreviewWatchdog(Math.min(seg.end_ms - seg.start_ms, PREVIEW_MAX_MS));
     // 只放这一段所在的那条轨。播放器是多轨混音的:不压另一条轨的话,同一时刻远端
     // (system)说的话会跟着一起响,听起来就是「试听的样本不是同一个人」。
@@ -959,7 +970,13 @@
     player.seek(seekFix(seg.start_ms, segSource));
     player.play();
   }
-
+  /** 单钮试听(兼容入口):播第一段;已在播则换下一段。 */
+  function previewSpeaker(sid: string) {
+    const clips = previewClips(sid);
+    if (clips.length === 0) return;
+    const idx = preview?.sid === sid ? (preview.idx + 1) % clips.length : 0;
+    previewSpeakerClip(sid, clips[idx].seq);
+  }
   /** 退出试听态:清状态并解除独奏(三条退出路径共用,漏一条就会把轨一直压着)。 */
   function endPreview(_reason = "unknown") {
     if (previewTimer) {
@@ -1249,6 +1266,9 @@
     regenStage = null;
     regenErr = "";
     viewMode = "refined";
+    // 换笔记清空试听记录(Codex P2):各篇 seq 都从 0 起,不清会把上一篇听过的 seq 当成
+    // 本篇的 audited_seq 传给关联,让没听过的段冒充"用户确认过"进样本。
+    lastAuditioned = {};
     cancelHideEntityPop();
     entityPop = null;
     refinedBadgePop = null;
@@ -2332,7 +2352,10 @@
         onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
         onMarkMulti={canEdit && !refining ? runAutoSplit : undefined}
         onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
+        previewClips={canEdit && tracks.length > 0 ? previewClips : undefined}
+        onPreviewClip={canEdit && tracks.length > 0 ? previewSpeakerClip : undefined}
         previewingId={preview?.sid ?? null}
+        previewingSeq={preview?.seq ?? null}
         onRenamed={() => {
           refresh();
           recording.bumpNotes();
