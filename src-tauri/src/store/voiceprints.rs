@@ -726,6 +726,10 @@ impl VoiceprintStore {
         for sample in self.sample_paths_existing(id) {
             if let Err(e) = std::fs::remove_file(&sample) {
                 eprintln!("声纹样本删除失败({id},不影响库): {e}");
+            } else {
+                // 溯源 receipt 一并清(Codex P2):否则留一堆指向不存在文件的条目,
+                // 槽位被别人复用后还会把新文件错标成"来自那篇"。
+                super::sample_trace::on_sample_deleted(&self.root, &sample);
             }
         }
         Ok(())
@@ -1209,6 +1213,8 @@ impl VoiceprintStore {
     /// 按样本重建双方,样本才是真相。持 vp_guard 与 merge/delete 串行。
     /// 返回落地后的新路径。对方满员(MAX_SAMPLES)拒绝而非静默丢弃:用户是来救
     /// 一份样本的,不是来删它的。
+    /// 已知缺口(Codex P2,暂不做):rename 与溯源更新之间没有 WAL,进程恰在其间崩溃会留下
+    /// "文件已搬、receipt 仍指旧路径"——后果只是该样本退化为无溯源(按时间推断),不丢文件。
     pub fn move_sample(&self, from: &str, path: &std::path::Path, to: &str) -> anyhow::Result<PathBuf> {
         let _guard = vp_guard();
         let vp = self.load();
@@ -1818,7 +1824,12 @@ struct EmbedCache {
     model: String,
     entries: BTreeMap<String, Vec<f32>>,
     dirty: bool,
+    /// 本次会话命中/写入过的 hash:超限收缩时只留这些(Codex P2:只增不删会无限长)。
+    touched: std::collections::BTreeSet<String>,
 }
+
+/// 缓存条目上限:MAX_SAMPLES × 200 人量级的 3 倍余量;超过即只保留本次触碰过的。
+const EMBED_CACHE_MAX_ENTRIES: usize = 20_000;
 
 #[derive(Serialize, Deserialize, Default)]
 struct EmbedCacheFile {
@@ -1834,12 +1845,13 @@ impl EmbedCache {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
         let entries = if file.model == model { file.entries } else { BTreeMap::new() };
-        Self { path, model: model.to_string(), entries, dirty: false }
+        Self { path, model: model.to_string(), entries, dirty: false, touched: Default::default() }
     }
 
     /// 命中即返回;未命中则嵌入并记入(嵌入失败不记,下次再试)。
     fn get_or_embed(&mut self, p: &std::path::Path, e: &mut dyn crate::diar::SpeakerEmbedder) -> Option<Vec<f32>> {
         let hash = sample_content_hash(p)?;
+        self.touched.insert(hash.clone());
         if let Some(v) = self.entries.get(&hash) {
             return Some(v.clone());
         }
@@ -1850,7 +1862,12 @@ impl EmbedCache {
     }
 
     /// best-effort 落盘(原子写);失败只打日志——下次重建多算几份而已。
-    fn save(&self) {
+    fn save(&mut self) {
+        if self.entries.len() > EMBED_CACHE_MAX_ENTRIES {
+            let touched = std::mem::take(&mut self.touched);
+            self.entries.retain(|h, _| touched.contains(h));
+            self.dirty = true;
+        }
         if !self.dirty {
             return;
         }

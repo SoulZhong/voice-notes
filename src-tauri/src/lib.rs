@@ -8517,18 +8517,29 @@ fn sample_note_ref(
     path: &std::path::Path,
     mtime: Option<chrono::DateTime<chrono::Local>>,
 ) -> Option<ipc::SampleNoteRef> {
+    sample_note_ref_within(store, notes, path, mtime, 10 * 60)
+}
+
+/// 同上,推断窗口可调:展示用 10 分钟(宁可多标"按时间推测"),**同步动笔记用 2 分钟**
+/// (Codex P2:相邻两场或落盘延迟时猜错场会改错簇;实测样本与会议结束时间差全为 0 秒)。
+fn sample_note_ref_within(
+    store: &store::VoiceprintStore,
+    notes: &[store::NoteSummary],
+    path: &std::path::Path,
+    mtime: Option<chrono::DateTime<chrono::Local>>,
+    max_gap_secs: i64,
+) -> Option<ipc::SampleNoteRef> {
     if let Some((note_id, cluster_id)) = store.sample_origin(path) {
         let title = notes.iter().find(|n| n.id == note_id).map(|n| n.title.clone()).unwrap_or_default();
         return Some(ipc::SampleNoteRef { note_id, title, cluster_id: Some(cluster_id), inferred: false });
     }
     let mt = mtime?;
-    const MAX_GAP_SECS: i64 = 10 * 60;
     let mut best: Option<(i64, &store::NoteSummary)> = None;
     for n in notes {
         let Ok(start) = chrono::DateTime::parse_from_rfc3339(&n.started_at) else { continue };
         let end = start + chrono::Duration::seconds(n.duration_secs.unwrap_or(0) as i64);
         let gap = (mt.with_timezone(&chrono::Utc) - end.with_timezone(&chrono::Utc)).num_seconds().abs();
-        if gap <= MAX_GAP_SECS && best.is_none_or(|(g, _)| gap < g) {
+        if gap <= max_gap_secs && best.is_none_or(|(g, _)| gap < g) {
             best = Some((gap, n));
         }
     }
@@ -8550,11 +8561,21 @@ fn rebuild_person_blocking(app: &AppHandle, id: &str) -> Result<(), String> {
             "Person is quarantined by a split; finish or undo it first"
         ));
     }
-    {
-        let _ctl = REBUILD_CTL.lock().unwrap();
-        if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
+    // 占重建槽:有别的重建在跑(全库重建/上一次样本操作的跟进)就等它,最多 2 分钟
+    // (Codex P1:立刻失败会让"文件已删、质心没重算、会议没同步"永久留在库里)。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let acquired = {
+            let _ctl = REBUILD_CTL.lock().unwrap();
+            !REBUILD_RUNNING.swap(true, Ordering::SeqCst)
+        };
+        if acquired {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
             return Err(tr!("声纹库重建进行中,稍后再试", "A library rebuild is running; try again later"));
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
     // 嵌入器优先复用常驻缓存(与录制/整库重建同一只):每次新建 SherpaEmbedder 要加载
     // ONNX、吃满 CPU 一两秒,把 WebView 主线程饿住——用户 8/29 实报"删样本仍卡 2 秒"。
@@ -8589,7 +8610,7 @@ fn rebuild_person_blocking(app: &AppHandle, id: &str) -> Result<(), String> {
 fn sample_origin_ref(app: &AppHandle, store: &store::VoiceprintStore, path: &std::path::Path) -> Option<ipc::SampleNoteRef> {
     let notes = notes_dir(app).map(|d| store::NoteStore::new(d).list()).unwrap_or_default();
     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok().map(chrono::DateTime::<chrono::Local>::from);
-    sample_note_ref(store, &notes, path, mtime)
+    sample_note_ref_within(store, &notes, path, mtime, 120)
 }
 
 /// 样本↔会议同步(2026-08-29 用户:"更新样本,对应出现的会议也要更新"):样本改归属/
@@ -8606,21 +8627,23 @@ fn sync_note_links_for_sample(app: &AppHandle, origin: Option<ipc::SampleNoteRef
         Ok(s) => s.load(),
         Err(_) => return 0,
     };
-    let from_r = store::VoiceprintStore::resolve(&vp, from).map(str::to_string);
+    // from 解析不到(已被删除/并走)就不动笔记(Codex P1):否则"关联到 from"的判据会退化
+    // 成"person_id 为空/悬空",把该场所有未关联簇整批改派给 to。
+    let Some(from_r) = store::VoiceprintStore::resolve(&vp, from).map(str::to_string) else {
+        eprintln!("样本↔会议同步跳过:{from} 已不在库中");
+        return 0;
+    };
+    let linked_to_from = |m: &store::SpeakerMeta| {
+        m.person_id
+            .as_deref()
+            .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
+            .is_some_and(|r| r == from_r)
+    };
+    // 只动**此刻仍关联到 from** 的簇(Codex P1):用户在异步任务落地前已手工改派给第三
+    // 人的簇不覆盖——样本操作是"这段声音不是 from",不是"这簇一定归 to"。
     let clusters: Vec<String> = match &origin.cluster_id {
-        Some(c) => vec![c.clone()],
-        None => note
-            .speakers
-            .iter()
-            .filter(|(_, m)| {
-                m.person_id
-                    .as_deref()
-                    .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
-                    .map(str::to_string)
-                    == from_r
-            })
-            .map(|(k, _)| k.clone())
-            .collect(),
+        Some(c) => note.speakers.get(c).filter(|m| linked_to_from(m)).map(|_| vec![c.clone()]).unwrap_or_default(),
+        None => note.speakers.iter().filter(|(_, m)| linked_to_from(m)).map(|(k, _)| k.clone()).collect(),
     };
     if app.state::<AppState>().session.lock().unwrap().as_ref().is_some_and(|s| s.note_id == origin.note_id) {
         eprintln!("样本↔会议同步跳过:{} 正在录制", origin.note_id);
@@ -8651,6 +8674,17 @@ fn retire_traced_samples_async(app: &AppHandle, person: String, note_id: String,
     let app = app.clone();
     std::thread::spawn(move || {
         let Ok(store) = open_voiceprint_store(&app) else { return };
+        // 复核(Codex P1):任务排队期间用户可能已把这簇改回给同一个人——那他的样本
+        // 就不该退。只有簇此刻不再归他时才动手。
+        let still_his = notes_dir(&app)
+            .ok()
+            .and_then(|d| store::NoteStore::new(d).load(&note_id).ok())
+            .and_then(|n| n.speakers.get(&cluster_id).and_then(|m| m.person_id.clone()))
+            .and_then(|pid| store::VoiceprintStore::resolve(&store.load(), &pid).map(str::to_string))
+            .is_some_and(|r| store::VoiceprintStore::resolve(&store.load(), &person).is_some_and(|p| p == r));
+        if still_his {
+            return;
+        }
         let paths = store.samples_traced_to(&person, &note_id, &cluster_id);
         if paths.is_empty() {
             return;
@@ -8831,7 +8865,12 @@ fn suggest_person_merges(app: AppHandle) -> Result<Vec<ipc::PersonMergeSuggestio
 /// 删除声纹库人物的一份录音样本（详情页试听区,录坏/混音的样本可单独删）。
 /// 样本不参与识别（认人靠质心），删除不影响准确率;路径归属校验在 store 层。
 #[tauri::command]
-async fn delete_person_sample(app: AppHandle, id: String, path: String) -> Result<(), String> {
+async fn delete_person_sample(app: AppHandle, state: State<'_, AppState>, id: String, path: String) -> Result<(), String> {
+    // 录制中拒绝(Codex P1):会话已注入删除前的种子,停录 upsert 会把旧结果写回库,
+    // 删除等于白删;与 move_person_sample 同口径。
+    if state.session.lock().unwrap().is_some() {
+        return Err(tr!("录制中不能删除样本", "Cannot delete samples while recording"));
+    }
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let store = open_voiceprint_store(&app)?;
         let origin = sample_origin_ref(&app, &store, std::path::Path::new(&path));
