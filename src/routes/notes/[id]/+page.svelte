@@ -1266,6 +1266,9 @@
     regenStage = null;
     regenErr = "";
     viewMode = "refined";
+    // 换笔记清空试听记录(Codex P2):各篇 seq 都从 0 起,不清会把上一篇听过的 seq 当成
+    // 本篇的 audited_seq 传给关联,让没听过的段冒充"用户确认过"进样本。
+    lastAuditioned = {};
     cancelHideEntityPop();
     entityPop = null;
     refinedBadgePop = null;

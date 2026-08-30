@@ -4401,7 +4401,9 @@ fn do_assign_note_speaker_person_with(
             if let Some(a) = pool.iter().find(|s| s.seq == seq) {
                 picks.retain(|s| s.seq != seq);
                 picks.insert(0, a.clone());
-                // 试听段进来后重新截到刚够 10s,别让样本无谓变长。
+                // 试听段进来后,后面的段只补到累计够 10s 为止(段保持完整,与
+                // pick_confirmed_sample_segs 同一"拼到刚够"语义;Codex P2 指出这不是精确
+                // 截断——最后一段整段保留,样本可能略超 10s,ASR 段本就短,接受)。
                 let mut acc = 0u64;
                 picks.retain(|s| {
                     let keep = acc < store::AUTO_ENROLL_MS;
