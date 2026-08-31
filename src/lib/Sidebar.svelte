@@ -155,9 +155,12 @@
   // 已命名组:样本份数降序、最近样本收录时间降序(2026-08-30 用户要求);未命名组仍按编号。
   const peopleNamed = $derived(sortPeopleBySamples(peopleFiltered.filter((p) => p.name)));
 
-  /** 「概览与整理」徽标:待拍板的活(有效回执+建议+同名组+无样本);失效存档不计。 */
+  /** 「概览与整理」徽标:待拍板的活(有效回执+身份线索+建议+同名组+无样本);失效存档不计。
+      身份线索与 /speakers 页同一队列(此前漏计:页面上有卡、徽标却是 0)。 */
   const tidyBadge = $derived(
-    splitArchive(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed)).pending.length,
+    splitArchive(
+      buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed, tidy.visibleIdentify),
+    ).pending.length,
   );
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");

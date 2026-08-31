@@ -24,6 +24,7 @@
     onDelete,
     onUnlink,
     onMarkMulti,
+    blockedReason = null,
   }: {
     speakers: Record<
       string,
@@ -71,6 +72,9 @@
     /** 标记为多人混杂(可选)。回调只负责打开处置面板;真正的打标由面板内确认后执行。
         已标记的说话人不再显示此入口(chip 上会带「多人」徽标)。 */
     onMarkMulti?: (id: string) => void;
+    /** 拆分/删除暂不可用的原因(如 Aing 进行中)。有值时两行不藏,置灰并写明原因——
+        功能"时有时无"比"现在不能用,因为……"更让人以为坏了(2026-08-31 用户实报)。 */
+    blockedReason?: string | null;
   } = $props();
 
   let editingId = $state<string | null>(null);
@@ -430,23 +434,21 @@
                     </button>
                   {/if}
                 {/if}
-                <button class="row" onclick={() => markAsMe(id)}>
-                  <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
-                    <circle cx="8" cy="5.2" r="2.6" />
-                    <path d="M2.8 13.4c.9-2.4 2.9-3.6 5.2-3.6s4.3 1.2 5.2 3.6" />
-                  </svg>
-                  {t("speakers.chipMe")}
-                </button>
-                {#if onUnlink && speakers[id]?.person_id}
-                  <button class="row" onclick={() => commitUnlink(id)}>
+              {/if}
+              <!-- 动作行常驻(输入名字时也在):拆分排第一——分人错了是最常见、
+                   也最要紧的修正,不能埋在试听与人物列表之间。 -->
+              {#if onMarkMulti && !speakers[id]?.multi_speaker}
+                {#if blockedReason}
+                  <div class="row row-off">
                     <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
-                      <path d="M6.5 9.5 4.8 11.2a2.4 2.4 0 0 1-3.4-3.4l1.7-1.7M9.5 6.5l1.7-1.7a2.4 2.4 0 0 1 3.4 3.4l-1.7 1.7M6 10l4-4" />
+                      <circle cx="5.5" cy="5.5" r="2.6" /><circle cx="10.5" cy="5.5" r="2.6" />
+                      <path d="M2.2 13.4c.6-2.1 1.9-3.2 3.3-3.2m5 0c1.4 0 2.7 1.1 3.3 3.2" />
                     </svg>
-                    {t("speakers.chipUnlink")}
-                  </button>
-                {/if}
-                {#if onMarkMulti && !speakers[id]?.multi_speaker}
-                  <button class="row" onclick={() => { cancelEdit(); onMarkMulti(id); }}>
+                    {t("speakers.chipMarkMulti")}
+                    <span class="row-sub">{blockedReason}</span>
+                  </div>
+                {:else}
+                  <button class="row" title={t("speakers.chipMarkMultiTitle")} onclick={() => { cancelEdit(); onMarkMulti(id); }}>
                     <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                       <circle cx="5.5" cy="5.5" r="2.6" /><circle cx="10.5" cy="5.5" r="2.6" />
                       <path d="M2.2 13.4c.6-2.1 1.9-3.2 3.3-3.2m5 0c1.4 0 2.7 1.1 3.3 3.2" />
@@ -454,18 +456,41 @@
                     {t("speakers.chipMarkMulti")}
                   </button>
                 {/if}
-                {#if onDelete}
-                  {#if deletePending}
-                    <button class="row strong" onclick={() => commitDelete(id)}>{t("speakers.chipDeleteConfirm")}</button>
-                    <button class="row quiet" onclick={() => (deletePending = false)}>{t("speakers.cancel")}</button>
-                  {:else}
-                    <button class="row" onclick={() => (deletePending = true)}>
-                      <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
-                        <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.7 8.5h4.6l.7-8.5" />
-                      </svg>
-                      {t("speakers.chipDelete")}
-                    </button>
-                  {/if}
+              {/if}
+              <button class="row" onclick={() => markAsMe(id)}>
+                <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                  <circle cx="8" cy="5.2" r="2.6" />
+                  <path d="M2.8 13.4c.9-2.4 2.9-3.6 5.2-3.6s4.3 1.2 5.2 3.6" />
+                </svg>
+                {t("speakers.chipMe")}
+              </button>
+              {#if onUnlink && speakers[id]?.person_id}
+                <button class="row" onclick={() => commitUnlink(id)}>
+                  <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                    <path d="M6.5 9.5 4.8 11.2a2.4 2.4 0 0 1-3.4-3.4l1.7-1.7M9.5 6.5l1.7-1.7a2.4 2.4 0 0 1 3.4 3.4l-1.7 1.7M6 10l4-4" />
+                  </svg>
+                  {t("speakers.chipUnlink")}
+                </button>
+              {/if}
+              {#if onDelete && blockedReason}
+                <div class="row row-off">
+                  <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                    <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.7 8.5h4.6l.7-8.5" />
+                  </svg>
+                  {t("speakers.chipDelete")}
+                  <span class="row-sub">{blockedReason}</span>
+                </div>
+              {:else if onDelete}
+                {#if deletePending}
+                  <button class="row strong" onclick={() => commitDelete(id)}>{t("speakers.chipDeleteConfirm")}</button>
+                  <button class="row quiet" onclick={() => (deletePending = false)}>{t("speakers.cancel")}</button>
+                {:else}
+                  <button class="row" onclick={() => (deletePending = true)}>
+                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                      <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.7 8.5h4.6l.7-8.5" />
+                    </svg>
+                    {t("speakers.chipDelete")}
+                  </button>
                 {/if}
               {/if}
               {#if people && onPick}

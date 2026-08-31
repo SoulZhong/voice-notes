@@ -625,12 +625,6 @@
     void id;
     void refreshMultiOps();
   });
-  /** 打标入口(两个视图共用:一波说话人后修订稿胸牌就是 S 本尊,无需映射)。
-      仅存留给历史中断 op 的恢复面板;默认路径已换一键拆分(2026-08-22 设计)。 */
-  function openMultiForRaw(sid: string) {
-    multiPanel = { candidates: [sid], existingOp: null };
-  }
-
   // ── 一键拆分(2026-08-22-one-click-split-design.md):点击即后台全默认执行 ──
   let autoSplitRunning = $state(false);
   /** 逐段嵌入进度(done/total);null=尚无事件(装载/解码阶段)。 */
@@ -2348,7 +2342,8 @@
       <!-- 说话人条:修订稿与原始逐字稿同一份 speakers.json、同一套交互,不随视图切换变化
            (2026-08-28 用户实报:修订稿上不可点、逐字稿上可点)。改名/选人/取消关联
            只写 speakers.json,Aing 整写的是 aing.json,互不相扰,故 Aing 中照常可编;
-           删除与标记多人后端在 Aing 中拒绝(管线随后整写会引用旧表项),前端同口径隐藏。
+           删除与拆分后端在 Aing 中拒绝(管线随后整写会引用旧表项),前端不藏、置灰并写原因
+           (blockedReason;藏掉会被当成"没有这个功能",2026-08-31 用户实报)。
            录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
       <SpeakerChips
         speakers={note.speakers}
@@ -2361,9 +2356,10 @@
               assignNoteSpeakerPerson(id, sid, personId, sample?.auditedSeq ?? lastAuditioned[sid], sample?.selectedSeqs?.length ? sample.selectedSeqs : undefined)
           : undefined}
         onDetachClip={canEdit ? detachClip : undefined}
-        onDelete={canEdit && !refining ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
+        onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
         onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
-        onMarkMulti={canEdit && !refining ? runAutoSplit : undefined}
+        onMarkMulti={canEdit ? runAutoSplit : undefined}
+        blockedReason={refining ? t("speakers.chipBlockedAing") : null}
         onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
         previewClips={canEdit && tracks.length > 0 ? previewClips : undefined}
         onPreviewClip={canEdit && tracks.length > 0 ? previewSpeakerClip : undefined}
