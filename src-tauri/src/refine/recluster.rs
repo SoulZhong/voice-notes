@@ -1,4 +1,5 @@
-//! A1 离线全局重聚类:AHC 平均链接(质心近似)。纯逻辑,嵌入由调用方提供。
+//! A1 离线全局重聚类:AHC 平均链接(精确:簇向量存**未归一化**成员均值,两均值点积
+//! 恰等于两簇成员两两余弦的平均值)。纯逻辑,嵌入由调用方提供。
 //! 在线单遍聚类(registry.rs)只做录制中临时标签;本模块产终稿。
 
 use std::collections::BTreeMap;
@@ -14,6 +15,16 @@ pub const AHC_THRESHOLD: f32 = 0.68;
 pub const MIN_CLUSTER_MS: u64 = 8000;
 /// 段时长低于此值(ms)不提嵌入(调用方遵守;本模块按 embs=None 处理)。
 pub const MIN_EMBED_MS: u64 = 1500;
+/// 拆分路径的碎片门槛(ms):AHC 后总时长低于此值的组是"碎片",只在与某个大组
+/// (≥ 此值)足够像时并入它;否则仍独立成组(短发言者正是要分出来的人,不强并)。
+///
+/// 2026-08-31 现场会(8 人、单麦远场)实测:平均连接 0.68 得 167 组 = 8 个 ≥1 分钟的
+/// 大组 + 157 个 <30s 碎片(其中 150+ 是单段),不吞并就是 76 个「新说话人」胸牌。
+pub const SPLIT_FRAGMENT_MS: u64 = 30_000;
+/// 碎片并入最近大组所需的最低质心余弦。近场会议跨人相似 0.3~0.45,远场同房间
+/// 跨人可达 0.6~0.8——0.5 让近场的短插话者保持独立,远场的碎片归到最像的人。
+/// 同场实测 floor 0.5 吞并 152/157,留 5 个 1.5s 单段。
+pub const SPLIT_ABSORB_SIM: f32 = 0.5;
 
 pub struct SegInput {
     pub seq: u64,
@@ -92,20 +103,30 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 struct Cl {
-    centroid: Vec<f32>,   // 单位化
-    members: Vec<usize>,  // inputs 下标
+    /// 成员单位向量的**未归一化**均值。两簇 `dot(mean_a, mean_b)` 恰等于成员两两余弦
+    /// 的平均值(Σ_a Σ_b a·b / (|A||B|) = mean_A · mean_B),即精确的平均链接。
+    ///
+    /// 2026-08-31 事故:此前这里存的是归一化质心,合并后再归一——归一化把噪声
+    /// 平均掉之后,两簇质心的余弦**系统性高于**成员两两余弦的平均值;远场单麦
+    /// 会议里跨人段两两 ~0.55 却质心 ~0.75,巨簇越大越像"房间平均声",8 人 1100 段
+    /// 链式并成 1 个巨簇 + 104 个单段。去掉归一化就是精确平均链接,同场分出 8 人。
+    mean: Vec<f32>,
+    members: Vec<usize>, // inputs 下标
     total_ms: u64,
 }
 
-/// 合并两簇质心:按成员数加权平均后再归一化。这是平均链接(average-linkage)的
-/// 质心近似——真实"全体样本重新求均值"与"两质心按成员数加权"在数学上等价当
-/// 且仅当两侧质心本身就是各自成员的精确均值;多轮合并累积后会有轻微漂移误差,
-/// 但对聚类判定(是否越过阈值)影响可忽略,换来的是不必存储/重扫全部原始向量。
-fn merge_centroid(a: &Cl, b: &Cl) -> Vec<f32> {
+impl Cl {
+    /// 单位化质心(种子比对/碎片归属用;聚类判定不用它)。
+    fn centroid(&self) -> Vec<f32> {
+        normalize(&self.mean).unwrap_or_else(|| self.mean.clone())
+    }
+}
+
+/// 合并两簇均值:按成员数加权,不归一化(见 Cl::mean)。
+fn merge_mean(a: &Cl, b: &Cl) -> Vec<f32> {
     let wa = a.members.len() as f32;
     let wb = b.members.len() as f32;
-    let mixed: Vec<f32> = a.centroid.iter().zip(&b.centroid).map(|(x, y)| x * wa + y * wb).collect();
-    normalize(&mixed).unwrap_or_else(|| a.centroid.clone())
+    a.mean.iter().zip(&b.mean).map(|(x, y)| (x * wa + y * wb) / (wa + wb)).collect()
 }
 
 /// 拆分建议的一个组:成员段(下标指向 inputs)+ 最像的库种子(去处建议)。
@@ -125,8 +146,11 @@ pub struct SplitSuggestion {
 
 /// 混杂簇的**拆分专用**聚类(设计:2026-08-20-mixed-speaker-split-design.md 承诺三)。
 /// 与常规 recluster 的三点差别,都是刻意的:
-/// - **不做碎片吞并**(MIN_CLUSTER_MS 不生效):混杂簇里的短发言者正是要分出来的人,
-///   常规路径会把 <8s 的簇无条件并进最近大簇,功能等于没有(codex 设计轮一 P1⑦)
+/// - **不无条件吞并碎片**(MIN_CLUSTER_MS 不生效):混杂簇里的短发言者正是要分出来的人,
+///   常规路径会把 <8s 的簇无条件并进最近大簇,功能等于没有(codex 设计轮一 P1⑦)。
+///   2026-08-31 起改为**有条件吞并**:<SPLIT_FRAGMENT_MS 的组只在与某大组质心余弦
+///   ≥ SPLIT_ABSORB_SIM 时并入;不像任何大组的仍独立成组(远场单麦会议不吞并会
+///   得 76 个胸牌,见常量注释)
 /// - 无嵌入的段**不按相邻传播**:这簇的段本来就不连续,"相邻"没有意义;统一进
 ///   无法判定桶(不只 <1.5s 的,嵌入失败/轨道缺失都算,codex 设计轮三 P2②)
 /// - 种子只用来给每组标"最像谁"(建议去处),不改变分组本身
@@ -142,19 +166,19 @@ pub fn recluster_split(
     for (i, e) in embs.iter().enumerate() {
         match e.as_ref().and_then(|v| normalize(v)) {
             Some(u) => cls.push(Cl {
-                centroid: u,
+                mean: u,
                 members: vec![i],
                 total_ms: inputs[i].end_ms.saturating_sub(inputs[i].start_ms),
             }),
             None => undetermined_idx.push(i),
         }
     }
-    // AHC(与常规同一内核同一阈值),但到此为止——没有碎片吞并、没有传播。
+    // AHC(精确平均链接:均值点积),没有传播。
     loop {
         let mut best: Option<(usize, usize, f32)> = None;
         for i in 0..cls.len() {
             for j in (i + 1)..cls.len() {
-                let sim = dot(&cls[i].centroid, &cls[j].centroid);
+                let sim = dot(&cls[i].mean, &cls[j].mean);
                 if best.map_or(true, |(_, _, s)| sim > s) {
                     best = Some((i, j, sim));
                 }
@@ -165,13 +189,37 @@ pub fn recluster_split(
                 debug_assert!(i < j);
                 let b = cls.swap_remove(j);
                 let a = &mut cls[i];
-                a.centroid = merge_centroid(a, &b);
+                a.mean = merge_mean(a, &b);
                 a.members.extend(b.members);
                 a.total_ms += b.total_ms;
             }
             _ => break,
         }
     }
+    // 有条件碎片吞并:碎片(<SPLIT_FRAGMENT_MS)并入最像的大组(≥SPLIT_FRAGMENT_MS),
+    // 要求质心余弦 ≥ SPLIT_ABSORB_SIM;没有大组或不够像则原样保留。大组质心在
+    // 吞并过程中固定(单遍、与顺序无关)。
+    let (mut bigs, frags): (Vec<Cl>, Vec<Cl>) = cls.into_iter().partition(|c| c.total_ms >= SPLIT_FRAGMENT_MS);
+    let big_centroids: Vec<Vec<f32>> = bigs.iter().map(Cl::centroid).collect();
+    let mut cls: Vec<Cl> = Vec::new();
+    for f in frags {
+        let fc = f.centroid();
+        let best = big_centroids
+            .iter()
+            .enumerate()
+            .map(|(k, bc)| (k, dot(&fc, bc)))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        match best {
+            Some((k, sim)) if sim >= SPLIT_ABSORB_SIM => {
+                let t = &mut bigs[k];
+                t.mean = merge_mean(t, &f);
+                t.members.extend(f.members);
+                t.total_ms += f.total_ms;
+            }
+            _ => cls.push(f),
+        }
+    }
+    cls.extend(bigs);
     // 同名强建议合组(2026-08-22 用户拍板「甲」):多个组的最近种子指向同一人且都
     // 过 SEED_ASSIGN_THRESHOLD,拆开自相矛盾(724 段大簇实测碎成 15 组、5 组同标
     // 「像是徐万振?」)。声纹既然笃定是同一人,就并成一组;低于阈值的仅是参考,
@@ -179,9 +227,10 @@ pub fn recluster_split(
     let seed_of = |c: &Cl| -> Option<(String, String, f32)> {
         // 最像的种子:同一 person 多种子取 max(与 seed_clusters 的多种子语义一致)。
         let mut best: Option<(String, String, f32)> = None;
+        let cc = c.centroid();
         for sd in seeds {
             if let Some(u) = normalize(&sd.centroid) {
-                let sim = dot(&c.centroid, &u);
+                let sim = dot(&cc, &u);
                 if best.as_ref().map_or(true, |(_, _, s)| sim > *s) {
                     best = Some((sd.person.clone(), sd.name.clone(), sim));
                 }
@@ -196,7 +245,7 @@ pub fn recluster_split(
             Some((pid, _, _)) => match by_person.get(&pid) {
                 Some(&k) => {
                     let t = &mut merged[k];
-                    t.centroid = merge_centroid(t, &c);
+                    t.mean = merge_mean(t, &c);
                     t.members.extend(c.members);
                     t.total_ms += c.total_ms;
                 }
@@ -398,6 +447,67 @@ mod tests {
         assert_eq!(sug.groups.len(), 2, "3 秒短发言者必须独立成组");
         assert!(sug.groups.iter().any(|g| g.member_idx == vec![2]));
         assert!(sug.undetermined_idx.is_empty());
+    }
+
+    /// 大组在场时,不像任何大组的短发言者仍独立成组;像某大组的碎片并入它。
+    #[test]
+    fn split_absorbs_similar_fragment_but_keeps_dissimilar_short_speaker() {
+        let mut inputs = Vec::new();
+        let mut embs = Vec::new();
+        // 大组:8 段 × 5s = 40s(≥ SPLIT_FRAGMENT_MS)
+        for i in 0..8u64 {
+            inputs.push(seg(i, i * 5000, i * 5000 + 5000));
+            embs.push(v([1.0, 0.0, 0.0], 0.01 * (i as f32 % 2.0)));
+        }
+        // 碎片 A(3s):与大组余弦 ~0.7(≥0.5)→ 并入
+        inputs.push(seg(8, 50_000, 53_000));
+        embs.push(Some(vec![0.7, 0.71, 0.0]));
+        // 碎片 B(3s):正交(0)→ 独立成组
+        inputs.push(seg(9, 60_000, 63_000));
+        embs.push(v([0.0, 0.0, 1.0], 0.0));
+        let sug = recluster_split(&inputs, &embs, &[]);
+        assert_eq!(sug.groups.len(), 2, "像的碎片并入大组,不像的独立");
+        assert!(sug.groups[0].member_idx.contains(&8), "碎片 A 应并入大组");
+        assert_eq!(sug.groups[1].member_idx, vec![9]);
+    }
+
+    /// 2026-08-31 现场会回归:同房间远场——每段 = 房间分量 + 说话人分量 + 噪声。
+    /// 归一化质心法会把 3 人链式并成 1 组(质心去噪后跨人余弦被抬高),精确平均
+    /// 链接分成 3 个纯组。
+    #[test]
+    fn split_separates_far_field_speakers_sharing_room_signature() {
+        // 确定性伪随机(LCG)→ 近似正态(12 个均匀数求和)
+        let mut st: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut normal = || -> f32 {
+            let mut acc = 0.0f32;
+            for _ in 0..12 {
+                st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                acc += ((st >> 33) as f32) / (u32::MAX >> 1) as f32;
+            }
+            acc - 6.0
+        };
+        const DIM: usize = 64;
+        let room: Vec<f32> = (0..DIM).map(|_| normal()).collect();
+        let spk: Vec<Vec<f32>> = (0..3).map(|_| (0..DIM).map(|_| normal()).collect()).collect();
+        let mut inputs = Vec::new();
+        let mut embs = Vec::new();
+        let mut truth = Vec::new();
+        for k in 0..3usize {
+            for i in 0..40u64 {
+                let seq = (k as u64) * 40 + i;
+                inputs.push(seg(seq, seq * 4000, seq * 4000 + 3000));
+                let v: Vec<f32> = (0..DIM).map(|d| 1.6 * room[d] + 1.0 * spk[k][d] + 0.9 * normal()).collect();
+                embs.push(Some(v));
+                truth.push(k);
+            }
+        }
+        let sug = recluster_split(&inputs, &embs, &[]);
+        let big: Vec<&SplitGroup> = sug.groups.iter().filter(|g| g.total_ms >= SPLIT_FRAGMENT_MS).collect();
+        assert_eq!(big.len(), 3, "3 个远场说话人应分成 3 个大组,实得 {} 组", sug.groups.len());
+        for g in &big {
+            let k0 = truth[g.member_idx[0]];
+            assert!(g.member_idx.iter().all(|&i| truth[i] == k0), "大组必须纯:一组只含一个人");
+        }
     }
 
     #[test]
