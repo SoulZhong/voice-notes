@@ -1279,6 +1279,14 @@
     refinedSaveErr = "";
     exportMenuOpen = false;
     exportMsg = "";
+    // 圈选游标是会话态且以毫秒记在**本篇**时间轴上:不清的话切到别篇会沿用旧值,
+    // 导出静默取错区间(Codex 审出)。
+    rangeStartMs = null;
+    rangeEndMs = null;
+    rangeDragging = false;
+    rangeHintSeq = null;
+    rangeHintEdge = null;
+    clearTimeout(rangeHintTimer);
   });
 
   // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。

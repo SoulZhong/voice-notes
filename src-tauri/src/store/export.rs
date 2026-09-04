@@ -195,21 +195,44 @@ fn clip_track_to(
     result
 }
 
-/// 录制格式 WAV(16k 单声道 s16)按毫秒裁剪:重写 44 字节头 + 拷贝数据区切片,
-/// 零重编码。起点越界报错;终点越界钳到文件末尾(游标停在音频略短于时间轴的
-/// 尾巴之外属正常,不该报错)。
+/// 录制口径 WAV(16k 单声道 s16)按毫秒裁剪:逐块定位 `data` 块(不可假设 44 字节
+/// 标准头——afconvert 解出的 WAV 带 40 字节 fmt 块与 FLLR 填充块,按固定偏移裁会把
+/// 元数据当音频,Codex 审出),块内按字节切片、重写标准头,零重编码、流式拷贝。
+/// 起点越界报错;终点越界钳到数据末尾(游标停在音频略短于时间轴的尾巴之外属正常)。
 fn clip_wav(src: &std::path::Path, dest: &std::path::Path, start_ms: u64, end_ms: u64) -> anyhow::Result<()> {
-    use super::audio::{ms_to_bytes, wav_header, HEADER_LEN};
+    use super::audio::{ms_to_bytes, wav_header};
     use std::io::{Read, Seek, SeekFrom, Write};
     let mut f = std::fs::File::open(src)?;
-    let data_len = f.metadata()?.len().saturating_sub(HEADER_LEN);
+    let mut head = [0u8; 12];
+    f.read_exact(&mut head)?;
+    if &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        anyhow::bail!("非 WAV 数据: {}", src.display());
+    }
+    let file_len = f.metadata()?.len();
+    // 块遍历与 transcode::read_wav_f32_slice 同款口径:size 以文件长度为上限,
+    // 块尾按 RIFF 规则补齐到偶数,溢出即报错(坏块不死循环)。
+    let mut pos = 12u64;
+    let (data_start, data_len) = loop {
+        if pos + 8 > file_len {
+            anyhow::bail!("WAV 无 data 块: {}", src.display());
+        }
+        f.seek(SeekFrom::Start(pos))?;
+        let mut ch = [0u8; 8];
+        f.read_exact(&mut ch)?;
+        let size = u64::from(u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]));
+        let start = pos + 8;
+        if &ch[0..4] == b"data" {
+            break (start, size.min(file_len.saturating_sub(start)));
+        }
+        pos = start.saturating_add(size).saturating_add(size & 1);
+    };
     let from = ms_to_bytes(start_ms);
     let to = ms_to_bytes(end_ms).min(data_len);
     if from >= data_len || to <= from {
         anyhow::bail!("圈定范围在音频末尾之外");
     }
     let n = to - from;
-    f.seek(SeekFrom::Start(HEADER_LEN + from))?;
+    f.seek(SeekFrom::Start(data_start + from))?;
     let mut out = std::io::BufWriter::new(std::fs::File::create(dest)?);
     out.write_all(&wav_header(u32::try_from(n)?))?;
     let mut remaining = n;
@@ -934,6 +957,38 @@ mod export_audio_to_tests {
 
         // 空范围:报错
         assert!(store.export_audio_to(&id, &out.path().join("y.wav"), Some((300, 300))).is_err());
+    }
+
+    /// afconvert 解出的 WAV 不是 44 字节标准头(40 字节 fmt 块 + FLLR 填充块):
+    /// clip_wav 必须逐块定位 data,按固定偏移裁会把元数据当音频(Codex 审出)。
+    #[test]
+    fn clip_wav_handles_afconvert_style_headers() {
+        use crate::store::audio::ms_to_bytes;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("weird.wav");
+        let pcm: Vec<u8> = (0u16..8000).flat_map(|i| (i as i16).to_le_bytes()).collect(); // 0.5s @16k s16
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 总长占位:解析按块走
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 40]);
+        bytes.extend_from_slice(b"FLLR");
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 100]);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&pcm);
+        std::fs::write(&src, &bytes).unwrap();
+
+        let dest = dir.path().join("cut.wav");
+        super::clip_wav(&src, &dest, 100, 300).unwrap();
+        let cut = std::fs::read(&dest).unwrap();
+        let (from, to) = (ms_to_bytes(100) as usize, ms_to_bytes(300) as usize);
+        assert_eq!(&cut[44..], &pcm[from..to], "data 从块内正确偏移取出");
+        let declared = u32::from_le_bytes(cut[40..44].try_into().unwrap()) as usize;
+        assert_eq!(declared, to - from);
     }
 
     #[test]
