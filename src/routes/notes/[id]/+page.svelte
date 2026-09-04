@@ -55,6 +55,7 @@
     noteCalendarPermission,
     identifyNote,
     finalizeInterruptedNote,
+    formatTs,
     type CalendarCandidate,
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
@@ -1278,6 +1279,14 @@
     refinedSaveErr = "";
     exportMenuOpen = false;
     exportMsg = "";
+    // 圈选游标是会话态且以毫秒记在**本篇**时间轴上:不清的话切到别篇会沿用旧值,
+    // 导出静默取错区间(Codex 审出)。
+    rangeStartMs = null;
+    rangeEndMs = null;
+    rangeDragging = false;
+    rangeHintSeq = null;
+    rangeHintEdge = null;
+    clearTimeout(rangeHintTimer);
   });
 
   // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。
@@ -1737,12 +1746,75 @@
     if (playerPlaying) untrack(resumeFollow);
   });
   $effect(() => {
-    if (!playerPlaying || !follow) return;
+    if (!playerPlaying || !follow || rangeDragging) return;
     if (currentSeq !== null && currentSeq !== lastScrolledSeq) {
       lastScrolledSeq = currentSeq;
       centerCurrent();
     }
   });
+
+  // ── 圈选游标(导出范围):会话态,不落盘。拖动中与原始逐字稿联动——离游标
+  //    最近的段滚到屏幕中央并高亮,松手后高亮片刻消散。 ──
+  let rangeStartMs = $state<number | null>(null);
+  let rangeEndMs = $state<number | null>(null);
+  let rangeDragging = $state(false);
+  let rangeHintSeq = $state<number | null>(null);
+  /** 正拖的是哪枚游标:决定联动段的切线画在文字上方(start)还是下方(end)。 */
+  let rangeHintEdge = $state<"start" | "end" | null>(null);
+  let rangeHintTimer: ReturnType<typeof setTimeout> | undefined;
+  function onRangeDrag(which: "start" | "end", ms: number) {
+    rangeDragging = true;
+    clearTimeout(rangeHintTimer);
+    // 离游标最近的段:命中区间即距离 0;边界与播放高亮同一套 seekFix 修正。
+    let best: number | null = null;
+    let bestD = Infinity;
+    for (const sg of displaySegments) {
+      const s = seekFix(sg.start_ms, sg.source);
+      const e = seekFix(sg.end_ms, sg.source);
+      const d = ms < s ? s - ms : ms >= e ? ms - e + 1 : 0;
+      if (d < bestD) {
+        bestD = d;
+        best = sg.seq;
+        if (d === 0) break;
+      }
+    }
+    if (best === null) return;
+    // 联动的对象是原始逐字稿:正看修订稿就自动切过去(2026-09-04 用户点名)。
+    // 切换后 .md-seg 由编辑器异步重建,此刻 querySelector 多半扑空——滚动交给
+    // 下方高亮 effect 在 segmentsrendered 后补(scrollHintIntoView 幂等)。
+    if (effectiveView === "refined") viewMode = "raw";
+    rangeHintSeq = best;
+    rangeHintEdge = which;
+    scrollHintIntoView(best);
+  }
+  /** 把联动段滚到屏幕中央(每个 seq 只滚一次,拖动中同段的连续 move 不重复滚;
+      behavior 用默认瞬时滚动——拖动是连续手势,平滑滚动追不上会一路抖)。 */
+  let lastHintScrolled = -1;
+  function scrollHintIntoView(seq: number) {
+    if (lastHintScrolled === seq) return;
+    const el = document.querySelector(`[data-seq="${seq}"]`);
+    if (!el) return; // 还没渲染出来:等 segRenderTick 驱动高亮 effect 时重试
+    lastHintScrolled = seq;
+    el.scrollIntoView({ block: "center" });
+  }
+  function onRangeDragEnd() {
+    rangeDragging = false;
+    lastHintScrolled = -1;
+    clearTimeout(rangeHintTimer);
+    rangeHintTimer = setTimeout(() => {
+      rangeHintSeq = null;
+      rangeHintEdge = null;
+    }, 1600);
+  }
+  /** 游标圈定的导出范围;未圈定或覆盖全程时为 null(导整篇)。 */
+  function exportRange(): { start: number; end: number } | null {
+    const total = player?.durationMs() ?? 0;
+    if (total <= 0) return null;
+    const s = Math.max(0, rangeStartMs ?? 0);
+    const e = Math.min(total, rangeEndMs ?? total);
+    if (e <= s || (s <= 0 && e >= total)) return null;
+    return { start: Math.round(s), end: Math.round(e) };
+  }
 
   // wheel 上滑 = 主动离开(平滑滚动只产生 scroll 事件,不会误判);内容不足一屏不触发。
   $effect(() => {
@@ -1978,15 +2050,23 @@
     const el = transcriptEl;
     const active = activeSeqs;
     const discarded = discardedSeqs;
+    const hint = rangeHintSeq;
+    const edge = rangeHintEdge;
     void segRenderTick;
     if (!el || effectiveView === "refined") return;
     for (const node of el.querySelectorAll<HTMLElement>(".md-seg")) {
       const seq = Number(node.dataset.seq);
       node.classList.toggle("playing", active.has(seq));
+      node.classList.toggle("range-hint", seq === hint);
+      node.classList.toggle("hint-start", seq === hint && edge === "start");
+      node.classList.toggle("hint-end", seq === hint && edge === "end");
       node.classList.toggle("discarded", discarded.has(seq));
       if (discarded.has(seq)) node.title = t("notes.seg.filtered");
       else node.removeAttribute("title");
     }
+    // 拖游标触发的修订稿→原始稿自动切换:切换当拍 .md-seg 尚未渲染,联动段的
+    // 首次滚动在这里补(segmentsrendered → segRenderTick 变化驱动;幂等,已滚过不重复)。
+    if (hint !== null && rangeDragging) scrollHintIntoView(hint);
   });
 
   // Escape 还原桥接:segments 编辑器在段内 Escape 时派发 segescape(不冒泡,与
@@ -2050,6 +2130,7 @@
     // 是点击导出那一刻用户看到的那份。
     const noteId = id;
     const preferRefined = effectiveView === "refined";
+    const range = exportRange(); // 同样在 await 前快照:对话框开着时游标可能被再拖
     try {
       // 保存对话框让用户挑落盘位置(冒烟反馈:旧流程写进数据目录再开 Finder,
       // 用户以为"只是打开了文件夹")。默认名 = 标题+录音时间;取消返回 null,
@@ -2059,7 +2140,7 @@
         filters: [{ name: "Markdown", extensions: ["md"] }],
       });
       if (!dest) return;
-      const path = await exportNote(noteId, format, preferRefined, dest);
+      const path = await exportNote(noteId, format, preferRefined, dest, range);
       exportMsg = t("notes.export.done", { path });
       // 清掉早前失败留下的红色横幅,避免"上面报失败下面报成功"并存。
       // 前缀判定:导出失败文案去掉 {e} 占位后的固定头部。
@@ -2077,13 +2158,14 @@
     if (!track) return;
     const noteId = id;
     const ext = track.path.split(".").pop() || "m4a";
+    const range = exportRange(); // await 前快照,同 doExport
     try {
       const dest = await save({
         defaultPath: exportFileName(note.meta.title, note.meta.started_at, ext),
         filters: [{ name: "Audio", extensions: [ext] }],
       });
       if (!dest) return;
-      const path = await exportNoteAudio(noteId, dest);
+      const path = await exportNoteAudio(noteId, dest, range);
       exportMsg = t("notes.export.done", { path });
       if (error.startsWith(t("notes.export.failed", { e: "" }))) error = "";
     } catch (e) {
@@ -2270,6 +2352,10 @@
             {#if exportMenuOpen}
               <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_interactive_supports_focus -->
               <div class="export-menu" role="menu" onclick={(e) => e.stopPropagation()}>
+                {#if exportRange()}
+                  {@const r = exportRange()!}
+                  <p class="export-range-note">{t("notes.export.rangeNote", { start: formatTs(r.start), end: formatTs(r.end) })}</p>
+                {/if}
                 <button
                   class="export-item"
                   role="menuitem"
@@ -2314,7 +2400,7 @@
       <div class="transport">
         {#if canEdit && tracks.length > 0}
           <div class="player-slot">
-            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} bind:rangeStartMs bind:rangeEndMs {onRangeDrag} {onRangeDragEnd} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
@@ -2817,6 +2903,16 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);
   }
+  /* 圈定范围提示:游标圈了真子范围时出现在菜单顶部,交代两个导出项的作用域 */
+  .export-range-note {
+    margin: 0;
+    padding: 0.35em 0.7em 0.45em;
+    font-size: 0.75rem;
+    color: var(--ink-secondary);
+    border-bottom: 1px solid var(--hairline);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
   .export-item {
     border: none;
     background: none;
@@ -2984,6 +3080,19 @@
   /* 播放跟随:当前段 accent-tint 底,与 editable hover 同色系,安静不抢内容 */
   .transcript :global(.md-seg.playing) {
     background: var(--accent-tint);
+  }
+  /* 圈选游标联动:拖动游标时离它最近的段 accent-tint 底 + 切线交代边界方向——
+     开始游标的线在文字上方(从这里起导出)、结束游标在下方(到这里为止)。
+     线用 box-shadow 而非 border:不挤动版面(段间 6px margin 里画得下 2px 线);
+     拖完 1.6s 自动消散。 */
+  .transcript :global(.md-seg.range-hint) {
+    background: var(--accent-tint);
+  }
+  .transcript :global(.md-seg.range-hint.hint-start) {
+    box-shadow: 0 -2px 0 0 var(--accent);
+  }
+  .transcript :global(.md-seg.range-hint.hint-end) {
+    box-shadow: 0 2px 0 0 var(--accent);
   }
   /* 被 Aing 过滤掉的段(原始稿视角):灰显但保留可读,不做删除线/隐藏 */
   .transcript :global(.md-seg.discarded) {

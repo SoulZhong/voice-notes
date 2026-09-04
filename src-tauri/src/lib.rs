@@ -8498,9 +8498,18 @@ fn set_segment_speaker(
 /// 桌面 webview 为本地可信代码);export_to 内有兜底守卫:须绝对路径、不得落在
 /// 笔记数据目录内,写入为原子替换。
 #[tauri::command]
-fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool, dest: String) -> Result<String, String> {
+fn export_note(
+    app: AppHandle,
+    id: String,
+    format: String,
+    prefer_refined: bool,
+    dest: String,
+    range_start_ms: Option<u64>,
+    range_end_ms: Option<u64>,
+) -> Result<String, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let range = export_range(range_start_ms, range_end_ms)?;
     let refined = if prefer_refined {
         store::load_refined_for_display(&dir.join(&id)).map(|mut doc| {
             if let (Ok(note), Ok(root)) = (store::NoteStore::new(dir.clone()).load(&id), data_root(&app)) {
@@ -8514,7 +8523,7 @@ fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool,
     };
     let dest_path = std::path::PathBuf::from(&dest);
     let result = store::NoteStore::new(dir)
-        .export_to(&id, &format, refined.as_ref(), &dest_path)
+        .export_to(&id, &format, refined.as_ref(), &dest_path, range)
         .map(|_| dest)
         .map_err(|e| e.to_string());
     if result.is_ok() {
@@ -8525,14 +8534,33 @@ fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool,
     result
 }
 
+/// 导出圈选范围整形:两参数须同来同往(前端要么都给要么都空),半开区间须非空。
+/// 单独给一半按坏参数拒绝,不猜"另一半是 0/无穷"——猜错会静默导出意料外的范围。
+fn export_range(start: Option<u64>, end: Option<u64>) -> Result<Option<(u64, u64)>, String> {
+    match (start, end) {
+        (None, None) => Ok(None),
+        (Some(s), Some(e)) if e > s => Ok(Some((s, e))),
+        (Some(_), Some(_)) => Err("圈定范围为空".into()),
+        _ => Err("圈定范围参数不完整".into()),
+    }
+}
+
 /// 导出成品轨音频到用户选定路径(前端保存对话框拿到 dest)。守卫在 store 层
 /// (export_audio_to):绝对路径、不落数据目录内、tmp+rename 原子替换。
+/// 圈定范围时裁剪出该时间段(WAV 字节裁剪;m4a 解码重编码)。
 #[tauri::command]
-fn export_note_audio(app: AppHandle, id: String, dest: String) -> Result<String, String> {
+fn export_note_audio(
+    app: AppHandle,
+    id: String,
+    dest: String,
+    range_start_ms: Option<u64>,
+    range_end_ms: Option<u64>,
+) -> Result<String, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let range = export_range(range_start_ms, range_end_ms)?;
     store::NoteStore::new(dir)
-        .export_audio_to(&id, std::path::Path::new(&dest))
+        .export_audio_to(&id, std::path::Path::new(&dest), range)
         .map(|_| dest)
         .map_err(|e| e.to_string())
 }
