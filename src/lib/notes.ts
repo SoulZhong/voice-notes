@@ -277,13 +277,23 @@ export const deleteNoteSpeaker = (noteId: string, speakerId: string) =>
 /** 改名(命名即入库时,auditedSeq/selectedSeqs 决定样本料:勾选段优先、其次试听段)。 */
 export const renameSpeaker = (noteId: string, speakerId: string, name: string, auditedSeq?: number, selectedSeqs?: number[]) =>
   invoke<void>("rename_speaker", { noteId, speakerId, name, auditedSeq: auditedSeq ?? null, selectedSeqs: selectedSeqs ?? null });
+/** 导出圈选范围(播放器游标圈定,笔记时间轴毫秒):null=导整篇。 */
+export type ExportRange = { start: number; end: number } | null;
 /** 导出到用户选定路径(保存对话框),返回落盘绝对路径。preferRefined=真且修订稿
- * 在盘时导修订稿(所见即所得)。 */
-export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean, dest: string) =>
-  invoke<string>("export_note", { id, format, preferRefined, dest });
-/** 导出成品轨音频到用户选定路径(保存对话框流程);无成品轨后端报错。 */
-export const exportNoteAudio = (id: string, dest: string) =>
-  invoke<string>("export_note_audio", { id, dest });
+ * 在盘时导修订稿(所见即所得)。range 圈定时只导与范围重叠的段/段落。 */
+export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean, dest: string, range?: ExportRange) =>
+  invoke<string>("export_note", {
+    id,
+    format,
+    preferRefined,
+    dest,
+    rangeStartMs: range?.start ?? null,
+    rangeEndMs: range?.end ?? null,
+  });
+/** 导出成品轨音频到用户选定路径(保存对话框流程);无成品轨后端报错。
+ * range 圈定时裁剪出该时间段(整篇导出仍走原样拷贝)。 */
+export const exportNoteAudio = (id: string, dest: string, range?: ExportRange) =>
+  invoke<string>("export_note_audio", { id, dest, rangeStartMs: range?.start ?? null, rangeEndMs: range?.end ?? null });
 /** 在系统文件管理器中打开该笔记的存储目录。 */
 export const openNoteDir = (id: string) => invoke<void>("open_note_dir", { id });
 

@@ -20,6 +20,10 @@
     title,
     onLoaded,
     onUserPause,
+    rangeStartMs = $bindable(null),
+    rangeEndMs = $bindable(null),
+    onRangeDrag,
+    onRangeDragEnd,
   }: {
     tracks: TrackInfo[];
     /** 音轨波形(0..1 归一条高,按时间等分;由页面从段落 rms 聚合)。空数组退化为平轨。 */
@@ -38,6 +42,13 @@
         seek/play 间隙采到的 playing=false——从 playing 翻转推断必有竞态
         (2026-08-21 用户实测:整篇一直放),只有这里是确定的用户意图。 */
     onUserPause?: () => void;
+    /** 圈选范围两游标(导出用,会话态):null=未圈定,等效 0/全长。绑定给宿主,
+        导出时由宿主判定是否只导圈定段。 */
+    rangeStartMs?: number | null;
+    rangeEndMs?: number | null;
+    /** 拖动游标期间逐帧回调(which=哪个游标,ms=当前位置):宿主做逐字稿联动高亮。 */
+    onRangeDrag?: (which: "start" | "end", ms: number) => void;
+    onRangeDragEnd?: () => void;
   } = $props();
 
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
@@ -370,6 +381,64 @@
     else return;
     e.preventDefault();
   }
+
+  // ── 圈选游标(开始/结束):拖动圈定导出范围,拖动中回调宿主做逐字稿联动 ──
+  /** 两游标最小间距:防拖成零长/交叉(导出空音频无意义)。 */
+  const MIN_RANGE_MS = 1000;
+  /** 游标生效位置:null 视作 0/全长。totalMs 装载后才非 0,钳位随之收敛。 */
+  const effStart = $derived(Math.max(0, Math.min(rangeStartMs ?? 0, totalMs)));
+  const effEnd = $derived(rangeEndMs == null ? totalMs : Math.max(0, Math.min(rangeEndMs, totalMs)));
+  /** 圈定了真子范围(有游标离开端点):此时波形圈外条淡显。 */
+  const rangeActive = $derived(totalMs > 0 && (effStart > 0 || effEnd < totalMs));
+  let draggingHandle = $state<"start" | "end" | null>(null);
+  function pointerMs(e: PointerEvent): number {
+    if (!waveEl || totalMs <= 0) return 0;
+    const r = waveEl.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * totalMs;
+  }
+  function moveHandle(which: "start" | "end", ms: number) {
+    if (totalMs <= 0) return;
+    if (which === "start") {
+      const v = Math.round(Math.max(0, Math.min(ms, effEnd - MIN_RANGE_MS)));
+      rangeStartMs = v;
+      onRangeDrag?.("start", v);
+    } else {
+      const v = Math.round(Math.min(totalMs, Math.max(ms, effStart + MIN_RANGE_MS)));
+      rangeEndMs = v;
+      onRangeDrag?.("end", v);
+    }
+  }
+  function onHandleDown(which: "start" | "end", e: PointerEvent) {
+    if (totalMs <= 0) return;
+    e.stopPropagation(); // 不让底下的波形把这次按下当 seek
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    draggingHandle = which;
+    moveHandle(which, pointerMs(e));
+  }
+  function onHandleMove(e: PointerEvent) {
+    if (draggingHandle) moveHandle(draggingHandle, pointerMs(e));
+  }
+  function onHandleUp() {
+    if (!draggingHandle) return;
+    draggingHandle = null;
+    onRangeDragEnd?.();
+  }
+  function onHandleKey(which: "start" | "end", e: KeyboardEvent) {
+    const STEP = 1000;
+    const cur = which === "start" ? effStart : effEnd;
+    if (e.key === "ArrowLeft") moveHandle(which, cur - STEP);
+    else if (e.key === "ArrowRight") moveHandle(which, cur + STEP);
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+    onRangeDragEnd?.();
+  }
+  /** 条 i 的中心时刻是否落在圈外(rangeActive 时淡显圈外)。 */
+  function barOutside(i: number): boolean {
+    if (!rangeActive || bars.length === 0) return false;
+    const mid = ((i + 0.5) / bars.length) * totalMs;
+    return mid < effStart || mid > effEnd;
+  }
 </script>
 
 <div class="player">
@@ -406,8 +475,48 @@
     onkeydown={onWaveKey}
   >
     {#each bars as h, i (i)}
-      <span class="bar" class:played={i < playedBars} style="height: {6 + h * 94}%"></span>
+      <span class="bar" class:played={i < playedBars} class:outside={barOutside(i)} style="height: {6 + h * 94}%"></span>
     {/each}
+    <!-- 圈选游标:开始/结束各一枚,拖动圈定导出范围。旗标朝内(开始在上、结束在下)
+         区分两枚;拖动中或已离开端点时点亮 accent。 -->
+    {#if totalMs > 0}
+      <div
+        class="cursor start"
+        class:active={rangeActive || draggingHandle === "start"}
+        style="left: {(effStart / totalMs) * 100}%"
+        role="slider"
+        tabindex="0"
+        aria-label={t("notes.player.rangeStart")}
+        aria-valuemin={0}
+        aria-valuemax={totalMs}
+        aria-valuenow={effStart}
+        aria-valuetext={formatTs(effStart)}
+        title={`${t("notes.player.rangeStart")} ${formatTs(effStart)}`}
+        onpointerdown={(e) => onHandleDown("start", e)}
+        onpointermove={onHandleMove}
+        onpointerup={onHandleUp}
+        onpointercancel={onHandleUp}
+        onkeydown={(e) => onHandleKey("start", e)}
+      ></div>
+      <div
+        class="cursor end"
+        class:active={rangeActive || draggingHandle === "end"}
+        style="left: {(effEnd / totalMs) * 100}%"
+        role="slider"
+        tabindex="0"
+        aria-label={t("notes.player.rangeEnd")}
+        aria-valuemin={0}
+        aria-valuemax={totalMs}
+        aria-valuenow={effEnd}
+        aria-valuetext={formatTs(effEnd)}
+        title={`${t("notes.player.rangeEnd")} ${formatTs(effEnd)}`}
+        onpointerdown={(e) => onHandleDown("end", e)}
+        onpointermove={onHandleMove}
+        onpointerup={onHandleUp}
+        onpointercancel={onHandleUp}
+        onkeydown={(e) => onHandleKey("end", e)}
+      ></div>
+    {/if}
   </div>
   <span class="time">{formatTs(totalMs)}</span>
   {#if tracks.length > 1}
@@ -579,6 +688,7 @@
      等分条宽靠 flex:1+gap,条高内联(rms 归一)。touch-action:none 保拖拽定位不被
      滚动手势抢走。focus 用 accent 外环(与 editable-text 同语言)。 */
   .wave {
+    position: relative; /* 圈选游标的定位容器 */
     flex: 1;
     min-width: 0;
     height: 34px;
@@ -602,6 +712,59 @@
   }
   .bar.played {
     background: var(--accent);
+  }
+  /* 圈外条淡显:圈定了真子范围时,一眼看出哪段会被导出 */
+  .bar.outside {
+    opacity: 0.3;
+  }
+  /* 圈选游标:2px 竖线 + 朝内小旗标(开始在上、结束在下)。热区 14px 宽居中,
+     好抓;线与旗默认次级墨,拖动中/已圈定点亮 accent。 */
+  .cursor {
+    position: absolute;
+    top: -3px;
+    bottom: -3px;
+    width: 14px;
+    margin-left: -7px;
+    cursor: ew-resize;
+    touch-action: none;
+    z-index: 2;
+  }
+  .cursor::before {
+    content: "";
+    position: absolute;
+    left: 6px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    border-radius: var(--radius-full);
+    background: var(--ink-faint);
+  }
+  .cursor::after {
+    content: "";
+    position: absolute;
+    left: 6px;
+    width: 7px;
+    height: 7px;
+    background: var(--ink-faint);
+  }
+  .cursor.start::after {
+    top: 0;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  }
+  .cursor.end::after {
+    bottom: 0;
+    left: auto;
+    right: 6px;
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  }
+  .cursor.active::before,
+  .cursor.active::after {
+    background: var(--accent);
+  }
+  .cursor:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-radius: var(--radius-sm);
   }
   /* 音轨错误可视化:danger 色小字,贴在播放器下方 */
   .track-errors {

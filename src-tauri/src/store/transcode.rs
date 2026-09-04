@@ -43,7 +43,8 @@ fn run(cmd: &mut Command) -> anyhow::Result<std::process::Output> {
 }
 
 /// WAV → m4a(AAC 32kbps 单声道)。参数为控制器本机实测值。
-fn afconvert_encode(wav: &Path, m4a_tmp: &Path) -> anyhow::Result<()> {
+/// pub(crate):导出裁剪(export.rs)复用同一编码参数,防两处漂移。
+pub(crate) fn afconvert_encode(wav: &Path, m4a_tmp: &Path) -> anyhow::Result<()> {
     run(Command::new(AFCONVERT)
         .args(["-f", "m4af", "-d", "aac", "-b", "32000"])
         .arg(wav)
@@ -52,7 +53,8 @@ fn afconvert_encode(wav: &Path, m4a_tmp: &Path) -> anyhow::Result<()> {
 }
 
 /// m4a → WAV(16kHz 单声道 s16le,与录制格式一致,续录端可直接续写)。
-fn afconvert_decode(m4a: &Path, wav_tmp: &Path) -> anyhow::Result<()> {
+/// pub(crate):导出裁剪(export.rs)复用,解出的 WAV 与录制字节口径一致才能按毫秒裁。
+pub(crate) fn afconvert_decode(m4a: &Path, wav_tmp: &Path) -> anyhow::Result<()> {
     run(Command::new(AFCONVERT)
         .args(["-f", "WAVE", "-d", "LEI16@16000", "-c", "1"])
         .arg(m4a)
