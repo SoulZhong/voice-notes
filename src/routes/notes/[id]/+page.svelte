@@ -1969,6 +1969,12 @@
     const seg = note?.segments.find((s) => s.seq === attrs.seq);
     const speaker = seg?.speaker ?? null;
     const source = seg?.source ?? "mic";
+    // 无主段兜底按场景分流(2026-09-05 用户实报):「我/对方」的老约定来自线上会
+    // 双轨(mic=自己、system=远端);现场会(onsite)单麦所有人都进 mic 轨,短到没
+    // 声纹的段兜底成「我」是把别人安到用户头上——改中性灰「未识别」。
+    if (!speaker && sceneDoc?.final_scene === "onsite") {
+      return { label: t("notes.speaker.unknown"), bg: "var(--surface-press)", ink: "var(--ink-secondary)" };
+    }
     return {
       label: speakerLabel(speaker, source, note?.speakers ?? {}),
       bg: speakerColor(speaker, source, note?.speakers),
@@ -2148,6 +2154,9 @@
     void note?.speakers;
     void effectiveView;
     void segEditor;
+    // scene.json 异步到达要重建一次:无主段徽章按场景分流(onsite→「未识别」),
+    // scene 晚于首次渲染时不重建会让「我」残留(segBadge 是 NodeView 构造期快照)。
+    void sceneDoc?.final_scene;
     syncSegments();
   });
 

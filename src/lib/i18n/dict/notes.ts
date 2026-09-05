@@ -7,6 +7,7 @@ export const zh = {
   // notes.ts:兜底显示名与时长
   "notes.untitled": "未命名",
   "notes.speaker.me": "我",
+  "notes.speaker.unknown": "未识别",
   "notes.speaker.other": "对方",
   "notes.speaker.n": "说话人 {n}",
   "notes.speaker.newN": "新说话人 {n}",
@@ -180,6 +181,7 @@ export const zh = {
 export const en = {
   "notes.untitled": "Untitled",
   "notes.speaker.me": "Me",
+  "notes.speaker.unknown": "Unidentified",
   "notes.speaker.other": "Them",
   "notes.speaker.n": "Speaker {n}",
   "notes.speaker.newN": "New speaker {n}",
