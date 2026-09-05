@@ -2487,7 +2487,10 @@
           {@const editsRange = exportRange()}
           {@const editsRowOn = !!editsRange || edits.length > 0 || !!editsErr}
           <div class="player-slot" class:has-edits={editsRowOn}>
-            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} bind:rangeStartMs bind:rangeEndMs {onRangeDrag} {onRangeDragEnd} cuts={edits} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
+            <!-- cuts 试听期间临时清空:试听段可能恰好落在被删区间里,内核跳段会把
+                 它跳成"无声"(2026-09-05 用户实报);试听是"听清这段是谁"的动作,
+                 必须绕过删减,结束即恢复。 -->
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} bind:rangeStartMs bind:rangeEndMs {onRangeDrag} {onRangeDragEnd} cuts={preview ? [] : edits} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
             <!-- 音频剪辑行(非破坏性删减):播放器卡片的第二行(同底、hairline 分隔),
                  与下方说话人区自然分组。删除只记入剪辑表(edits.json),播放跳过、
                  导出剔除,原始录音不动。 -->

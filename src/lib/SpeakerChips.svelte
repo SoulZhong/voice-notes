@@ -367,7 +367,15 @@
                       {#each clips as c, i (c.seq)}
                         {@const playing = previewingId === id && previewingSeq === c.seq}
                         <div class="clip-line" class:playing class:picked={sampleSel.includes(c.seq)}>
-                        <button class="row clip" class:playing onclick={() => { lastPlayed[id] = c.seq; onPreviewClip(id, c.seq); }}>
+                        <!-- 播放态只靠均衡器动画 + accent 高亮传达,不再塞行内状态文字——
+                             浮层定宽,长文字会把「作为样本」挤压重叠(2026-09-05 用户截图);
+                             「再点停止」的说明进 title。 -->
+                        <button
+                          class="row clip"
+                          class:playing
+                          title={playing ? t("speakers.chipClipPlaying") : t("speakers.chipClipPlayTitle")}
+                          onclick={() => { lastPlayed[id] = c.seq; onPreviewClip(id, c.seq); }}
+                        >
                           {#if playing}
                             <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
                           {:else}
@@ -378,7 +386,6 @@
                           <span class="clip-idx">{i + 1}</span>
                           <span class="clip-at">{clockOf(c.start_ms)}</span>
                           <span class="row-sub">{t("speakers.chipClipDur", { s: Math.round((c.end_ms - c.start_ms) / 1000) })}</span>
-                          {#if playing}<span class="row-sub accent">{t("speakers.chipClipPlaying")}</span>{/if}
                         </button>
                         <label class="clip-pick" title={t("speakers.chipClipPickTitle")}>
                           <input
@@ -695,6 +702,9 @@
   .clip-line .row.clip {
     flex: 1 1 auto;
     width: auto;
+    /* 溢出保护:浮层定宽,行内容再长也不许压到右侧勾选/跳转(2026-09-05 截图教训) */
+    min-width: 0;
+    overflow: hidden;
   }
   .clip-pick {
     display: inline-flex;
@@ -747,9 +757,6 @@
   }
   .clip-at {
     font-weight: 500;
-  }
-  .row-sub.accent {
-    color: var(--accent);
   }
   .bars {
     display: inline-flex;
