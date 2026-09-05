@@ -29,23 +29,30 @@ impl NoteStore {
         let file_name = dest
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("导出路径缺少文件名"))?;
+        // 剪辑表(非破坏性删减):完全落在被删区间内的段/段落不导出;跨界的保留
+        // (段里还有没被删的话音,文字不切半句——与圈选范围同一条整段纪律)。
+        let cuts = super::edits::load_edits(&self.note_dir(id)?).cuts;
+        let fully_cut = |s: u64, e: u64| cuts.iter().any(|c| s >= c.start_ms && e <= c.end_ms);
         let content = match refined {
             Some(doc) => {
                 let title = self.load(id)?.meta.title;
-                match range {
-                    Some((s, e)) => {
-                        let mut clipped = doc.clone();
-                        clipped.paragraphs.retain(|p| p.end_ms > s && p.start_ms < e);
-                        render_refined(&title, &clipped, format == "md")
-                    }
-                    None => render_refined(&title, doc, format == "md"),
+                let mut clipped = doc.clone();
+                // 无音频跨度的自由块(用户在笔记页插入的标题/手写段,start==end==0)
+                // 不参与时间过滤:它们不属于任何时间段,按范围/删减掐掉会把用户
+                // 手写的内容丢掉(Codex 审出:从 0 开始的删减会命中 fully_cut(0,0))。
+                let has_span = |p: &super::RefinedParagraph| p.end_ms > p.start_ms;
+                if let Some((s, e)) = range {
+                    clipped.paragraphs.retain(|p| !has_span(p) || (p.end_ms > s && p.start_ms < e));
                 }
+                clipped.paragraphs.retain(|p| !has_span(p) || !fully_cut(p.start_ms, p.end_ms));
+                render_refined(&title, &clipped, format == "md")
             }
             None => {
                 let mut note = self.load(id)?;
                 if let Some((s, e)) = range {
                     note.segments.retain(|sg| sg.end_ms > s && sg.start_ms < e);
                 }
+                note.segments.retain(|sg| !fully_cut(sg.start_ms, sg.end_ms));
                 render_note(&note, format)?
             }
         };
@@ -93,10 +100,11 @@ impl NoteStore {
 
     /// 导出成品轨音频到用户选定路径(保存对话框流程)。守卫与 export_to 同源
     /// (validate_export_dest);源文件由 mixed_track 解析,无成品轨报错。
-    /// 拷贝/裁剪走同目录临时文件 + rename 原子替换,与 export_to 同款崩溃纪律。
-    /// range:时间轴毫秒半开区间;None = 整轨原样拷贝(不重编码)。圈定时裁出该段:
-    /// WAV 纯字节裁剪,m4a 先解回 WAV 裁完再重编码(有损代际,但圈选导出本就是
-    /// 「掐一段发出去」的场景,32kbps 语音再压一代听感无碍)。
+    /// 拷贝/拼接走同目录临时文件 + rename 原子替换,与 export_to 同款崩溃纪律。
+    /// range:时间轴毫秒半开区间(None=全程);再减去剪辑表(edits.json 的非破坏性
+    /// 删减)得到保留区间列表:无范围无删减 = 整轨原样拷贝(不重编码);否则按区间
+    /// 拼接——WAV 纯字节拼接,m4a 先解回 WAV 拼完再重编码(有损代际,但掐段导出
+    /// 的场景 32kbps 语音再压一代听感无碍)。
     pub fn export_audio_to(
         &self,
         id: &str,
@@ -107,20 +115,40 @@ impl NoteStore {
         let note_dir = self.note_dir(id)?;
         let track = super::audio::mixed_track(&note_dir)
             .ok_or_else(|| anyhow::anyhow!("此笔记没有成品轨"))?;
-        // 时间轴 → 轨内时刻:轨 0 点对应时间轴 offset_ms(成品轨通常 0,续录不为 0)。
-        let clip = match range {
-            Some((s, e)) => {
-                if e <= s {
-                    anyhow::bail!("圈定范围为空");
-                }
-                let ls = s.saturating_sub(track.offset_ms);
-                let le = e.saturating_sub(track.offset_ms);
-                if le <= ls {
-                    anyhow::bail!("圈定范围不与成品轨重叠");
-                }
-                Some((ls, le))
+        if let Some((s, e)) = range {
+            if e <= s {
+                anyhow::bail!("圈定范围为空");
             }
-            None => None,
+        }
+        // 时间轴 → 轨内时刻:轨 0 点对应时间轴 offset_ms(成品轨通常 0,续录不为 0)。
+        let cuts = super::edits::load_edits(&note_dir).cuts;
+        let keeps: Option<Vec<(u64, u64)>> = match (range, cuts.is_empty()) {
+            (None, true) => None, // 无范围无删减:整轨原样拷贝
+            _ => {
+                let base = match range {
+                    Some((s, e)) => {
+                        let (ls, le) = (s.saturating_sub(track.offset_ms), e.saturating_sub(track.offset_ms));
+                        if le <= ls {
+                            anyhow::bail!("圈定范围不与成品轨重叠");
+                        }
+                        (ls, le)
+                    }
+                    None => (0, u64::MAX),
+                };
+                let local_cuts: Vec<super::edits::CutRange> = cuts
+                    .iter()
+                    .map(|c| super::edits::CutRange {
+                        start_ms: c.start_ms.saturating_sub(track.offset_ms),
+                        end_ms: c.end_ms.saturating_sub(track.offset_ms),
+                    })
+                    .filter(|c| c.end_ms > c.start_ms)
+                    .collect();
+                let ks = super::edits::subtract_cuts(base, &local_cuts);
+                if ks.is_empty() {
+                    anyhow::bail!("圈定范围已被全部删减,没有可导出的音频");
+                }
+                Some(ks)
+            }
         };
         let file_name = dest
             .file_name()
@@ -130,9 +158,9 @@ impl NoteStore {
             file_name.to_string_lossy(),
             std::process::id()
         ));
-        let produced = match clip {
+        let produced = match &keeps {
             None => std::fs::copy(&track.path, &tmp).map(|_| ()).map_err(anyhow::Error::from),
-            Some((ls, le)) => clip_track_to(std::path::Path::new(&track.path), &tmp, ls, le),
+            Some(ks) => splice_track_to(std::path::Path::new(&track.path), &tmp, ks),
         };
         if let Err(e) = produced {
             let _ = std::fs::remove_file(&tmp);
@@ -169,25 +197,25 @@ pub(crate) fn render_note(note: &Note, format: &str) -> anyhow::Result<String> {
     })
 }
 
-/// 把成品轨轨内 [start_ms, end_ms) 裁出写到 tmp。WAV 直接按字节裁(录制格式
-/// 16k 单声道 s16,毫秒→字节走 audio.rs 的同一换算);m4a 借系统 afconvert 解回
-/// 同格式 WAV 再裁、再重编码(afconvert 是 macOS 内建,而 m4a 成品轨本就只在
-/// macOS 由它产出,非 macOS 走不到这个分支)。中间产物与 tmp 同目录,收尾必删。
-fn clip_track_to(
+/// 把成品轨轨内若干保留区间(毫秒,有序不重叠)拼接写到 tmp。WAV 直接按字节拼
+/// (录制格式 16k 单声道 s16,毫秒→字节走 audio.rs 的同一换算);m4a 借系统
+/// afconvert 解回同格式 WAV 再拼、再重编码(afconvert 是 macOS 内建,而 m4a
+/// 成品轨本就只在 macOS 由它产出,非 macOS 走不到这个分支)。中间产物与 tmp
+/// 同目录,收尾必删。
+fn splice_track_to(
     src: &std::path::Path,
     tmp: &std::path::Path,
-    start_ms: u64,
-    end_ms: u64,
+    keeps_ms: &[(u64, u64)],
 ) -> anyhow::Result<()> {
     let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("");
     if ext.eq_ignore_ascii_case("wav") {
-        return clip_wav(src, tmp, start_ms, end_ms);
+        return splice_wav(src, tmp, keeps_ms);
     }
     let wav_full = tmp.with_extension("clipsrc.wav");
     let wav_cut = tmp.with_extension("clipcut.wav");
     let result = (|| {
         super::transcode::afconvert_decode(src, &wav_full)?;
-        clip_wav(&wav_full, &wav_cut, start_ms, end_ms)?;
+        splice_wav(&wav_full, &wav_cut, keeps_ms)?;
         super::transcode::afconvert_encode(&wav_cut, tmp)
     })();
     let _ = std::fs::remove_file(&wav_full);
@@ -195,11 +223,12 @@ fn clip_track_to(
     result
 }
 
-/// 录制口径 WAV(16k 单声道 s16)按毫秒裁剪:逐块定位 `data` 块(不可假设 44 字节
-/// 标准头——afconvert 解出的 WAV 带 40 字节 fmt 块与 FLLR 填充块,按固定偏移裁会把
-/// 元数据当音频,Codex 审出),块内按字节切片、重写标准头,零重编码、流式拷贝。
-/// 起点越界报错;终点越界钳到数据末尾(游标停在音频略短于时间轴的尾巴之外属正常)。
-fn clip_wav(src: &std::path::Path, dest: &std::path::Path, start_ms: u64, end_ms: u64) -> anyhow::Result<()> {
+/// 录制口径 WAV(16k 单声道 s16)按毫秒区间拼接:逐块定位 `data` 块(不可假设
+/// 44 字节标准头——afconvert 解出的 WAV 带 40 字节 fmt 块与 FLLR 填充块,按固定
+/// 偏移裁会把元数据当音频,Codex 审出),各保留区间在块内切片顺序拼接、重写标准头,
+/// 零重编码、流式拷贝。整体落在音频末尾之外报错;个别区间越过末尾钳到数据尾/丢弃
+/// (游标停在音频略短于时间轴的尾巴之外属正常)。
+fn splice_wav(src: &std::path::Path, dest: &std::path::Path, keeps_ms: &[(u64, u64)]) -> anyhow::Result<()> {
     use super::audio::{ms_to_bytes, wav_header};
     use std::io::{Read, Seek, SeekFrom, Write};
     let mut f = std::fs::File::open(src)?;
@@ -226,25 +255,31 @@ fn clip_wav(src: &std::path::Path, dest: &std::path::Path, start_ms: u64, end_ms
         }
         pos = start.saturating_add(size).saturating_add(size & 1);
     };
-    let from = ms_to_bytes(start_ms);
-    let to = ms_to_bytes(end_ms).min(data_len);
-    if from >= data_len || to <= from {
+    // 先把毫秒区间换算成 data 块内的字节区间并钳位,算出总长写头
+    let spans: Vec<(u64, u64)> = keeps_ms
+        .iter()
+        .map(|&(s, e)| (ms_to_bytes(s).min(data_len), ms_to_bytes(e).min(data_len)))
+        .filter(|(a, b)| b > a)
+        .collect();
+    if spans.is_empty() {
         anyhow::bail!("圈定范围在音频末尾之外");
     }
-    let n = to - from;
-    f.seek(SeekFrom::Start(data_start + from))?;
+    let total: u64 = spans.iter().map(|(a, b)| b - a).sum();
     let mut out = std::io::BufWriter::new(std::fs::File::create(dest)?);
-    out.write_all(&wav_header(u32::try_from(n)?))?;
-    let mut remaining = n;
+    out.write_all(&wav_header(u32::try_from(total)?))?;
     let mut buf = [0u8; 64 * 1024];
-    while remaining > 0 {
-        let take = remaining.min(buf.len() as u64) as usize;
-        let read = f.read(&mut buf[..take])?;
-        if read == 0 {
-            anyhow::bail!("音频比头部标称的短(读到 EOF)");
+    for (a, b) in spans {
+        f.seek(SeekFrom::Start(data_start + a))?;
+        let mut remaining = b - a;
+        while remaining > 0 {
+            let take = remaining.min(buf.len() as u64) as usize;
+            let read = f.read(&mut buf[..take])?;
+            if read == 0 {
+                anyhow::bail!("音频比头部标称的短(读到 EOF)");
+            }
+            out.write_all(&buf[..read])?;
+            remaining -= read as u64;
         }
-        out.write_all(&buf[..read])?;
-        remaining -= read as u64;
     }
     out.flush()?;
     Ok(())
@@ -483,6 +518,16 @@ mod tests {
 
         // 空范围报错
         assert!(store.export_to(&id, "md", None, &out.path().join("z.md"), Some((5_000, 5_000))).is_err());
+
+        // 剪辑表:完全罩住第一段的删减 → 文字导出剔除;跨界删减(只压住第二段开头)→ 保留
+        let note_dir = store.note_dir(&id).unwrap();
+        crate::store::edits::add_cut(&note_dir, 82_000, 87_000, 200_000).unwrap();
+        crate::store::edits::add_cut(&note_dir, 90_000, 92_000, 200_000).unwrap();
+        let dest3 = out.path().join("cutaway.md");
+        store.export_to(&id, "md", None, &dest3, None).unwrap();
+        let md3 = std::fs::read_to_string(&dest3).unwrap();
+        assert!(!md3.contains("第一段。"), "整段被删减的文字不导出: {md3}");
+        assert!(md3.contains("第二段。"), "跨界段整段保留: {md3}");
     }
 
     /// 修订稿同样按重叠过滤段落。
@@ -536,6 +581,73 @@ mod tests {
         let md = std::fs::read_to_string(&dest).unwrap();
         assert!(md.contains("中段。"), "{md}");
         assert!(!md.contains("开场。") && !md.contains("收尾。"), "{md}");
+    }
+
+    /// 用户插入的自由块(无说话人,start==end==0)不参与范围/删减过滤:从 0 开始的
+    /// 删减曾把它当成"完全落在删减内"一并抹掉(Codex 审出)。
+    #[test]
+    fn export_keeps_speakerless_free_blocks_despite_range_and_cuts() {
+        use crate::store::{RefineStages, RefinedDoc, RefinedParagraph};
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "占位。", 0, 1_000, None, None).unwrap();
+        w.finalize(chrono::Local::now()).unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let free = RefinedParagraph {
+            speaker: String::new(),
+            name: None,
+            person_id: None,
+            start_ms: 0,
+            end_ms: 0,
+            text: "# 我的手写标题".into(),
+            source_seqs: vec![],
+            mentions: vec![],
+        };
+        let spoken = RefinedParagraph {
+            speaker: "S1".into(),
+            name: Some("甲".into()),
+            person_id: None,
+            start_ms: 60_000,
+            end_ms: 70_000,
+            text: "有声段。".into(),
+            source_seqs: vec![],
+            mentions: vec![],
+        };
+        let doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
+            schema_version: 1,
+            generated_at: String::new(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
+            llm_model: None,
+            stages: RefineStages {
+                filter: "done".into(),
+                recluster: "done".into(),
+                llm: "done".into(),
+                entities: "off".into(),
+                relations: "off".into(),
+            },
+            discarded_seqs: vec![],
+            entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
+            graph_support_mentions: vec![],
+            revision: 0,
+            stale: false,
+            paragraphs: vec![free, spoken],
+        };
+        // 从 0 开始的删减 + 只罩住后半的范围:自由块两关都要活下来
+        let note_dir = store.note_dir(&id).unwrap();
+        crate::store::edits::add_cut(&note_dir, 0, 5_000, 100_000).unwrap();
+        let dest = out.path().join("free.md");
+        store.export_to(&id, "md", Some(&doc), &dest, Some((50_000, 90_000))).unwrap();
+        let md = std::fs::read_to_string(&dest).unwrap();
+        assert!(md.contains("我的手写标题"), "自由块不被范围/删减掐掉: {md}");
+        assert!(md.contains("有声段。"), "{md}");
     }
 
     #[test]
@@ -983,12 +1095,51 @@ mod export_audio_to_tests {
         std::fs::write(&src, &bytes).unwrap();
 
         let dest = dir.path().join("cut.wav");
-        super::clip_wav(&src, &dest, 100, 300).unwrap();
+        super::splice_wav(&src, &dest, &[(100, 300)]).unwrap();
         let cut = std::fs::read(&dest).unwrap();
         let (from, to) = (ms_to_bytes(100) as usize, ms_to_bytes(300) as usize);
         assert_eq!(&cut[44..], &pcm[from..to], "data 从块内正确偏移取出");
         let declared = u32::from_le_bytes(cut[40..44].try_into().unwrap()) as usize;
         assert_eq!(declared, to - from);
+    }
+
+    /// 剪辑表参与音频导出:无圈选范围但有删减 → 拼接掉被删段;字节级核对两段
+    /// 保留区拼接的连续性与头部总长。
+    #[test]
+    fn export_audio_to_splices_out_cuts() {
+        use crate::store::audio::ms_to_bytes;
+        const HEADER: usize = 44;
+        let (_tmp, out, store, id) = fixture_note();
+        let note_dir = store.note_dir(&id).unwrap();
+        write_mixed_track(&note_dir); // 0.5s
+        let source = std::fs::read(note_dir.join("mixed.wav")).unwrap();
+        crate::store::edits::add_cut(&note_dir, 200, 300, 500).unwrap();
+
+        let dest = out.path().join("spliced.wav");
+        store.export_audio_to(&id, &dest, None).unwrap();
+        let got = std::fs::read(&dest).unwrap();
+        let (c0, c1) = (ms_to_bytes(200) as usize, ms_to_bytes(300) as usize);
+        let mut want = Vec::new();
+        want.extend_from_slice(&source[HEADER..HEADER + c0]);
+        want.extend_from_slice(&source[HEADER + c1..]);
+        assert_eq!(&got[HEADER..], &want[..], "被删段之外逐字节保留、顺序拼接");
+        let declared = u32::from_le_bytes(got[40..44].try_into().unwrap()) as usize;
+        assert_eq!(declared, want.len());
+
+        // 圈选范围与删减叠加:范围 [100,400) 再抠掉 [200,300)
+        let dest2 = out.path().join("range-and-cut.wav");
+        store.export_audio_to(&id, &dest2, Some((100, 400))).unwrap();
+        let got2 = std::fs::read(&dest2).unwrap();
+        let (r0, r1) = (ms_to_bytes(100) as usize, ms_to_bytes(400) as usize);
+        let mut want2 = Vec::new();
+        want2.extend_from_slice(&source[HEADER + r0..HEADER + c0]);
+        want2.extend_from_slice(&source[HEADER + c1..HEADER + r1]);
+        assert_eq!(&got2[HEADER..], &want2[..]);
+
+        // 范围整个落在删减里 → 报错不留半成品
+        crate::store::edits::add_cut(&note_dir, 0, 500, 500).unwrap();
+        assert!(store.export_audio_to(&id, &out.path().join("z.wav"), None).is_err());
+        assert!(!out.path().join("z.wav").exists());
     }
 
     #[test]

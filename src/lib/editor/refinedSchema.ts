@@ -132,6 +132,9 @@ export function makeRefinedParagraphView(cb: BadgeCallbacks) {
     dom.className = "md-para";
     dom.dataset.refinedParagraph = "";
     if (node.attrs.speaker || node.attrs.name || node.attrs.personId) {
+      // 有说话人 = 有真实时间跨度的段落:暴露起点毫秒供页面回查(音频删减的灰显
+      // 按它对回 refined.paragraphs 拿 end_ms;自由块无此标记,天然不参与)。
+      dom.dataset.startMs = String(node.attrs.startMs ?? 0);
       const { label, bg, ink } = cb.speakerBadge(node.attrs);
       const badge = document.createElement("button");
       badge.type = "button";

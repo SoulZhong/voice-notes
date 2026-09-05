@@ -24,6 +24,7 @@
     rangeEndMs = $bindable(null),
     onRangeDrag,
     onRangeDragEnd,
+    cuts = [],
   }: {
     tracks: TrackInfo[];
     /** 音轨波形(0..1 归一条高,按时间等分;由页面从段落 rms 聚合)。空数组退化为平轨。 */
@@ -49,6 +50,8 @@
     /** 拖动游标期间逐帧回调(which=哪个游标,ms=当前位置):宿主做逐字稿联动高亮。 */
     onRangeDrag?: (which: "start" | "end", ms: number) => void;
     onRangeDragEnd?: () => void;
+    /** 音频删减区间(非破坏性剪辑表):波形上红显,并推给内核让播放跳过。 */
+    cuts?: { start_ms: number; end_ms: number }[];
   } = $props();
 
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
@@ -439,6 +442,23 @@
     const mid = ((i + 0.5) / bars.length) * totalMs;
     return mid < effStart || mid > effEnd;
   }
+
+  /** 条 i 的中心时刻是否落在删减区间内:染条不盖罩——被删段的波形条本身换
+      danger 色淡显(已播也不点亮),区间顶部另有 2px 细线standing边界。 */
+  function barCut(i: number): boolean {
+    if (cuts.length === 0 || bars.length === 0) return false;
+    const mid = ((i + 0.5) / bars.length) * totalMs;
+    return cuts.some((c) => mid >= c.start_ms && mid < c.end_ms);
+  }
+
+  // ── 剪辑表 → 内核:删减/恢复即时生效(装载路径自读盘上 edits.json,这里只管
+  //    运行时变更;排在装载 promise 之后,打不到旧核)。 ──
+  $effect(() => {
+    const list = cuts.map((c) => [c.start_ms, c.end_ms]);
+    const p = loadPromise;
+    if (!p) return;
+    void p.then(() => invoke("player_set_cuts", { cutsMs: list })).catch(() => {});
+  });
 </script>
 
 <div class="player">
@@ -475,8 +495,18 @@
     onkeydown={onWaveKey}
   >
     {#each bars as h, i (i)}
-      <span class="bar" class:played={i < playedBars} class:outside={barOutside(i)} style="height: {6 + h * 94}%"></span>
+      <span class="bar" class:played={i < playedBars} class:cutbar={barCut(i)} class:outside={barOutside(i)} style="height: {6 + h * 94}%"></span>
     {/each}
+    <!-- 删减区间边界线(非破坏性剪辑):区间顶部 2px danger 细线;条本身由 cutbar
+         染色淡显。染条不盖罩——整块半透明罩会把波形糊成红斑,违背细线留白的语言 -->
+    {#if totalMs > 0}
+      {#each cuts as c (c.start_ms)}
+        <div
+          class="cut-edge"
+          style="left: {(Math.min(c.start_ms, totalMs) / totalMs) * 100}%; width: {(Math.max(0, Math.min(c.end_ms, totalMs) - Math.min(c.start_ms, totalMs)) / totalMs) * 100}%"
+        ></div>
+      {/each}
+    {/if}
     <!-- 圈选游标:开始/结束各一枚,拖动圈定导出范围。旗标朝内(开始在上、结束在下)
          区分两枚;拖动中或已离开端点时点亮 accent。 -->
     {#if totalMs > 0}
@@ -713,9 +743,28 @@
   .bar.played {
     background: var(--accent);
   }
-  /* 圈外条淡显:圈定了真子范围时,一眼看出哪段会被导出 */
+  /* 被删段:染条不盖罩——条本身 danger 色淡显;已播同样不点亮(同类名在 .played
+     之后声明,同权重后者胜)。与圈外淡显叠加时由下方 .outside 的更低透明度主导
+     (拖游标时圈选优先) */
+  .bar.cutbar {
+    background: var(--danger);
+    opacity: 0.35;
+  }
+  /* 圈外条淡显:圈定了真子范围时,一眼看出哪段会被导出(声明在 cutbar 之后:
+     拖动圈选时圈外的被删条同样压暗,圈选语义主导) */
   .bar.outside {
     opacity: 0.3;
+  }
+  /* 删减区间边界线:顶部 2px danger 细线,交代范围而不糊波形 */
+  .cut-edge {
+    position: absolute;
+    top: 0;
+    height: 2px;
+    background: var(--danger);
+    opacity: 0.6;
+    border-radius: var(--radius-full);
+    pointer-events: none;
+    z-index: 1;
   }
   /* 圈选游标:2px 竖线 + 朝内小旗标(开始在上、结束在下)。热区 14px 宽居中,
      好抓;线与旗默认次级墨,拖动中/已圈定点亮 accent。 */

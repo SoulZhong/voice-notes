@@ -2,6 +2,7 @@ pub mod aing_graph;
 pub mod align;
 pub mod audio;
 pub mod disk;
+pub mod edits;
 mod export;
 pub mod diagnostics;
 pub mod embed_cache;

@@ -56,6 +56,11 @@
     identifyNote,
     finalizeInterruptedNote,
     formatTs,
+    getNoteEdits,
+    addNoteCut,
+    removeNoteCut,
+    getClipRanks,
+    type CutRange,
     type CalendarCandidate,
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
@@ -919,7 +924,23 @@
     void refreshMultiOps();
   }
 
-  /** 该说话人的试听候选:最长的 5 段源段(修订稿一律回落到源段,见下)。 */
+  /** 试听候选排序表(说话人 → 声纹最像此人的 seq 降序;后端纯读嵌入缓存)。
+      现场会教训(2026-09-05 用户实报):最长的段往往是多人来回对话,按"最像"排,
+      混了多人的段声纹偏离质心自然沉底。 */
+  let clipRanks = $state<Record<string, number[]>>({});
+  $effect(() => {
+    const forId = id;
+    getClipRanks(forId)
+      .then((r) => {
+        if (forId === id) clipRanks = r;
+      })
+      .catch(() => {
+        if (forId === id) clipRanks = {};
+      });
+  });
+
+  /** 该说话人的试听候选:声纹最像此人的 5 段;无嵌入缓存回落最长 5 段
+      (修订稿一律回落到源段,见下)。 */
   function previewClips(sid: string): { seq: number; start_ms: number; end_ms: number }[] {
     // **修订稿一律回落到源段**。修订稿的段落是「不连续源段的合并」,却只记一个
     // start_ms~end_ms 的大范围;照那个范围连续播,中间别人说的话会原样放出来。
@@ -929,15 +950,25 @@
     // 一波说话人:两个视图的 sid 都是原始稿说话人,直接取其原始段;修订稿旧文档
     // 映射不回 S 的遗留 id 才退回「段落 source_seqs 还原」。
     const direct = displaySegments.filter((s) => s.speaker === sid);
-    return (
+    const pool =
       direct.length > 0
         ? direct
         : (refined?.paragraphs ?? [])
             .filter((p) => p.speaker === sid)
             .flatMap((p) => p.source_seqs)
             .map((seq) => segBySeq.get(seq))
-            .filter((s) => s !== undefined)
-    )
+            .filter((s) => s !== undefined);
+    // 优先按声纹相似度序(后端 note_clip_ranks;多人混杂段沉底);该人无排序数据
+    // (无嵌入缓存/段太少)回落最长序。
+    const rank = clipRanks[sid];
+    if (rank && rank.length > 0) {
+      const bySeq = new Map(pool.map((s) => [s.seq, s]));
+      const ranked = rank.map((q) => bySeq.get(q)).filter((s) => s !== undefined);
+      if (ranked.length > 0) {
+        return ranked.slice(0, 5).map((s) => ({ seq: s.seq, start_ms: s.start_ms, end_ms: s.end_ms }));
+      }
+    }
+    return pool
       .sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms))
       .slice(0, 5)
       .map((s) => ({ seq: s.seq, start_ms: s.start_ms, end_ms: s.end_ms }));
@@ -1287,6 +1318,13 @@
     rangeHintSeq = null;
     rangeHintEdge = null;
     clearTimeout(rangeHintTimer);
+    // 剪辑表/试听排序属于上一篇:先清空,新一篇由各自拉取 effect 填(id 快照防旧响应)。
+    edits = [];
+    editsManage = false;
+    editsErr = "";
+    lastCut = null;
+    clearTimeout(undoTimer);
+    clipRanks = {};
   });
 
   // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。
@@ -1816,6 +1854,78 @@
     return { start: Math.round(s), end: Math.round(e) };
   }
 
+  // ── 音频删减(非破坏性剪辑表 edits.json):删掉圈内 → 播放跳过、导出剔除、
+  //    逐字稿灰显;原始录音一个字节不动,随时可恢复。 ──
+  let edits = $state<CutRange[]>([]);
+  let editsManage = $state(false);
+  let editsErr = $state("");
+  /** 刚删的那段(可能已被后端吞并成更大的区间):一键撤销入口。
+      瞬态:出现约 10s 后收走——管理浮层里永远能恢复,常驻的撤销只会把行越挤越长。 */
+  let lastCut = $state<CutRange | null>(null);
+  let undoTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 短时长(区别于 formatTs 的定长时间点):不足 1 小时 m:ss,否则 h:mm:ss。 */
+  function fmtDur(ms: number): string {
+    const s = Math.round(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = String(s % 60).padStart(2, "0");
+    return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+  }
+  // 进页/切笔记拉一遍剪辑表(id 快照防快速切换时旧响应覆盖新页)。
+  $effect(() => {
+    const forId = id;
+    getNoteEdits(forId)
+      .then((l) => {
+        if (forId === id) edits = l.cuts;
+      })
+      .catch(() => {
+        if (forId === id) edits = [];
+      });
+  });
+  async function deleteRange() {
+    const r = exportRange();
+    if (!r || !player) return;
+    editsErr = "";
+    const forId = id; // await 期间可能切笔记:旧笔记的响应不得写进新页(Codex 审出)
+    try {
+      const list = await addNoteCut(forId, r.start, r.end, Math.round(player.durationMs()));
+      if (forId !== id) return;
+      edits = list.cuts;
+      // 撤销目标 = 表里覆盖本次区间的那条(后端可能已把它与旧区间吞并)。
+      lastCut = list.cuts.find((c) => c.start_ms <= r.start && c.end_ms >= r.end) ?? null;
+      clearTimeout(undoTimer);
+      undoTimer = setTimeout(() => (lastCut = null), 10_000);
+      rangeStartMs = null;
+      rangeEndMs = null;
+    } catch (e) {
+      if (forId !== id) return;
+      editsErr = t("notes.edits.failed", { e });
+    }
+  }
+  async function restoreCut(c: CutRange) {
+    editsErr = "";
+    const forId = id; // 同 deleteRange:切笔记后旧响应作废
+    try {
+      const list = await removeNoteCut(forId, c.start_ms, c.end_ms);
+      if (forId !== id) return;
+      edits = list.cuts;
+      if (lastCut && lastCut.start_ms === c.start_ms && lastCut.end_ms === c.end_ms) lastCut = null;
+      if (edits.length === 0) editsManage = false;
+    } catch (e) {
+      if (forId !== id) return;
+      editsErr = t("notes.edits.failed", { e });
+    }
+  }
+  /** 完全落在删减区间内的段(逐字稿灰显;跨界段不标——里面还有没删的话音)。 */
+  const cutSeqs = $derived.by(() => {
+    const s = new Set<number>();
+    if (edits.length === 0) return s;
+    for (const sg of displaySegments) {
+      if (edits.some((c) => sg.start_ms >= c.start_ms && sg.end_ms <= c.end_ms)) s.add(sg.seq);
+    }
+    return s;
+  });
+
   // wheel 上滑 = 主动离开(平滑滚动只产生 scroll 事件,不会误判);内容不足一屏不触发。
   $effect(() => {
     if (!transcriptEl) return;
@@ -2050,10 +2160,28 @@
     const el = transcriptEl;
     const active = activeSeqs;
     const discarded = discardedSeqs;
+    const cut = cutSeqs;
     const hint = rangeHintSeq;
     const edge = rangeHintEdge;
     void segRenderTick;
-    if (!el || effectiveView === "refined") return;
+    if (!el) return;
+    if (effectiveView === "refined") {
+      // 修订稿(默认视图)同样要标被删段:只在原始稿灰显的话,删完在默认视图里
+      // 看不到任何变化,像没生效(Codex 审出)。段落 DOM 带 data-start-ms
+      // (refinedSchema NodeView),回查 syncedRefined 拿 end_ms 判"完全落在删减内";
+      // syncedRefined 在 setRefined 同步落 DOM 后赋值,依赖它即拿到已挂好的 .md-para。
+      const paras = syncedRefined?.paragraphs ?? [];
+      const byStart = new Map(paras.filter((p) => p.end_ms > p.start_ms).map((p) => [p.start_ms, p]));
+      for (const node of el.querySelectorAll<HTMLElement>(".md-para")) {
+        const sm = node.dataset.startMs;
+        const p = sm === undefined ? undefined : byStart.get(Number(sm));
+        const isCut = p !== undefined && edits.some((c) => p.start_ms >= c.start_ms && p.end_ms <= c.end_ms);
+        node.classList.toggle("cut", isCut);
+        if (isCut) node.title = t("notes.seg.cutAway");
+        else node.removeAttribute("title");
+      }
+      return;
+    }
     for (const node of el.querySelectorAll<HTMLElement>(".md-seg")) {
       const seq = Number(node.dataset.seq);
       node.classList.toggle("playing", active.has(seq));
@@ -2061,7 +2189,9 @@
       node.classList.toggle("hint-start", seq === hint && edge === "start");
       node.classList.toggle("hint-end", seq === hint && edge === "end");
       node.classList.toggle("discarded", discarded.has(seq));
-      if (discarded.has(seq)) node.title = t("notes.seg.filtered");
+      node.classList.toggle("cut", cut.has(seq));
+      if (cut.has(seq)) node.title = t("notes.seg.cutAway");
+      else if (discarded.has(seq)) node.title = t("notes.seg.filtered");
       else node.removeAttribute("title");
     }
     // 拖游标触发的修订稿→原始稿自动切换:切换当拍 .md-seg 尚未渲染,联动段的
@@ -2235,9 +2365,15 @@
 </script>
 
 <svelte:window
-  onclick={() => (exportMenuOpen = false)}
+  onclick={() => {
+    exportMenuOpen = false;
+    editsManage = false;
+  }}
   onkeydown={(e) => {
-    if (e.key === "Escape") exportMenuOpen = false;
+    if (e.key === "Escape") {
+      exportMenuOpen = false;
+      editsManage = false;
+    }
   }}
 />
 
@@ -2399,8 +2535,85 @@
            录制中(含暂停)不出播放器:文件正在写,不做边写边播的半态。 -->
       <div class="transport">
         {#if canEdit && tracks.length > 0}
-          <div class="player-slot">
-            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} bind:rangeStartMs bind:rangeEndMs {onRangeDrag} {onRangeDragEnd} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
+          {@const editsRange = exportRange()}
+          {@const editsRowOn = !!editsRange || edits.length > 0 || !!editsErr}
+          <div class="player-slot" class:has-edits={editsRowOn}>
+            <!-- cuts 试听期间临时清空:试听段可能恰好落在被删区间里,内核跳段会把
+                 它跳成"无声"(2026-09-05 用户实报);试听是"听清这段是谁"的动作,
+                 必须绕过删减,结束即恢复。 -->
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} bind:rangeStartMs bind:rangeEndMs {onRangeDrag} {onRangeDragEnd} cuts={preview ? [] : edits} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
+            <!-- 音频剪辑行(非破坏性删减):播放器卡片的第二行(同底、hairline 分隔),
+                 与下方说话人区自然分组。删除只记入剪辑表(edits.json),播放跳过、
+                 导出剔除,原始录音不动。 -->
+            {#if editsRowOn}
+              <div class="edits-row">
+                {#if editsRange}
+                  <button
+                    class="edits-btn edits-del"
+                    title={t("notes.edits.deleteTitle", { start: formatTs(editsRange.start), end: formatTs(editsRange.end) })}
+                    onclick={() => void deleteRange()}
+                  >
+                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="4.3" cy="4.6" r="1.9" />
+                      <circle cx="4.3" cy="11.4" r="1.9" />
+                      <path d="M5.9 5.9 13.6 12.4M5.9 10.1 13.6 3.6" />
+                    </svg>
+                    {t("notes.edits.deleteRange", { dur: fmtDur(editsRange.end - editsRange.start) })}
+                  </button>
+                {/if}
+                {#if edits.length > 0}
+                  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+                  <div class="edits-menu" onclick={(e) => e.stopPropagation()}>
+                    <button
+                      class="edits-btn"
+                      class:open={editsManage}
+                      aria-expanded={editsManage}
+                      aria-haspopup="menu"
+                      onclick={() => (editsManage = !editsManage)}
+                    >
+                      {t("notes.edits.count", { n: edits.length, dur: fmtDur(edits.reduce((a, c) => a + c.end_ms - c.start_ms, 0)) })}
+                      <svg class="chev" class:open={editsManage} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M4 6l4 4 4-4" />
+                      </svg>
+                    </button>
+                    {#if editsManage}
+                      <div class="edits-pop" role="menu">
+                        <p class="edits-pop-hint">{t("notes.edits.popHint")}</p>
+                        {#each edits as c (c.start_ms)}
+                          <div class="edits-item">
+                            <span class="edits-span">{formatTs(c.start_ms)} – {formatTs(c.end_ms)}</span>
+                            <button class="edits-restore" onclick={() => void restoreCut(c)}>{t("notes.edits.restore")}</button>
+                          </div>
+                        {/each}
+                        {#if edits.length > 1}
+                          <button
+                            class="edits-restore edits-restore-all"
+                            onclick={async () => {
+                              for (const c of [...edits]) await restoreCut(c);
+                            }}>{t("notes.edits.restoreAll")}</button
+                          >
+                        {/if}
+                      </div>
+                    {/if}
+                  </div>
+                  {#if lastCut}
+                    {@const undoTarget = lastCut}
+                    <button
+                      class="edits-btn"
+                      title={t("notes.edits.undoTitle", { start: formatTs(undoTarget.start_ms), end: formatTs(undoTarget.end_ms) })}
+                      onclick={() => void restoreCut(undoTarget)}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M3.4 6.6h5.8a3.5 3.5 0 1 1 0 7H5.2" />
+                        <path d="M6 3.9 3.3 6.6l2.7 2.7" />
+                      </svg>
+                      {t("notes.edits.undo")}
+                    </button>
+                  {/if}
+                {/if}
+                {#if editsErr}<span class="edits-err">{editsErr}</span>{/if}
+              </div>
+            {/if}
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
@@ -2424,6 +2637,7 @@
           <span class="rec-dot"></span>
         </button>
       </div>
+
 
       <!-- 说话人条:修订稿与原始逐字稿同一份 speakers.json、同一套交互,不随视图切换变化
            (2026-08-28 用户实报:修订稿上不可点、逐字稿上可点)。改名/选人/取消关联
@@ -2903,6 +3117,129 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);
   }
+  /* 音频剪辑行:播放器卡片的第二行——同底色、hairline 分隔、下缘补回卡片圆角 */
+  .edits-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0;
+    padding: 0.45rem 0.9rem;
+    background: var(--surface);
+    border-top: 1px solid var(--hairline);
+    border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  }
+  /* 胶囊按钮:track-btn 同语言(hairline-strong 边、圆角满、图标+文字),
+     数字走 tabular 对齐;按压下沉 0.5px 给触感 */
+  .edits-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.3em 0.8em;
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+      background 120ms ease,
+      color 120ms ease,
+      border-color 120ms ease;
+  }
+  .edits-btn:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .edits-btn:active {
+    transform: translateY(0.5px);
+  }
+  .edits-btn.open {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .edits-btn .chev {
+    transition: transform 120ms ease;
+    opacity: 0.7;
+  }
+  .edits-btn .chev.open {
+    transform: rotate(180deg);
+  }
+  /* 删除入口:danger 族(墨/边/悬停底全用 danger token),一眼分清这是破坏性动作
+     的入口——虽然实际非破坏,但语义上是"删" */
+  .edits-btn.edits-del {
+    color: var(--danger);
+    border-color: var(--danger-line);
+  }
+  .edits-btn.edits-del:hover {
+    background: var(--danger-tint);
+    color: var(--danger-ink);
+  }
+  .edits-err {
+    color: var(--danger);
+    font-size: 0.78rem;
+  }
+  /* 管理浮层:track-pop 同语言(surface-press 底、hairline 边、popover 阴影),
+     在按钮下方展开 */
+  .edits-menu {
+    position: relative;
+  }
+  .edits-pop {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 20;
+    min-width: 15rem;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    padding: 0.5rem;
+  }
+  .edits-pop-hint {
+    margin: 0 0 0.45rem;
+    padding: 0 0.15rem;
+    color: var(--ink-secondary);
+    font-size: 0.75rem;
+  }
+  .edits-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.9rem;
+    padding: 0.28em 0.15rem;
+    font-size: 0.85rem;
+  }
+  .edits-span {
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  /* 浮层内恢复按钮:小号 secondary(有边有形,不是裸链接) */
+  .edits-restore {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.12em 0.65em;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition:
+      background 120ms ease,
+      color 120ms ease;
+  }
+  .edits-restore:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .edits-restore:active {
+    transform: translateY(0.5px);
+  }
+  .edits-restore-all {
+    margin-top: 0.35rem;
+    width: 100%;
+  }
   /* 圈定范围提示:游标圈了真子范围时出现在菜单顶部,交代两个导出项的作用域 */
   .export-range-note {
     margin: 0;
@@ -2974,7 +3311,9 @@
   /* 控制行:录音 + 播放器整合一行(录音机式) */
   .transport {
     display: flex;
-    align-items: center;
+    /* flex-start + 右侧控件按第一行高度(3.1rem=播放键 2.1rem+上下 0.5rem 内边距)
+       自行垂直居中:播放器卡片长出剪辑第二行时,右侧簇不再被整块高度拽下去 */
+    align-items: flex-start;
     gap: 0.5rem 0.75rem;
     margin: 0 0 1rem;
     flex-wrap: wrap;
@@ -2986,6 +3325,11 @@
     flex: 1;
     min-width: 23rem;
   }
+  /* 剪辑行出现时播放器卡片下缘拉直,与第二行(同底色)无缝相接 */
+  .player-slot.has-edits :global(.player) {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
   /* 回放方案 A/B 切换(二期):Segmented(sm)承载,容器只管行内定位。
      margin-left:auto 让「segmented+录制键」聚成一簇靠右——宽窗时播放器 flex:1
      已占满空间无感;窄窗换行后这簇整体落在第二行右端,不与录制键分居两端(冒烟反馈)。 */
@@ -2994,6 +3338,7 @@
     gap: 0.15rem;
     flex: none;
     align-items: center;
+    height: 3.1rem; /* 锚定播放器第一行高度,transport flex-start 下保持视觉居中 */
     margin-left: auto;
   }
   /* 继续录制:录音机标志式圆形录音键(圆环 + 居中红点),行尾右置,与播放键同语言。
@@ -3003,6 +3348,7 @@
   .rec-btn {
     width: 2.4rem;
     height: 2.4rem;
+    margin-top: 0.35rem; /* (3.1rem 第一行高 − 2.4rem)/2:transport flex-start 下对齐播放器行中线 */
     padding: 0;
     flex: none;
     display: inline-flex;
@@ -3097,6 +3443,15 @@
   /* 被 Aing 过滤掉的段(原始稿视角):灰显但保留可读,不做删除线/隐藏 */
   .transcript :global(.md-seg.discarded) {
     opacity: 0.38;
+  }
+  /* 被删减的段(剪辑表):灰显 + danger 删除线,与 AI 过滤灰显区分——这是用户
+     亲手删的,语义是"音频里已剪掉",恢复入口在播放器下方 */
+  .transcript :global(.md-seg.cut),
+  .transcript :global(.md-para.cut) {
+    opacity: 0.38;
+    text-decoration: line-through;
+    text-decoration-color: var(--danger);
+    text-decoration-thickness: 1px;
   }
   /* 修订稿段落(MarkdownEditor 的 refined_paragraph NodeView 产出,DOM 由 PM 命令式
      创建,没有 Svelte 的 scope hash,必须 :global 才能命中):与 .md-seg 同排版语言,
