@@ -1296,6 +1296,7 @@
     editsManage = false;
     editsErr = "";
     lastCut = null;
+    clearTimeout(undoTimer);
   });
 
   // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。
@@ -1830,8 +1831,18 @@
   let edits = $state<CutRange[]>([]);
   let editsManage = $state(false);
   let editsErr = $state("");
-  /** 刚删的那段(可能已被后端吞并成更大的区间):一键撤销入口。 */
+  /** 刚删的那段(可能已被后端吞并成更大的区间):一键撤销入口。
+      瞬态:出现约 10s 后收走——管理浮层里永远能恢复,常驻的撤销只会把行越挤越长。 */
   let lastCut = $state<CutRange | null>(null);
+  let undoTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 短时长(区别于 formatTs 的定长时间点):不足 1 小时 m:ss,否则 h:mm:ss。 */
+  function fmtDur(ms: number): string {
+    const s = Math.round(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = String(s % 60).padStart(2, "0");
+    return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+  }
   // 进页/切笔记拉一遍剪辑表(id 快照防快速切换时旧响应覆盖新页)。
   $effect(() => {
     const forId = id;
@@ -1852,6 +1863,8 @@
       edits = list.cuts;
       // 撤销目标 = 表里覆盖本次区间的那条(后端可能已把它与旧区间吞并)。
       lastCut = list.cuts.find((c) => c.start_ms <= r.start && c.end_ms >= r.end) ?? null;
+      clearTimeout(undoTimer);
+      undoTimer = setTimeout(() => (lastCut = null), 10_000);
       rangeStartMs = null;
       rangeEndMs = null;
     } catch (e) {
@@ -2471,8 +2484,82 @@
            录制中(含暂停)不出播放器:文件正在写,不做边写边播的半态。 -->
       <div class="transport">
         {#if canEdit && tracks.length > 0}
-          <div class="player-slot">
+          {@const editsRange = exportRange()}
+          {@const editsRowOn = !!editsRange || edits.length > 0 || !!editsErr}
+          <div class="player-slot" class:has-edits={editsRowOn}>
             <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} bind:rangeStartMs bind:rangeEndMs {onRangeDrag} {onRangeDragEnd} cuts={edits} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
+            <!-- 音频剪辑行(非破坏性删减):播放器卡片的第二行(同底、hairline 分隔),
+                 与下方说话人区自然分组。删除只记入剪辑表(edits.json),播放跳过、
+                 导出剔除,原始录音不动。 -->
+            {#if editsRowOn}
+              <div class="edits-row">
+                {#if editsRange}
+                  <button
+                    class="edits-btn edits-del"
+                    title={t("notes.edits.deleteTitle", { start: formatTs(editsRange.start), end: formatTs(editsRange.end) })}
+                    onclick={() => void deleteRange()}
+                  >
+                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="4.3" cy="4.6" r="1.9" />
+                      <circle cx="4.3" cy="11.4" r="1.9" />
+                      <path d="M5.9 5.9 13.6 12.4M5.9 10.1 13.6 3.6" />
+                    </svg>
+                    {t("notes.edits.deleteRange", { dur: fmtDur(editsRange.end - editsRange.start) })}
+                  </button>
+                {/if}
+                {#if edits.length > 0}
+                  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+                  <div class="edits-menu" onclick={(e) => e.stopPropagation()}>
+                    <button
+                      class="edits-btn"
+                      class:open={editsManage}
+                      aria-expanded={editsManage}
+                      aria-haspopup="menu"
+                      onclick={() => (editsManage = !editsManage)}
+                    >
+                      {t("notes.edits.count", { n: edits.length, dur: fmtDur(edits.reduce((a, c) => a + c.end_ms - c.start_ms, 0)) })}
+                      <svg class="chev" class:open={editsManage} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M4 6l4 4 4-4" />
+                      </svg>
+                    </button>
+                    {#if editsManage}
+                      <div class="edits-pop" role="menu">
+                        <p class="edits-pop-hint">{t("notes.edits.popHint")}</p>
+                        {#each edits as c (c.start_ms)}
+                          <div class="edits-item">
+                            <span class="edits-span">{formatTs(c.start_ms)} – {formatTs(c.end_ms)}</span>
+                            <button class="edits-restore" onclick={() => void restoreCut(c)}>{t("notes.edits.restore")}</button>
+                          </div>
+                        {/each}
+                        {#if edits.length > 1}
+                          <button
+                            class="edits-restore edits-restore-all"
+                            onclick={async () => {
+                              for (const c of [...edits]) await restoreCut(c);
+                            }}>{t("notes.edits.restoreAll")}</button
+                          >
+                        {/if}
+                      </div>
+                    {/if}
+                  </div>
+                  {#if lastCut}
+                    {@const undoTarget = lastCut}
+                    <button
+                      class="edits-btn"
+                      title={t("notes.edits.undoTitle", { start: formatTs(undoTarget.start_ms), end: formatTs(undoTarget.end_ms) })}
+                      onclick={() => void restoreCut(undoTarget)}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M3.4 6.6h5.8a3.5 3.5 0 1 1 0 7H5.2" />
+                        <path d="M6 3.9 3.3 6.6l2.7 2.7" />
+                      </svg>
+                      {t("notes.edits.undo")}
+                    </button>
+                  {/if}
+                {/if}
+                {#if editsErr}<span class="edits-err">{editsErr}</span>{/if}
+              </div>
+            {/if}
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
@@ -2497,83 +2584,6 @@
         </button>
       </div>
 
-      <!-- 音频剪辑行(非破坏性删减):与播放器「音轨」菜单同族的胶囊按钮 + 浮层面板。
-           圈定了范围给 danger 胶囊「删除圈内」;有删减给统计胶囊(点开管理浮层逐段
-           恢复)与「撤销」胶囊。删除只记入剪辑表(edits.json),播放跳过、导出剔除,
-           原始录音不动。 -->
-      {#if canEdit && tracks.length > 0}
-        {@const editsRange = exportRange()}
-        {#if editsRange || edits.length > 0 || editsErr}
-          <div class="edits-row">
-            {#if editsRange}
-              <button class="edits-btn edits-del" title={t("notes.edits.deleteTitle")} onclick={() => void deleteRange()}>
-                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="4.3" cy="4.6" r="1.9" />
-                  <circle cx="4.3" cy="11.4" r="1.9" />
-                  <path d="M5.9 5.9 13.6 12.4M5.9 10.1 13.6 3.6" />
-                </svg>
-                {t("notes.edits.deleteRange", { start: formatTs(editsRange.start), end: formatTs(editsRange.end) })}
-              </button>
-            {/if}
-            {#if edits.length > 0}
-              <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-              <div class="edits-menu" onclick={(e) => e.stopPropagation()}>
-                <button
-                  class="edits-btn"
-                  class:open={editsManage}
-                  aria-expanded={editsManage}
-                  aria-haspopup="menu"
-                  onclick={() => (editsManage = !editsManage)}
-                >
-                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <circle cx="4.3" cy="4.6" r="1.9" />
-                    <circle cx="4.3" cy="11.4" r="1.9" />
-                    <path d="M5.9 5.9 13.6 12.4M5.9 10.1 13.6 3.6" />
-                  </svg>
-                  {t("notes.edits.count", { n: edits.length, dur: formatTs(edits.reduce((a, c) => a + c.end_ms - c.start_ms, 0)) })}
-                  <svg class="chev" class:open={editsManage} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M4 6l4 4 4-4" />
-                  </svg>
-                </button>
-                {#if editsManage}
-                  <div class="edits-pop" role="menu">
-                    <p class="edits-pop-hint">{t("notes.edits.popHint")}</p>
-                    {#each edits as c (c.start_ms)}
-                      <div class="edits-item">
-                        <span class="edits-span">{formatTs(c.start_ms)} – {formatTs(c.end_ms)}</span>
-                        <button class="edits-restore" onclick={() => void restoreCut(c)}>{t("notes.edits.restore")}</button>
-                      </div>
-                    {/each}
-                    {#if edits.length > 1}
-                      <button
-                        class="edits-restore edits-restore-all"
-                        onclick={async () => {
-                          for (const c of [...edits]) await restoreCut(c);
-                        }}>{t("notes.edits.restoreAll")}</button
-                      >
-                    {/if}
-                  </div>
-                {/if}
-              </div>
-              {#if lastCut}
-                {@const undoTarget = lastCut}
-                <button
-                  class="edits-btn"
-                  title={t("notes.edits.undoTitle", { start: formatTs(undoTarget.start_ms), end: formatTs(undoTarget.end_ms) })}
-                  onclick={() => void restoreCut(undoTarget)}
-                >
-                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M3.4 6.6h5.8a3.5 3.5 0 1 1 0 7H5.2" />
-                    <path d="M6 3.9 3.3 6.6l2.7 2.7" />
-                  </svg>
-                  {t("notes.edits.undo")}
-                </button>
-              {/if}
-            {/if}
-            {#if editsErr}<span class="edits-err">{editsErr}</span>{/if}
-          </div>
-        {/if}
-      {/if}
 
       <!-- 说话人条:修订稿与原始逐字稿同一份 speakers.json、同一套交互,不随视图切换变化
            (2026-08-28 用户实报:修订稿上不可点、逐字稿上可点)。改名/选人/取消关联
@@ -3053,13 +3063,17 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);
   }
-  /* 音频剪辑行:与播放器「音轨」按钮同族的胶囊按钮组,贴 transport 下方 */
+  /* 音频剪辑行:播放器卡片的第二行——同底色、hairline 分隔、下缘补回卡片圆角 */
   .edits-row {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 0.5rem;
-    margin: 0.4rem 0 0 0.2rem;
+    margin: 0;
+    padding: 0.45rem 0.9rem;
+    background: var(--surface);
+    border-top: 1px solid var(--hairline);
+    border-radius: 0 0 var(--radius-lg) var(--radius-lg);
   }
   /* 胶囊按钮:track-btn 同语言(hairline-strong 边、圆角满、图标+文字),
      数字走 tabular 对齐;按压下沉 0.5px 给触感 */
@@ -3243,7 +3257,9 @@
   /* 控制行:录音 + 播放器整合一行(录音机式) */
   .transport {
     display: flex;
-    align-items: center;
+    /* flex-start + 右侧控件按第一行高度(3.1rem=播放键 2.1rem+上下 0.5rem 内边距)
+       自行垂直居中:播放器卡片长出剪辑第二行时,右侧簇不再被整块高度拽下去 */
+    align-items: flex-start;
     gap: 0.5rem 0.75rem;
     margin: 0 0 1rem;
     flex-wrap: wrap;
@@ -3255,6 +3271,11 @@
     flex: 1;
     min-width: 23rem;
   }
+  /* 剪辑行出现时播放器卡片下缘拉直,与第二行(同底色)无缝相接 */
+  .player-slot.has-edits :global(.player) {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
   /* 回放方案 A/B 切换(二期):Segmented(sm)承载,容器只管行内定位。
      margin-left:auto 让「segmented+录制键」聚成一簇靠右——宽窗时播放器 flex:1
      已占满空间无感;窄窗换行后这簇整体落在第二行右端,不与录制键分居两端(冒烟反馈)。 */
@@ -3263,6 +3284,7 @@
     gap: 0.15rem;
     flex: none;
     align-items: center;
+    height: 3.1rem; /* 锚定播放器第一行高度,transport flex-start 下保持视觉居中 */
     margin-left: auto;
   }
   /* 继续录制:录音机标志式圆形录音键(圆环 + 居中红点),行尾右置,与播放键同语言。
@@ -3272,6 +3294,7 @@
   .rec-btn {
     width: 2.4rem;
     height: 2.4rem;
+    margin-top: 0.35rem; /* (3.1rem 第一行高 − 2.4rem)/2:transport flex-start 下对齐播放器行中线 */
     padding: 0;
     flex: none;
     display: inline-flex;

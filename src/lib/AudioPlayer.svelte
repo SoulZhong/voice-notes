@@ -443,6 +443,14 @@
     return mid < effStart || mid > effEnd;
   }
 
+  /** 条 i 的中心时刻是否落在删减区间内:染条不盖罩——被删段的波形条本身换
+      danger 色淡显(已播也不点亮),区间顶部另有 2px 细线standing边界。 */
+  function barCut(i: number): boolean {
+    if (cuts.length === 0 || bars.length === 0) return false;
+    const mid = ((i + 0.5) / bars.length) * totalMs;
+    return cuts.some((c) => mid >= c.start_ms && mid < c.end_ms);
+  }
+
   // ── 剪辑表 → 内核:删减/恢复即时生效(装载路径自读盘上 edits.json,这里只管
   //    运行时变更;排在装载 promise 之后,打不到旧核)。 ──
   $effect(() => {
@@ -487,15 +495,15 @@
     onkeydown={onWaveKey}
   >
     {#each bars as h, i (i)}
-      <span class="bar" class:played={i < playedBars} class:outside={barOutside(i)} style="height: {6 + h * 94}%"></span>
+      <span class="bar" class:played={i < playedBars} class:cutbar={barCut(i)} class:outside={barOutside(i)} style="height: {6 + h * 94}%"></span>
     {/each}
-    <!-- 删减区间红显(非破坏性剪辑):被删段盖半透明 danger 罩,一眼看出播放会跳过哪里 -->
+    <!-- 删减区间边界线(非破坏性剪辑):区间顶部 2px danger 细线;条本身由 cutbar
+         染色淡显。染条不盖罩——整块半透明罩会把波形糊成红斑,违背细线留白的语言 -->
     {#if totalMs > 0}
       {#each cuts as c (c.start_ms)}
         <div
-          class="cut-span"
+          class="cut-edge"
           style="left: {(Math.min(c.start_ms, totalMs) / totalMs) * 100}%; width: {(Math.max(0, Math.min(c.end_ms, totalMs) - Math.min(c.start_ms, totalMs)) / totalMs) * 100}%"
-          title={t("notes.player.cutSpan")}
         ></div>
       {/each}
     {/if}
@@ -735,18 +743,26 @@
   .bar.played {
     background: var(--accent);
   }
-  /* 圈外条淡显:圈定了真子范围时,一眼看出哪段会被导出 */
+  /* 被删段:染条不盖罩——条本身 danger 色淡显;已播同样不点亮(同类名在 .played
+     之后声明,同权重后者胜)。与圈外淡显叠加时由下方 .outside 的更低透明度主导
+     (拖游标时圈选优先) */
+  .bar.cutbar {
+    background: var(--danger);
+    opacity: 0.35;
+  }
+  /* 圈外条淡显:圈定了真子范围时,一眼看出哪段会被导出(声明在 cutbar 之后:
+     拖动圈选时圈外的被删条同样压暗,圈选语义主导) */
   .bar.outside {
     opacity: 0.3;
   }
-  /* 删减区红罩:danger 半透明覆盖,不吃指针(点击穿透到波形定位) */
-  .cut-span {
+  /* 删减区间边界线:顶部 2px danger 细线,交代范围而不糊波形 */
+  .cut-edge {
     position: absolute;
-    top: 2px;
-    bottom: 2px;
+    top: 0;
+    height: 2px;
     background: var(--danger);
-    opacity: 0.16;
-    border-radius: var(--radius-sm);
+    opacity: 0.6;
+    border-radius: var(--radius-full);
     pointer-events: none;
     z-index: 1;
   }
