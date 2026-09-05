@@ -220,6 +220,23 @@ impl NoteStore {
         write_meta_atomic(&dir, &meta)
     }
 
+    /// 仅当**盘上当前标题**仍是默认样式才改名(Aing 自动标题专用),返回是否写入。
+    /// 判定与写入在同一把锁内:自动标题的调用方在跑批开始时拿的标题快照会过期
+    /// ——Aing 跑几十分钟,用户中途手动改名后,按快照判定会把手动名覆盖掉
+    /// (2026-09-05 用户点名:手动标题优先级最高,AI 永不覆盖)。
+    pub fn rename_if_default(&self, id: &str, title: &str) -> anyhow::Result<bool> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
+        if !super::writer::is_default_title(&meta.title) {
+            return Ok(false);
+        }
+        meta.title = title.to_string();
+        write_meta_atomic(&dir, &meta)?;
+        Ok(true)
+    }
+
     /// 日历字段的唯一写入口(P3):与 rename 同一锁纪律(EDIT_LOCK + 笔记 flock)
     /// 内读-改-写。f 在持锁状态下拿到最新 meta——自动匹配路径必须在这里复查
     /// 「仍无快照且未被清除」,查询期间用户手动改选/清除则放弃;f 返回 false
@@ -1203,6 +1220,39 @@ fn scan_max_end_ms(jsonl: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 自动标题的条件改名:默认名可换;用户手动命名后拒写(手动标题优先级最高,
+    /// 2026-09-05 用户点名)——判定看盘上当前值,不吃调用方过期快照。
+    #[test]
+    fn rename_if_default_never_clobbers_manual_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let dir = tmp.path().join("20260101-000001");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec(&NoteMeta {
+                schema_version: SCHEMA_VERSION,
+                id: "20260101-000001".into(),
+                title: "周六上午的会议".into(), // 默认样式
+                started_at: "t".into(),
+                ended_at: Some("t".into()),
+                state: "complete".into(),
+                calendar: None,
+                calendar_cleared: false,
+                asr_engine: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // 默认名:自动标题可以换
+        assert!(store.rename_if_default("20260101-000001", "AI 起的标题").unwrap());
+        assert_eq!(store.load("20260101-000001").unwrap().meta.title, "AI 起的标题");
+        // 用户手动改名后:自动标题拒写,手动名保留
+        store.rename("20260101-000001", "我的手动标题").unwrap();
+        assert!(!store.rename_if_default("20260101-000001", "AI 又起了一个").unwrap());
+        assert_eq!(store.load("20260101-000001").unwrap().meta.title, "我的手动标题");
+    }
 
     /// 场景二期折叠原语(issue #162):追加幂等/恢复往返/dual_path 场端到端/非双路零动作。
     #[test]

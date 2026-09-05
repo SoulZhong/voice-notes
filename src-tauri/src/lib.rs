@@ -1110,8 +1110,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     };
                     match title {
                         Ok(title) => {
-                            match store::NoteStore::new(notes_dir(&app)?).rename(&note_id, &title) {
-                                Ok(()) => {
+                            // 条件写入(判定+写入同锁):上面的 is_default_title 用的是跑批
+                            // 开始的快照,用户在 Aing 期间手动改名后快照过期,无条件 rename
+                            // 会把手动名覆盖掉——手动标题优先级最高(2026-09-05 用户点名)。
+                            match store::NoteStore::new(notes_dir(&app)?).rename_if_default(&note_id, &title) {
+                                Ok(true) => {
                                     let _ = app.emit(
                                         "note_renamed",
                                         ipc::NoteRenamedEvent {
@@ -1119,6 +1122,9 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                             title,
                                         },
                                     );
+                                }
+                                Ok(false) => {
+                                    eprintln!("refine({note_id}): 用户已手动命名,自动标题放弃");
                                 }
                                 Err(e) => eprintln!("refine({note_id}): 主题标题落盘失败: {e}"),
                             }
@@ -8159,6 +8165,17 @@ fn note_audio_info(app: AppHandle, id: String) -> Result<Vec<store::audio::Track
 fn rename_note(app: AppHandle, state: State<AppState>, id: String, title: String) -> Result<(), String> {
     if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
         return Err(tr!("录制中的笔记不能改名", "A note being recorded cannot be renamed"));
+    }
+    // 重转写全程持本篇 NoteLock,改名会被锁层以通用的"被占用"拒绝,用户对不上号
+    // (2026-09-05 实报:反复改名"不生效",实为 FireRed 重转写在跑)。前置判定给出
+    // 能行动的原因。
+    if let Some((rid, _)) = state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if rid == id {
+            return Err(tr!(
+                "本篇正在重转写,期间不能改名;等重转写完成后再试",
+                "This note is being re-transcribed; renaming is unavailable until it finishes"
+            ));
+        }
     }
     let title = title.trim();
     if title.is_empty() {
