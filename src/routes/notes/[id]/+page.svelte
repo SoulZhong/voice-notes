@@ -2301,9 +2301,15 @@
 </script>
 
 <svelte:window
-  onclick={() => (exportMenuOpen = false)}
+  onclick={() => {
+    exportMenuOpen = false;
+    editsManage = false;
+  }}
   onkeydown={(e) => {
-    if (e.key === "Escape") exportMenuOpen = false;
+    if (e.key === "Escape") {
+      exportMenuOpen = false;
+      editsManage = false;
+    }
   }}
 />
 
@@ -2491,49 +2497,81 @@
         </button>
       </div>
 
-      <!-- 音频剪辑行(非破坏性删减):圈定了范围给「删除圈内」;有删减给统计+管理。
-           删除只记入剪辑表(edits.json),播放跳过、导出剔除,原始录音不动。 -->
+      <!-- 音频剪辑行(非破坏性删减):与播放器「音轨」菜单同族的胶囊按钮 + 浮层面板。
+           圈定了范围给 danger 胶囊「删除圈内」;有删减给统计胶囊(点开管理浮层逐段
+           恢复)与「撤销」胶囊。删除只记入剪辑表(edits.json),播放跳过、导出剔除,
+           原始录音不动。 -->
       {#if canEdit && tracks.length > 0}
         {@const editsRange = exportRange()}
         {#if editsRange || edits.length > 0 || editsErr}
           <div class="edits-row">
             {#if editsRange}
-              <button class="link danger" title={t("notes.edits.deleteTitle")} onclick={() => void deleteRange()}>
+              <button class="edits-btn edits-del" title={t("notes.edits.deleteTitle")} onclick={() => void deleteRange()}>
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="4.3" cy="4.6" r="1.9" />
+                  <circle cx="4.3" cy="11.4" r="1.9" />
+                  <path d="M5.9 5.9 13.6 12.4M5.9 10.1 13.6 3.6" />
+                </svg>
                 {t("notes.edits.deleteRange", { start: formatTs(editsRange.start), end: formatTs(editsRange.end) })}
               </button>
             {/if}
             {#if edits.length > 0}
-              <span class="edits-info">
-                {t("notes.edits.count", { n: edits.length, secs: Math.round(edits.reduce((a, c) => a + c.end_ms - c.start_ms, 0) / 1000) })}
-              </span>
-              <button class="link" onclick={() => (editsManage = !editsManage)}>
-                {editsManage ? t("notes.edits.collapse") : t("notes.edits.manage")}
-              </button>
+              <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+              <div class="edits-menu" onclick={(e) => e.stopPropagation()}>
+                <button
+                  class="edits-btn"
+                  class:open={editsManage}
+                  aria-expanded={editsManage}
+                  aria-haspopup="menu"
+                  onclick={() => (editsManage = !editsManage)}
+                >
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="4.3" cy="4.6" r="1.9" />
+                    <circle cx="4.3" cy="11.4" r="1.9" />
+                    <path d="M5.9 5.9 13.6 12.4M5.9 10.1 13.6 3.6" />
+                  </svg>
+                  {t("notes.edits.count", { n: edits.length, dur: formatTs(edits.reduce((a, c) => a + c.end_ms - c.start_ms, 0)) })}
+                  <svg class="chev" class:open={editsManage} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 6l4 4 4-4" />
+                  </svg>
+                </button>
+                {#if editsManage}
+                  <div class="edits-pop" role="menu">
+                    <p class="edits-pop-hint">{t("notes.edits.popHint")}</p>
+                    {#each edits as c (c.start_ms)}
+                      <div class="edits-item">
+                        <span class="edits-span">{formatTs(c.start_ms)} – {formatTs(c.end_ms)}</span>
+                        <button class="edits-restore" onclick={() => void restoreCut(c)}>{t("notes.edits.restore")}</button>
+                      </div>
+                    {/each}
+                    {#if edits.length > 1}
+                      <button
+                        class="edits-restore edits-restore-all"
+                        onclick={async () => {
+                          for (const c of [...edits]) await restoreCut(c);
+                        }}>{t("notes.edits.restoreAll")}</button
+                      >
+                    {/if}
+                  </div>
+                {/if}
+              </div>
               {#if lastCut}
                 {@const undoTarget = lastCut}
-                <button class="link" onclick={() => void restoreCut(undoTarget)}>{t("notes.edits.undo")}</button>
+                <button
+                  class="edits-btn"
+                  title={t("notes.edits.undoTitle", { start: formatTs(undoTarget.start_ms), end: formatTs(undoTarget.end_ms) })}
+                  onclick={() => void restoreCut(undoTarget)}
+                >
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3.4 6.6h5.8a3.5 3.5 0 1 1 0 7H5.2" />
+                    <path d="M6 3.9 3.3 6.6l2.7 2.7" />
+                  </svg>
+                  {t("notes.edits.undo")}
+                </button>
               {/if}
             {/if}
             {#if editsErr}<span class="edits-err">{editsErr}</span>{/if}
           </div>
-          {#if editsManage && edits.length > 0}
-            <div class="edits-list">
-              {#each edits as c (c.start_ms)}
-                <div class="edits-item">
-                  <span class="edits-span">{formatTs(c.start_ms)} – {formatTs(c.end_ms)}</span>
-                  <button class="link" onclick={() => void restoreCut(c)}>{t("notes.edits.restore")}</button>
-                </div>
-              {/each}
-              {#if edits.length > 1}
-                <button
-                  class="link"
-                  onclick={async () => {
-                    for (const c of [...edits]) await restoreCut(c);
-                  }}>{t("notes.edits.restoreAll")}</button
-                >
-              {/if}
-            </div>
-          {/if}
         {/if}
       {/if}
 
@@ -3015,41 +3053,124 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);
   }
-  /* 音频剪辑行:紧贴 transport 下方的一行小字动作(danger 删除入口 + 统计 + 管理) */
+  /* 音频剪辑行:与播放器「音轨」按钮同族的胶囊按钮组,贴 transport 下方 */
   .edits-row {
     display: flex;
     align-items: center;
-    gap: 0.9rem;
-    margin: 0.15rem 0 0 0.2rem;
-    font-size: 0.8rem;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0.4rem 0 0 0.2rem;
   }
-  .edits-info {
+  /* 胶囊按钮:track-btn 同语言(hairline-strong 边、圆角满、图标+文字),
+     数字走 tabular 对齐;按压下沉 0.5px 给触感 */
+  .edits-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
     color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.3em 0.8em;
+    font-size: 0.78rem;
     font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+      background 120ms ease,
+      color 120ms ease,
+      border-color 120ms ease;
+  }
+  .edits-btn:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .edits-btn:active {
+    transform: translateY(0.5px);
+  }
+  .edits-btn.open {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .edits-btn .chev {
+    transition: transform 120ms ease;
+    opacity: 0.7;
+  }
+  .edits-btn .chev.open {
+    transform: rotate(180deg);
+  }
+  /* 删除入口:danger 族(墨/边/悬停底全用 danger token),一眼分清这是破坏性动作
+     的入口——虽然实际非破坏,但语义上是"删" */
+  .edits-btn.edits-del {
+    color: var(--danger);
+    border-color: var(--danger-line);
+  }
+  .edits-btn.edits-del:hover {
+    background: var(--danger-tint);
+    color: var(--danger-ink);
   }
   .edits-err {
     color: var(--danger);
+    font-size: 0.78rem;
   }
-  .edits-list {
-    margin: 0.25rem 0 0 0.2rem;
-    padding: 0.4rem 0.6rem;
-    background: var(--surface);
+  /* 管理浮层:track-pop 同语言(surface-press 底、hairline 边、popover 阴影),
+     在按钮下方展开 */
+  .edits-menu {
+    position: relative;
+  }
+  .edits-pop {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 20;
+    min-width: 15rem;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
     border-radius: var(--radius-lg);
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    max-width: 22rem;
+    box-shadow: var(--shadow-popover);
+    padding: 0.5rem;
+  }
+  .edits-pop-hint {
+    margin: 0 0 0.45rem;
+    padding: 0 0.15rem;
+    color: var(--ink-secondary);
+    font-size: 0.75rem;
   }
   .edits-item {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 0.8rem;
-    font-size: 0.8rem;
+    gap: 0.9rem;
+    padding: 0.28em 0.15rem;
+    font-size: 0.85rem;
   }
   .edits-span {
-    color: var(--ink-secondary);
+    color: var(--ink);
     font-variant-numeric: tabular-nums;
+  }
+  /* 浮层内恢复按钮:小号 secondary(有边有形,不是裸链接) */
+  .edits-restore {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.12em 0.65em;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition:
+      background 120ms ease,
+      color 120ms ease;
+  }
+  .edits-restore:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .edits-restore:active {
+    transform: translateY(0.5px);
+  }
+  .edits-restore-all {
+    margin-top: 0.35rem;
+    width: 100%;
   }
   /* 圈定范围提示:游标圈了真子范围时出现在菜单顶部,交代两个导出项的作用域 */
   .export-range-note {
