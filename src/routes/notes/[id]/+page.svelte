@@ -2251,10 +2251,15 @@
   async function commitRename() {
     if (!editing || !note) return;
     editing = false;
+    const forId = id;
     try {
-      await renameNote(id, editingTitle);
+      await renameNote(forId, editingTitle);
       recording.bumpNotes();
+      // 页头显示的是 note.meta.title:不重查的话旧标题一直挂着,改名看起来
+      // "不生效"(2026-09-05 用户实报)。actor 回执 Ok 即已落盘,重查必读到新值。
+      if (forId === id) await refresh();
     } catch (e) {
+      if (forId !== id) return;
       error = t("notes.detail.renameFailed", { e });
     }
   }
