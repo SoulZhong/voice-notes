@@ -1005,6 +1005,17 @@
     refresh();
     recording.bumpNotes();
   }
+  /** 试听段「移出」:多人混在一段里,不适合归给任何人——清除归属(后端 "none"
+      哨兵),文字保留、不拆新说话人;onsite 场界面兜底显示「未识别」。 */
+  async function removeClip(sid: string, seq: number) {
+    const seg = segBySeq.get(seq);
+    if (!seg) return;
+    if (preview?.seq === seq) endPreview("remove");
+    await setSegmentSpeaker(id, seq, seg.text, "none");
+    if (lastAuditioned[sid] === seq) delete lastAuditioned[sid];
+    refresh();
+    recording.bumpNotes();
+  }
   /** 单钮试听(兼容入口):播第一段;已在播则换下一段。 */
   function previewSpeaker(sid: string) {
     const clips = previewClips(sid);
@@ -2670,6 +2681,7 @@
               assignNoteSpeakerPerson(id, sid, personId, sample?.auditedSeq ?? lastAuditioned[sid], sample?.selectedSeqs?.length ? sample.selectedSeqs : undefined)
           : undefined}
         onDetachClip={canEdit ? detachClip : undefined}
+        onRemoveClip={canEdit ? removeClip : undefined}
         onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
         onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
         onMarkMulti={canEdit ? runAutoSplit : undefined}

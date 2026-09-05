@@ -8472,6 +8472,14 @@ fn set_segment_speaker(
                 "Cannot create a new speaker while recording"
             ));
         }
+        // "none"(清除归属)同拒:live 路径的 writer 只认已注册 S-id,哨兵会被当
+        // 未知说话人报错,这里先给出面向用户的原因。
+        if speaker_id == "none" {
+            return Err(tr!(
+                "录制中不能移出段落归属，请先停止录制",
+                "Cannot unassign a segment while recording"
+            ));
+        }
         app.state::<lifecycle::LifecycleHandle>().request(
             lifecycle::machine::Msg::SetActiveSegmentSpeaker {
                 note_id,
