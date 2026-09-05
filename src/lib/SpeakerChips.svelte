@@ -366,6 +366,7 @@
                       <div class="clips-title">{t("speakers.chipClipsTitle", { n: clips.length })}</div>
                       {#each clips as c, i (c.seq)}
                         {@const playing = previewingId === id && previewingSeq === c.seq}
+                        {@const picked = sampleSel.includes(c.seq)}
                         <div class="clip-line" class:playing class:picked={sampleSel.includes(c.seq)}>
                         <!-- 播放态只靠均衡器动画 + accent 高亮传达,不再塞行内状态文字——
                              浮层定宽,长文字会把「作为样本」挤压重叠(2026-09-05 用户截图);
@@ -387,25 +388,32 @@
                           <span class="clip-at">{clockOf(c.start_ms)}</span>
                           <span class="row-sub">{t("speakers.chipClipDur", { s: Math.round((c.end_ms - c.start_ms) / 1000) })}</span>
                         </button>
-                        <label class="clip-pick" title={t("speakers.chipClipPickTitle")}>
-                          <input
-                            type="checkbox"
-                            checked={sampleSel.includes(c.seq)}
-                            onchange={(e) => {
-                              const on = (e.currentTarget as HTMLInputElement).checked;
-                              sampleSel = on ? [...sampleSel.filter((q) => q !== c.seq), c.seq] : sampleSel.filter((q) => q !== c.seq);
-                            }}
-                          />
-                          <span>{t("speakers.chipClipPick")}</span>
-                        </label>
+                        <!-- 两个动作都用带文字的小胶囊,不再靠图标猜(2026-09-05 用户实报:
+                             外链样图标被当成"跳转",裸勾选框不像操作)。
+                             「＋样本/✓样本」切换态,「拆出」明说动作。 -->
+                        <button
+                          class="clip-act"
+                          class:on={picked}
+                          title={t("speakers.chipClipPickTitle")}
+                          aria-pressed={picked}
+                          onclick={() => {
+                            sampleSel = picked ? sampleSel.filter((q) => q !== c.seq) : [...sampleSel, c.seq];
+                          }}
+                        >
+                          {#if picked}
+                            <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
+                          {:else}
+                            <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                          {/if}
+                          {t("speakers.chipClipPick")}
+                        </button>
                         {#if onDetachClip}
                           <button
-                            class="clip-detach"
+                            class="clip-act"
                             title={t("speakers.chipClipDetachTitle")}
-                            aria-label={t("speakers.chipClipDetach")}
                             onclick={() => run(() => onDetachClip(id, c.seq))}
                           >
-                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3.5h3v3M13 3.5L8.5 8M6 3.5H3v9h9V10" /></svg>
+                            {t("speakers.chipClipDetachShort")}
                           </button>
                         {/if}
                         </div>
@@ -706,37 +714,40 @@
     min-width: 0;
     overflow: hidden;
   }
-  .clip-pick {
+  /* 片段行动作胶囊(样本切换/拆出):带文字的小 secondary,不再靠图标猜。
+     选中态(✓样本)accent 描边点亮。 */
+  .clip-act {
     display: inline-flex;
     align-items: center;
-    gap: 0.25em;
+    gap: 0.3em;
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.1em 0.55em;
     font-size: 0.72rem;
-    color: var(--ink-faint);
     cursor: pointer;
     white-space: nowrap;
-    padding: 0 0.3rem;
+    flex: none;
+    transition:
+      background 120ms ease,
+      color 120ms ease,
+      border-color 120ms ease;
   }
-  .clip-pick input {
-    accent-color: var(--accent);
-    margin: 0;
-  }
-  .clip-detach {
-    width: 1.5rem;
-    height: 1.5rem;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    border: none;
-    background: none;
-    color: var(--ink-faint);
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    margin-right: 0.25rem;
-  }
-  .clip-detach:hover {
+  .clip-act:hover {
+    background: var(--surface-soft);
     color: var(--ink);
-    background: var(--surface-press);
+  }
+  .clip-act:active {
+    transform: translateY(0.5px);
+  }
+  .clip-act.on {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: var(--accent-tint);
+  }
+  .clip-act:last-child {
+    margin-right: 0.25rem;
   }
   .clips-hint.warn {
     color: var(--warning-ink);
