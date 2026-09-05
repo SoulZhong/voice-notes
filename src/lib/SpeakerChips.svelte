@@ -21,6 +21,7 @@
     onPreviewClip,
     previewingSeq,
     onDetachClip,
+    onRemoveClip,
     onDelete,
     onUnlink,
     onMarkMulti,
@@ -61,6 +62,9 @@
     onPreviewClip?: (id: string, seq: number) => void;
     /** 「这段不是此人」:把该段单独拆成新说话人(不依赖聚类,段内混杂/别人插话时用)。 */
     onDetachClip?: (id: string, seq: number) => Promise<void>;
+    /** 试听段「移出」:多人混在一段里,不适合归给任何人——清除归属(文字保留,
+        不拆新说话人)。2026-09-05 用户点名补的动作。 */
+    onRemoveClip?: (id: string, seq: number) => Promise<void>;
     /** 正在播放的片段 seq(高亮那一行)。 */
     previewingSeq?: number | null;
     /** 删除(可选,仅原始逐字稿视图传入)。表项移除,名下段落回到未标注;
@@ -414,6 +418,15 @@
                             onclick={() => run(() => onDetachClip(id, c.seq))}
                           >
                             {t("speakers.chipClipDetachShort")}
+                          </button>
+                        {/if}
+                        {#if onRemoveClip}
+                          <button
+                            class="clip-act"
+                            title={t("speakers.chipClipRemoveTitle")}
+                            onclick={() => run(() => onRemoveClip(id, c.seq))}
+                          >
+                            {t("speakers.chipClipRemove")}
                           </button>
                         {/if}
                         </div>

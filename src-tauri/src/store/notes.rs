@@ -751,6 +751,14 @@ impl NoteStore {
         let _flock = write_lock(&dir)?;
         let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
         find_seg(&mut lines, seq, expected_text)?;
+        // 归属清除哨兵(2026-09-05 用户点名:多人混在一段里,不适合归给任何人):
+        // speaker 置空回到未标注,段落文字保留,不建新说话人;onsite 场界面兜底
+        // 显示「未识别」。哨兵不与真实 id 空间(S/R 前缀)冲突。
+        if speaker_id == "none" {
+            find_seg(&mut lines, seq, expected_text)?.speaker = None;
+            write_jsonl_atomic(&dir, &lines)?;
+            return Ok("none".into());
+        }
         let mut speakers = read_speakers(&dir);
         let target = if speaker_id == "new" {
             let num = |s: &str| {
@@ -1220,6 +1228,45 @@ fn scan_max_end_ms(jsonl: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// "none" 哨兵清除段落归属:speaker 置空、文字保留、不建新说话人;CAS 文字
+    /// 对不上照常拒绝。
+    #[test]
+    fn set_segment_speaker_none_clears_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let dir = tmp.path().join("20260101-000002");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec(&NoteMeta {
+                schema_version: SCHEMA_VERSION,
+                id: "20260101-000002".into(),
+                title: "t".into(),
+                started_at: "t".into(),
+                ended_at: Some("t".into()),
+                state: "complete".into(),
+                calendar: None,
+                calendar_cleared: false,
+                asr_engine: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("segments.jsonl"),
+            r#"{"seq":0,"source":"mic","text":"混杂段","start_ms":0,"end_ms":3000,"speaker":"S1"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("speakers.json"), r#"{"S1":{"name":"甲","sources":[],"count":1}}"#).unwrap();
+
+        assert!(store.set_segment_speaker("20260101-000002", 0, "别的文字", "none").is_err(), "CAS 仍生效");
+        assert_eq!(store.set_segment_speaker("20260101-000002", 0, "混杂段", "none").unwrap(), "none");
+        let note = store.load("20260101-000002").unwrap();
+        assert_eq!(note.segments[0].speaker, None, "归属已清除");
+        assert_eq!(note.segments[0].text, "混杂段", "文字保留");
+        assert!(note.speakers.contains_key("S1"), "不动说话人表");
+    }
 
     /// 自动标题的条件改名:默认名可换;用户手动命名后拒写(手动标题优先级最高,
     /// 2026-09-05 用户点名)——判定看盘上当前值,不吃调用方过期快照。
