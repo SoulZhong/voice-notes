@@ -9,6 +9,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Mutex;
+
+/// 进程内写序列化(Codex 审出:add/remove 是 load→modify→save,并发会互相覆盖丢删减)。
+/// 全程持锁跨 load-modify-save;跨进程场景本表只有 GUI 单写者,不另做文件锁。
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub const EDITS_FILE: &str = "edits.json";
 
@@ -36,10 +42,14 @@ pub fn load_edits(note_dir: &Path) -> EditList {
     serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
-/// 原子写(tmp+rename,与笔记其余落盘同纪律)。
+/// 原子写(tmp+rename,与笔记其余落盘同纪律;tmp 名带 pid+序号防两次写争同一文件)。
 fn save_edits(note_dir: &Path, list: &EditList) -> anyhow::Result<()> {
     let p = note_dir.join(EDITS_FILE);
-    let tmp = note_dir.join(format!(".{EDITS_FILE}.tmp-{}", std::process::id()));
+    let tmp = note_dir.join(format!(
+        ".{EDITS_FILE}.tmp-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let bytes = serde_json::to_vec_pretty(list)?;
     if let Err(e) = std::fs::write(&tmp, &bytes) {
         let _ = std::fs::remove_file(&tmp);
@@ -59,6 +69,7 @@ pub fn add_cut(note_dir: &Path, start_ms: u64, end_ms: u64, total_ms: u64) -> an
     if e <= s {
         anyhow::bail!("删减区间为空");
     }
+    let _g = WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut list = load_edits(note_dir);
     list.schema_version = 1;
     let (mut s, mut e) = (s, e);
@@ -81,6 +92,7 @@ pub fn add_cut(note_dir: &Path, start_ms: u64, end_ms: u64, total_ms: u64) -> an
 /// 恢复一段删减:按精确端点匹配移除。找不到报错(说明前端拿的是过期表,
 /// 静默成功会让用户以为恢复了)。返回更新后的整表。
 pub fn remove_cut(note_dir: &Path, start_ms: u64, end_ms: u64) -> anyhow::Result<EditList> {
+    let _g = WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut list = load_edits(note_dir);
     let before = list.cuts.len();
     list.cuts.retain(|c| !(c.start_ms == start_ms && c.end_ms == end_ms));

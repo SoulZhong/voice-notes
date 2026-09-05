@@ -1886,8 +1886,10 @@
     const r = exportRange();
     if (!r || !player) return;
     editsErr = "";
+    const forId = id; // await 期间可能切笔记:旧笔记的响应不得写进新页(Codex 审出)
     try {
-      const list = await addNoteCut(id, r.start, r.end, Math.round(player.durationMs()));
+      const list = await addNoteCut(forId, r.start, r.end, Math.round(player.durationMs()));
+      if (forId !== id) return;
       edits = list.cuts;
       // 撤销目标 = 表里覆盖本次区间的那条(后端可能已把它与旧区间吞并)。
       lastCut = list.cuts.find((c) => c.start_ms <= r.start && c.end_ms >= r.end) ?? null;
@@ -1896,17 +1898,21 @@
       rangeStartMs = null;
       rangeEndMs = null;
     } catch (e) {
+      if (forId !== id) return;
       editsErr = t("notes.edits.failed", { e });
     }
   }
   async function restoreCut(c: CutRange) {
     editsErr = "";
+    const forId = id; // 同 deleteRange:切笔记后旧响应作废
     try {
-      const list = await removeNoteCut(id, c.start_ms, c.end_ms);
+      const list = await removeNoteCut(forId, c.start_ms, c.end_ms);
+      if (forId !== id) return;
       edits = list.cuts;
       if (lastCut && lastCut.start_ms === c.start_ms && lastCut.end_ms === c.end_ms) lastCut = null;
       if (edits.length === 0) editsManage = false;
     } catch (e) {
+      if (forId !== id) return;
       editsErr = t("notes.edits.failed", { e });
     }
   }
@@ -2158,7 +2164,24 @@
     const hint = rangeHintSeq;
     const edge = rangeHintEdge;
     void segRenderTick;
-    if (!el || effectiveView === "refined") return;
+    if (!el) return;
+    if (effectiveView === "refined") {
+      // 修订稿(默认视图)同样要标被删段:只在原始稿灰显的话,删完在默认视图里
+      // 看不到任何变化,像没生效(Codex 审出)。段落 DOM 带 data-start-ms
+      // (refinedSchema NodeView),回查 syncedRefined 拿 end_ms 判"完全落在删减内";
+      // syncedRefined 在 setRefined 同步落 DOM 后赋值,依赖它即拿到已挂好的 .md-para。
+      const paras = syncedRefined?.paragraphs ?? [];
+      const byStart = new Map(paras.filter((p) => p.end_ms > p.start_ms).map((p) => [p.start_ms, p]));
+      for (const node of el.querySelectorAll<HTMLElement>(".md-para")) {
+        const sm = node.dataset.startMs;
+        const p = sm === undefined ? undefined : byStart.get(Number(sm));
+        const isCut = p !== undefined && edits.some((c) => p.start_ms >= c.start_ms && p.end_ms <= c.end_ms);
+        node.classList.toggle("cut", isCut);
+        if (isCut) node.title = t("notes.seg.cutAway");
+        else node.removeAttribute("title");
+      }
+      return;
+    }
     for (const node of el.querySelectorAll<HTMLElement>(".md-seg")) {
       const seq = Number(node.dataset.seq);
       node.classList.toggle("playing", active.has(seq));
@@ -3423,7 +3446,8 @@
   }
   /* 被删减的段(剪辑表):灰显 + danger 删除线,与 AI 过滤灰显区分——这是用户
      亲手删的,语义是"音频里已剪掉",恢复入口在播放器下方 */
-  .transcript :global(.md-seg.cut) {
+  .transcript :global(.md-seg.cut),
+  .transcript :global(.md-para.cut) {
     opacity: 0.38;
     text-decoration: line-through;
     text-decoration-color: var(--danger);

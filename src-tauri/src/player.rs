@@ -927,10 +927,17 @@ pub fn player_seek(app: AppHandle, state: State<'_, PlayerHandle>, ms: u64) -> R
 
 /// 毫秒剪辑区间 → 16k 采样区间(排序 + 滤空,装载与运行时更新共用同一换算)。
 fn cut_samples_from_ms(cuts_ms: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    // 饱和乘法(Codex P2):盘上 edits.json 合法 JSON 也可能带天文数字端点,
+    // 普通乘法 debug 溢出 panic、release 回绕成错误剪辑位置。
     let mut out: Vec<(u64, u64)> = cuts_ms
         .iter()
         .filter(|(s, e)| e > s)
-        .map(|&(s, e)| (s * SRC_RATE as u64 / 1000, e * SRC_RATE as u64 / 1000))
+        .map(|&(s, e)| {
+            (
+                s.saturating_mul(SRC_RATE as u64) / 1000,
+                e.saturating_mul(SRC_RATE as u64) / 1000,
+            )
+        })
         .collect();
     out.sort_by_key(|c| c.0);
     out

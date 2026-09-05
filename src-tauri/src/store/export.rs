@@ -37,10 +37,14 @@ impl NoteStore {
             Some(doc) => {
                 let title = self.load(id)?.meta.title;
                 let mut clipped = doc.clone();
+                // 无音频跨度的自由块(用户在笔记页插入的标题/手写段,start==end==0)
+                // 不参与时间过滤:它们不属于任何时间段,按范围/删减掐掉会把用户
+                // 手写的内容丢掉(Codex 审出:从 0 开始的删减会命中 fully_cut(0,0))。
+                let has_span = |p: &super::RefinedParagraph| p.end_ms > p.start_ms;
                 if let Some((s, e)) = range {
-                    clipped.paragraphs.retain(|p| p.end_ms > s && p.start_ms < e);
+                    clipped.paragraphs.retain(|p| !has_span(p) || (p.end_ms > s && p.start_ms < e));
                 }
-                clipped.paragraphs.retain(|p| !fully_cut(p.start_ms, p.end_ms));
+                clipped.paragraphs.retain(|p| !has_span(p) || !fully_cut(p.start_ms, p.end_ms));
                 render_refined(&title, &clipped, format == "md")
             }
             None => {
@@ -577,6 +581,73 @@ mod tests {
         let md = std::fs::read_to_string(&dest).unwrap();
         assert!(md.contains("中段。"), "{md}");
         assert!(!md.contains("开场。") && !md.contains("收尾。"), "{md}");
+    }
+
+    /// 用户插入的自由块(无说话人,start==end==0)不参与范围/删减过滤:从 0 开始的
+    /// 删减曾把它当成"完全落在删减内"一并抹掉(Codex 审出)。
+    #[test]
+    fn export_keeps_speakerless_free_blocks_despite_range_and_cuts() {
+        use crate::store::{RefineStages, RefinedDoc, RefinedParagraph};
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "占位。", 0, 1_000, None, None).unwrap();
+        w.finalize(chrono::Local::now()).unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let free = RefinedParagraph {
+            speaker: String::new(),
+            name: None,
+            person_id: None,
+            start_ms: 0,
+            end_ms: 0,
+            text: "# 我的手写标题".into(),
+            source_seqs: vec![],
+            mentions: vec![],
+        };
+        let spoken = RefinedParagraph {
+            speaker: "S1".into(),
+            name: Some("甲".into()),
+            person_id: None,
+            start_ms: 60_000,
+            end_ms: 70_000,
+            text: "有声段。".into(),
+            source_seqs: vec![],
+            mentions: vec![],
+        };
+        let doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
+            schema_version: 1,
+            generated_at: String::new(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
+            llm_model: None,
+            stages: RefineStages {
+                filter: "done".into(),
+                recluster: "done".into(),
+                llm: "done".into(),
+                entities: "off".into(),
+                relations: "off".into(),
+            },
+            discarded_seqs: vec![],
+            entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
+            graph_support_mentions: vec![],
+            revision: 0,
+            stale: false,
+            paragraphs: vec![free, spoken],
+        };
+        // 从 0 开始的删减 + 只罩住后半的范围:自由块两关都要活下来
+        let note_dir = store.note_dir(&id).unwrap();
+        crate::store::edits::add_cut(&note_dir, 0, 5_000, 100_000).unwrap();
+        let dest = out.path().join("free.md");
+        store.export_to(&id, "md", Some(&doc), &dest, Some((50_000, 90_000))).unwrap();
+        let md = std::fs::read_to_string(&dest).unwrap();
+        assert!(md.contains("我的手写标题"), "自由块不被范围/删减掐掉: {md}");
+        assert!(md.contains("有声段。"), "{md}");
     }
 
     #[test]
