@@ -8534,6 +8534,66 @@ fn export_note(
     result
 }
 
+/// 试听候选排序:每个说话人按「段落声纹与该人质心的余弦」降序给出 seq 序。
+/// 动机(2026-09-05 用户实报):试听清单原按"最长的段",而现场会里越长的段越可能
+/// 是多人来回对话,拿来"听清是谁"正好选反;混了多人的段声纹偏离质心,按相似度
+/// 排自然沉底。纯读嵌入缓存(embeddings.json,录制期预热/Aing/拆分都会写),
+/// 不跑模型不读音频;无缓存或某人无覆盖段则该人缺席,前端回落时长序。
+/// 太短的段(听不出人)排到达标段之后而非剔除——有些人只有短段。
+#[tauri::command]
+fn note_clip_ranks(app: AppHandle, id: String) -> Result<std::collections::HashMap<String, Vec<u64>>, String> {
+    const MIN_AUDITION_MS: u64 = 4_000;
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let note_dir = dir.join(&id);
+    let note = store::NoteStore::new(dir).load(&id).map_err(|e| e.to_string())?;
+    let Some(cache) = store::embed_cache::load(&note_dir) else {
+        return Ok(Default::default());
+    };
+    // 命中口径与 embed_all 一致:(seq,start,end,source) 全等才可用,切片变过即弃。
+    let by_key: std::collections::HashMap<(u64, u64, u64, &str), &Vec<f32>> = cache
+        .entries
+        .iter()
+        .map(|e| ((e.seq, e.start_ms, e.end_ms, e.source.as_str()), &e.vec))
+        .collect();
+    let mut per: std::collections::HashMap<&str, Vec<(u64, &Vec<f32>, u64)>> = Default::default();
+    for s in &note.segments {
+        let Some(sp) = s.speaker.as_deref() else { continue };
+        if let Some(v) = by_key.get(&(s.seq, s.start_ms, s.end_ms, s.source.as_str())) {
+            per.entry(sp).or_default().push((s.seq, v, s.end_ms.saturating_sub(s.start_ms)));
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for (sid, items) in per {
+        if items.len() < 2 {
+            continue; // 单段无质心可言,前端回落时长序
+        }
+        let dim = items[0].1.len();
+        let mut mean = vec![0f32; dim];
+        for (_, v, _) in &items {
+            for (m, x) in mean.iter_mut().zip(v.iter()) {
+                *m += x;
+            }
+        }
+        let nm: f32 = mean.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mut scored: Vec<(f64, u64, u64)> = items
+            .iter()
+            .map(|(seq, v, dur)| {
+                let dot: f32 = mean.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                let nv: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let cos = if nv > 0.0 && nm > 0.0 { f64::from(dot / (nv * nm)) } else { -1.0 };
+                (cos, *dur, *seq)
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            let (ap, bp) = (u8::from(a.1 >= MIN_AUDITION_MS), u8::from(b.1 >= MIN_AUDITION_MS));
+            bp.cmp(&ap).then(b.0.total_cmp(&a.0))
+        });
+        out.insert(sid.to_string(), scored.into_iter().map(|(_, _, seq)| seq).collect());
+    }
+    Ok(out)
+}
+
 /// 读笔记的音频剪辑表(edits.json;无文件即空表)。
 #[tauri::command]
 fn note_edits(app: AppHandle, id: String) -> Result<store::edits::EditList, String> {
@@ -11166,6 +11226,7 @@ pub fn run() {
             note_edits,
             add_note_cut,
             remove_note_cut,
+            note_clip_ranks,
             player::player_stop,
             set_playback_active,
             mic_mode,

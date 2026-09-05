@@ -59,6 +59,7 @@
     getNoteEdits,
     addNoteCut,
     removeNoteCut,
+    getClipRanks,
     type CutRange,
     type CalendarCandidate,
   } from "$lib/notes";
@@ -923,7 +924,23 @@
     void refreshMultiOps();
   }
 
-  /** 该说话人的试听候选:最长的 5 段源段(修订稿一律回落到源段,见下)。 */
+  /** 试听候选排序表(说话人 → 声纹最像此人的 seq 降序;后端纯读嵌入缓存)。
+      现场会教训(2026-09-05 用户实报):最长的段往往是多人来回对话,按"最像"排,
+      混了多人的段声纹偏离质心自然沉底。 */
+  let clipRanks = $state<Record<string, number[]>>({});
+  $effect(() => {
+    const forId = id;
+    getClipRanks(forId)
+      .then((r) => {
+        if (forId === id) clipRanks = r;
+      })
+      .catch(() => {
+        if (forId === id) clipRanks = {};
+      });
+  });
+
+  /** 该说话人的试听候选:声纹最像此人的 5 段;无嵌入缓存回落最长 5 段
+      (修订稿一律回落到源段,见下)。 */
   function previewClips(sid: string): { seq: number; start_ms: number; end_ms: number }[] {
     // **修订稿一律回落到源段**。修订稿的段落是「不连续源段的合并」,却只记一个
     // start_ms~end_ms 的大范围;照那个范围连续播,中间别人说的话会原样放出来。
@@ -933,15 +950,25 @@
     // 一波说话人:两个视图的 sid 都是原始稿说话人,直接取其原始段;修订稿旧文档
     // 映射不回 S 的遗留 id 才退回「段落 source_seqs 还原」。
     const direct = displaySegments.filter((s) => s.speaker === sid);
-    return (
+    const pool =
       direct.length > 0
         ? direct
         : (refined?.paragraphs ?? [])
             .filter((p) => p.speaker === sid)
             .flatMap((p) => p.source_seqs)
             .map((seq) => segBySeq.get(seq))
-            .filter((s) => s !== undefined)
-    )
+            .filter((s) => s !== undefined);
+    // 优先按声纹相似度序(后端 note_clip_ranks;多人混杂段沉底);该人无排序数据
+    // (无嵌入缓存/段太少)回落最长序。
+    const rank = clipRanks[sid];
+    if (rank && rank.length > 0) {
+      const bySeq = new Map(pool.map((s) => [s.seq, s]));
+      const ranked = rank.map((q) => bySeq.get(q)).filter((s) => s !== undefined);
+      if (ranked.length > 0) {
+        return ranked.slice(0, 5).map((s) => ({ seq: s.seq, start_ms: s.start_ms, end_ms: s.end_ms }));
+      }
+    }
+    return pool
       .sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms))
       .slice(0, 5)
       .map((s) => ({ seq: s.seq, start_ms: s.start_ms, end_ms: s.end_ms }));
@@ -1291,12 +1318,13 @@
     rangeHintSeq = null;
     rangeHintEdge = null;
     clearTimeout(rangeHintTimer);
-    // 剪辑表属于上一篇:先清空,新一篇由拉取 effect 自己填(id 快照防旧响应)。
+    // 剪辑表/试听排序属于上一篇:先清空,新一篇由各自拉取 effect 填(id 快照防旧响应)。
     edits = [];
     editsManage = false;
     editsErr = "";
     lastCut = null;
     clearTimeout(undoTimer);
+    clipRanks = {};
   });
 
   // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。

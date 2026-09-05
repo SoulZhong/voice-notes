@@ -292,6 +292,10 @@ export const addNoteCut = (id: string, startMs: number, endMs: number, totalMs: 
 /** 恢复一段删减(按剪辑表里的精确端点)。返回更新后整表。 */
 export const removeNoteCut = (id: string, startMs: number, endMs: number) =>
   invoke<EditList>("remove_note_cut", { id, startMs, endMs });
+
+/** 试听候选排序:说话人 → 按「声纹最像此人」降序的段 seq 表(纯读嵌入缓存;
+ * 无缓存/无覆盖的人缺席,调用方回落时长序)。 */
+export const getClipRanks = (id: string) => invoke<Record<string, number[]>>("note_clip_ranks", { id });
 /** 导出到用户选定路径(保存对话框),返回落盘绝对路径。preferRefined=真且修订稿
  * 在盘时导修订稿(所见即所得)。range 圈定时只导与范围重叠的段/段落。 */
 export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean, dest: string, range?: ExportRange) =>
