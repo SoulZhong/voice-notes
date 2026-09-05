@@ -8534,6 +8534,31 @@ fn export_note(
     result
 }
 
+/// 读笔记的音频剪辑表(edits.json;无文件即空表)。
+#[tauri::command]
+fn note_edits(app: AppHandle, id: String) -> Result<store::edits::EditList, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    Ok(store::edits::load_edits(&dir.join(&id)))
+}
+
+/// 删减一段音频(非破坏性:只记入剪辑表,播放跳过/导出剔除,随时可恢复)。
+/// total_ms 由前端传播放器时间轴总长,仅用于钳位。返回更新后整表。
+#[tauri::command]
+fn add_note_cut(app: AppHandle, id: String, start_ms: u64, end_ms: u64, total_ms: u64) -> Result<store::edits::EditList, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::edits::add_cut(&dir.join(&id), start_ms, end_ms, total_ms).map_err(|e| e.to_string())
+}
+
+/// 恢复一段删减(按精确端点匹配)。返回更新后整表。
+#[tauri::command]
+fn remove_note_cut(app: AppHandle, id: String, start_ms: u64, end_ms: u64) -> Result<store::edits::EditList, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::edits::remove_cut(&dir.join(&id), start_ms, end_ms).map_err(|e| e.to_string())
+}
+
 /// 导出圈选范围整形:两参数须同来同往(前端要么都给要么都空),半开区间须非空。
 /// 单独给一半按坏参数拒绝,不猜"另一半是 0/无穷"——猜错会静默导出意料外的范围。
 fn export_range(start: Option<u64>, end: Option<u64>) -> Result<Option<(u64, u64)>, String> {
@@ -11136,7 +11161,11 @@ pub fn run() {
             player::player_play,
             player::player_pause,
             player::player_seek,
+            player::player_set_cuts,
             player::player_set_muted,
+            note_edits,
+            add_note_cut,
+            remove_note_cut,
             player::player_stop,
             set_playback_active,
             mic_mode,

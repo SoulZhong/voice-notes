@@ -279,6 +279,19 @@ export const renameSpeaker = (noteId: string, speakerId: string, name: string, a
   invoke<void>("rename_speaker", { noteId, speakerId, name, auditedSeq: auditedSeq ?? null, selectedSeqs: selectedSeqs ?? null });
 /** 导出圈选范围(播放器游标圈定,笔记时间轴毫秒):null=导整篇。 */
 export type ExportRange = { start: number; end: number } | null;
+
+/** 音频删减区间(非破坏性剪辑表 edits.json,笔记时间轴毫秒半开区间)。 */
+export type CutRange = { start_ms: number; end_ms: number };
+export type EditList = { schema_version: number; cuts: CutRange[] };
+/** 读剪辑表(无文件即空表)。 */
+export const getNoteEdits = (id: string) => invoke<EditList>("note_edits", { id });
+/** 删减一段音频:只记入剪辑表(播放跳过/导出剔除),原始音频不动,可恢复。
+ * 后端会吞并重叠/相邻区间,返回更新后整表。totalMs 传播放器时间轴总长做钳位。 */
+export const addNoteCut = (id: string, startMs: number, endMs: number, totalMs: number) =>
+  invoke<EditList>("add_note_cut", { id, startMs, endMs, totalMs });
+/** 恢复一段删减(按剪辑表里的精确端点)。返回更新后整表。 */
+export const removeNoteCut = (id: string, startMs: number, endMs: number) =>
+  invoke<EditList>("remove_note_cut", { id, startMs, endMs });
 /** 导出到用户选定路径(保存对话框),返回落盘绝对路径。preferRefined=真且修订稿
  * 在盘时导修订稿(所见即所得)。range 圈定时只导与范围重叠的段/段落。 */
 export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean, dest: string, range?: ExportRange) =>

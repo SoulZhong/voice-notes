@@ -56,6 +56,10 @@
     identifyNote,
     finalizeInterruptedNote,
     formatTs,
+    getNoteEdits,
+    addNoteCut,
+    removeNoteCut,
+    type CutRange,
     type CalendarCandidate,
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
@@ -1287,6 +1291,11 @@
     rangeHintSeq = null;
     rangeHintEdge = null;
     clearTimeout(rangeHintTimer);
+    // 剪辑表属于上一篇:先清空,新一篇由拉取 effect 自己填(id 快照防旧响应)。
+    edits = [];
+    editsManage = false;
+    editsErr = "";
+    lastCut = null;
   });
 
   // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。
@@ -1816,6 +1825,60 @@
     return { start: Math.round(s), end: Math.round(e) };
   }
 
+  // ── 音频删减(非破坏性剪辑表 edits.json):删掉圈内 → 播放跳过、导出剔除、
+  //    逐字稿灰显;原始录音一个字节不动,随时可恢复。 ──
+  let edits = $state<CutRange[]>([]);
+  let editsManage = $state(false);
+  let editsErr = $state("");
+  /** 刚删的那段(可能已被后端吞并成更大的区间):一键撤销入口。 */
+  let lastCut = $state<CutRange | null>(null);
+  // 进页/切笔记拉一遍剪辑表(id 快照防快速切换时旧响应覆盖新页)。
+  $effect(() => {
+    const forId = id;
+    getNoteEdits(forId)
+      .then((l) => {
+        if (forId === id) edits = l.cuts;
+      })
+      .catch(() => {
+        if (forId === id) edits = [];
+      });
+  });
+  async function deleteRange() {
+    const r = exportRange();
+    if (!r || !player) return;
+    editsErr = "";
+    try {
+      const list = await addNoteCut(id, r.start, r.end, Math.round(player.durationMs()));
+      edits = list.cuts;
+      // 撤销目标 = 表里覆盖本次区间的那条(后端可能已把它与旧区间吞并)。
+      lastCut = list.cuts.find((c) => c.start_ms <= r.start && c.end_ms >= r.end) ?? null;
+      rangeStartMs = null;
+      rangeEndMs = null;
+    } catch (e) {
+      editsErr = t("notes.edits.failed", { e });
+    }
+  }
+  async function restoreCut(c: CutRange) {
+    editsErr = "";
+    try {
+      const list = await removeNoteCut(id, c.start_ms, c.end_ms);
+      edits = list.cuts;
+      if (lastCut && lastCut.start_ms === c.start_ms && lastCut.end_ms === c.end_ms) lastCut = null;
+      if (edits.length === 0) editsManage = false;
+    } catch (e) {
+      editsErr = t("notes.edits.failed", { e });
+    }
+  }
+  /** 完全落在删减区间内的段(逐字稿灰显;跨界段不标——里面还有没删的话音)。 */
+  const cutSeqs = $derived.by(() => {
+    const s = new Set<number>();
+    if (edits.length === 0) return s;
+    for (const sg of displaySegments) {
+      if (edits.some((c) => sg.start_ms >= c.start_ms && sg.end_ms <= c.end_ms)) s.add(sg.seq);
+    }
+    return s;
+  });
+
   // wheel 上滑 = 主动离开(平滑滚动只产生 scroll 事件,不会误判);内容不足一屏不触发。
   $effect(() => {
     if (!transcriptEl) return;
@@ -2050,6 +2113,7 @@
     const el = transcriptEl;
     const active = activeSeqs;
     const discarded = discardedSeqs;
+    const cut = cutSeqs;
     const hint = rangeHintSeq;
     const edge = rangeHintEdge;
     void segRenderTick;
@@ -2061,7 +2125,9 @@
       node.classList.toggle("hint-start", seq === hint && edge === "start");
       node.classList.toggle("hint-end", seq === hint && edge === "end");
       node.classList.toggle("discarded", discarded.has(seq));
-      if (discarded.has(seq)) node.title = t("notes.seg.filtered");
+      node.classList.toggle("cut", cut.has(seq));
+      if (cut.has(seq)) node.title = t("notes.seg.cutAway");
+      else if (discarded.has(seq)) node.title = t("notes.seg.filtered");
       else node.removeAttribute("title");
     }
     // 拖游标触发的修订稿→原始稿自动切换:切换当拍 .md-seg 尚未渲染,联动段的
@@ -2400,7 +2466,7 @@
       <div class="transport">
         {#if canEdit && tracks.length > 0}
           <div class="player-slot">
-            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} bind:rangeStartMs bind:rangeEndMs {onRangeDrag} {onRangeDragEnd} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} bind:rangeStartMs bind:rangeEndMs {onRangeDrag} {onRangeDragEnd} cuts={edits} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
@@ -2424,6 +2490,52 @@
           <span class="rec-dot"></span>
         </button>
       </div>
+
+      <!-- 音频剪辑行(非破坏性删减):圈定了范围给「删除圈内」;有删减给统计+管理。
+           删除只记入剪辑表(edits.json),播放跳过、导出剔除,原始录音不动。 -->
+      {#if canEdit && tracks.length > 0}
+        {@const editsRange = exportRange()}
+        {#if editsRange || edits.length > 0 || editsErr}
+          <div class="edits-row">
+            {#if editsRange}
+              <button class="link danger" title={t("notes.edits.deleteTitle")} onclick={() => void deleteRange()}>
+                {t("notes.edits.deleteRange", { start: formatTs(editsRange.start), end: formatTs(editsRange.end) })}
+              </button>
+            {/if}
+            {#if edits.length > 0}
+              <span class="edits-info">
+                {t("notes.edits.count", { n: edits.length, secs: Math.round(edits.reduce((a, c) => a + c.end_ms - c.start_ms, 0) / 1000) })}
+              </span>
+              <button class="link" onclick={() => (editsManage = !editsManage)}>
+                {editsManage ? t("notes.edits.collapse") : t("notes.edits.manage")}
+              </button>
+              {#if lastCut}
+                {@const undoTarget = lastCut}
+                <button class="link" onclick={() => void restoreCut(undoTarget)}>{t("notes.edits.undo")}</button>
+              {/if}
+            {/if}
+            {#if editsErr}<span class="edits-err">{editsErr}</span>{/if}
+          </div>
+          {#if editsManage && edits.length > 0}
+            <div class="edits-list">
+              {#each edits as c (c.start_ms)}
+                <div class="edits-item">
+                  <span class="edits-span">{formatTs(c.start_ms)} – {formatTs(c.end_ms)}</span>
+                  <button class="link" onclick={() => void restoreCut(c)}>{t("notes.edits.restore")}</button>
+                </div>
+              {/each}
+              {#if edits.length > 1}
+                <button
+                  class="link"
+                  onclick={async () => {
+                    for (const c of [...edits]) await restoreCut(c);
+                  }}>{t("notes.edits.restoreAll")}</button
+                >
+              {/if}
+            </div>
+          {/if}
+        {/if}
+      {/if}
 
       <!-- 说话人条:修订稿与原始逐字稿同一份 speakers.json、同一套交互,不随视图切换变化
            (2026-08-28 用户实报:修订稿上不可点、逐字稿上可点)。改名/选人/取消关联
@@ -2903,6 +3015,42 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);
   }
+  /* 音频剪辑行:紧贴 transport 下方的一行小字动作(danger 删除入口 + 统计 + 管理) */
+  .edits-row {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    margin: 0.15rem 0 0 0.2rem;
+    font-size: 0.8rem;
+  }
+  .edits-info {
+    color: var(--ink-secondary);
+    font-variant-numeric: tabular-nums;
+  }
+  .edits-err {
+    color: var(--danger);
+  }
+  .edits-list {
+    margin: 0.25rem 0 0 0.2rem;
+    padding: 0.4rem 0.6rem;
+    background: var(--surface);
+    border-radius: var(--radius-lg);
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    max-width: 22rem;
+  }
+  .edits-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    font-size: 0.8rem;
+  }
+  .edits-span {
+    color: var(--ink-secondary);
+    font-variant-numeric: tabular-nums;
+  }
   /* 圈定范围提示:游标圈了真子范围时出现在菜单顶部,交代两个导出项的作用域 */
   .export-range-note {
     margin: 0;
@@ -3097,6 +3245,14 @@
   /* 被 Aing 过滤掉的段(原始稿视角):灰显但保留可读,不做删除线/隐藏 */
   .transcript :global(.md-seg.discarded) {
     opacity: 0.38;
+  }
+  /* 被删减的段(剪辑表):灰显 + danger 删除线,与 AI 过滤灰显区分——这是用户
+     亲手删的,语义是"音频里已剪掉",恢复入口在播放器下方 */
+  .transcript :global(.md-seg.cut) {
+    opacity: 0.38;
+    text-decoration: line-through;
+    text-decoration-color: var(--danger);
+    text-decoration-thickness: 1px;
   }
   /* 修订稿段落(MarkdownEditor 的 refined_paragraph NodeView 产出,DOM 由 PM 命令式
      创建,没有 Svelte 的 scope hash,必须 :global 才能命中):与 .md-seg 同排版语言,

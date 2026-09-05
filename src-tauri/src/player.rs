@@ -81,6 +81,10 @@ struct Core {
     playing: AtomicBool,
     /// 装载本核时的代次,随位置事件发给前端做归属判定。
     gen: u64,
+    /// 剪辑跳过区间(16k 采样,恒序不重叠;来自笔记 edits.json,player_set_cuts 更新)。
+    /// RwLock:音频回调每次 mix 读一把,写只发生在用户点删除/恢复的瞬间,竞争趋零;
+    /// 时间轴本身不缩短——游标进区间即跳到区间尾,总长/seek 语义不变。
+    cuts: std::sync::RwLock<Vec<(u64, u64)>>,
 }
 
 impl Core {
@@ -114,9 +118,16 @@ fn soft_limit(x: f32) -> f32 {
 /// 每帧写 channels 个声道(同值)。返回新 cursor。播完(cursor≥total)置停并静音填充。
 fn mix_frames(core: &Core, out: &mut [f32], channels: usize, step: f64) -> f64 {
     let mut cursor = core.cursor();
+    // 剪辑表快照:每次回调读一把锁(写端只有用户点删除/恢复,竞争趋零)。
+    let cuts = core.cuts.read().unwrap_or_else(std::sync::PoisonError::into_inner);
     for frame in out.chunks_mut(channels) {
         let mut acc = 0.0f32;
         if core.playing.load(Ordering::Relaxed) && cursor < core.total_samples as f64 {
+            // 游标落进被删区间 → 跳到区间尾(表恒序不重叠,单次命中即出;跳出后可能
+            // 直接越过总长,交由下方播完逻辑收口)。播放/seek 都可能把游标送进区间。
+            if let Some(&(_, e)) = cuts.iter().find(|&&(s, e)| cursor >= s as f64 && cursor < e as f64) {
+                cursor = e as f64;
+            }
             for t in &core.tracks {
                 if t.muted.load(Ordering::Relaxed) {
                     continue;
@@ -786,6 +797,9 @@ pub async fn player_load(
         cursor_bits: AtomicU64::new(0f64.to_bits()),
         playing: AtomicBool::new(false),
         gen,
+        // 装载即读盘上剪辑表:前端 player_set_cuts 只服务运行时增删,冷启动/重装载
+        // 不依赖前端补发(补发有竞态窗口,窗口里播放会闯进被删段)。
+        cuts: std::sync::RwLock::new(note_dir.as_deref().map(load_cut_samples).unwrap_or_default()),
     });
     // 发布段(持 publish 互斥,Codex P1):查代次→装内核→起流→复查整段串行。
     // 过期装载在首查即弃(未触碰任何共享态);持锁期间发布后才发现过期(新装载
@@ -908,6 +922,37 @@ pub fn player_seek(app: AppHandle, state: State<'_, PlayerHandle>, ms: u64) -> R
     let target = (ms as f64 / 1000.0 * SRC_RATE).min(core.total_samples as f64);
     core.set_cursor(target);
     emit_pos(&app, core);
+    Ok(())
+}
+
+/// 毫秒剪辑区间 → 16k 采样区间(排序 + 滤空,装载与运行时更新共用同一换算)。
+fn cut_samples_from_ms(cuts_ms: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = cuts_ms
+        .iter()
+        .filter(|(s, e)| e > s)
+        .map(|&(s, e)| (s * SRC_RATE as u64 / 1000, e * SRC_RATE as u64 / 1000))
+        .collect();
+    out.sort_by_key(|c| c.0);
+    out
+}
+
+/// 读盘上剪辑表(edits.json)并换算成采样区间,装载路径用。
+fn load_cut_samples(note_dir: &Path) -> Vec<(u64, u64)> {
+    let cuts: Vec<(u64, u64)> = crate::store::edits::load_edits(note_dir)
+        .cuts
+        .iter()
+        .map(|c| (c.start_ms, c.end_ms))
+        .collect();
+    cut_samples_from_ms(&cuts)
+}
+
+/// 运行时更新剪辑表(用户在页面上删减/恢复后调用):整表替换,毫秒区间。
+/// 内核态,重装载后由装载路径自读盘上表,不依赖本命令补发。
+#[tauri::command]
+pub fn player_set_cuts(state: State<'_, PlayerHandle>, cuts_ms: Vec<(u64, u64)>) -> Result<(), String> {
+    let g = state.core.lock().unwrap();
+    let core = g.as_ref().ok_or_else(|| crate::tr!("尚未装载音轨", "No audio track loaded"))?;
+    *core.cuts.write().unwrap_or_else(std::sync::PoisonError::into_inner) = cut_samples_from_ms(&cuts_ms);
     Ok(())
 }
 
@@ -1181,7 +1226,39 @@ mod tests {
             cursor_bits: AtomicU64::new(0f64.to_bits()),
             playing: AtomicBool::new(true),
             gen: 0,
+            cuts: std::sync::RwLock::new(Vec::new()),
         }
+    }
+
+    /// 剪辑跳过:游标进入被删区间立即跳到区间尾接着放,产出里没有被删段的采样;
+    /// 尾部被删时跳过后直接播完置停。
+    #[test]
+    fn mix_skips_cut_ranges_and_finishes_through_tail_cut() {
+        // 100 个采样,值即下标(1 起),好核对哪些进了输出
+        let samples: Vec<i16> = (1..=100).collect();
+        let core = core_of(vec![mem_track(&samples, 0, "mic")]);
+        // 删 [20,30) 与 [90,100) 采样(用采样直填,绕过 ms 换算的粒度)
+        *core.cuts.write().unwrap() = vec![(20, 30), (90, 100)];
+        let mut out = vec![0f32; 100];
+        mix_frames(&core, &mut out, 1, 1.0);
+        // 第 20 帧起应当直接放第 30 个采样(值 31):被删的 21..=30 不出现
+        let v = |i: usize| (out[i] * 32768.0).round() as i32;
+        assert_eq!(v(19), 20, "删区前最后一个采样照常");
+        assert_eq!(v(20), 31, "游标进入删区当帧即跳到 30(值 31)");
+        assert!((0..100).all(|i| !(21..=30).contains(&v(i))), "被删采样不入混音: {:?}", &out[15..25]);
+        // 全长 100、删掉 20 个采样 → 有效 80 帧,之后进入尾删区跳到 100 播完置停
+        assert_eq!(v(79), 90, "尾删区前最后一个有效采样");
+        assert!(!core.playing.load(Ordering::Relaxed), "越过尾部删区后播完置停");
+        assert!(out[81..].iter().all(|&x| x == 0.0), "播完静音填充");
+    }
+
+    /// 毫秒→采样换算:滤空、排序,16k 口径。
+    #[test]
+    fn cut_samples_conversion_sorts_and_drops_empty() {
+        assert_eq!(
+            cut_samples_from_ms(&[(1_000, 2_000), (500, 500), (0, 100)]),
+            vec![(0, 1_600), (16_000, 32_000)]
+        );
     }
 
     fn track_from_canonical_wav(
