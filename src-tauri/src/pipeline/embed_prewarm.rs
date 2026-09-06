@@ -278,7 +278,7 @@ mod tests {
             start_ms,
             end_ms,
             speaker: None,
-            rms: None,
+            rms: None, multi: None,
         }
     }
 

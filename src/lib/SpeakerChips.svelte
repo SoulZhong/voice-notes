@@ -21,7 +21,7 @@
     onPreviewClip,
     previewingSeq,
     onDetachClip,
-    onRemoveClip,
+    onMarkMultiClip,
     onDelete,
     onUnlink,
     onMarkMulti,
@@ -62,9 +62,10 @@
     onPreviewClip?: (id: string, seq: number) => void;
     /** 「这段不是此人」:把该段单独拆成新说话人(不依赖聚类,段内混杂/别人插话时用)。 */
     onDetachClip?: (id: string, seq: number) => Promise<void>;
-    /** 试听段「移出」:多人混在一段里,不适合归给任何人——清除归属(文字保留,
-        不拆新说话人)。2026-09-05 用户点名补的动作。 */
-    onRemoveClip?: (id: string, seq: number) => Promise<void>;
+    /** 试听段「多人」:几个人混在一段里实在分不开——标记为多人,不归任何人也
+        不造新说话人(文字保留)。2026-09-06 用户点名:此前「拆出/移出」误用会
+        造出一排假说话人。 */
+    onMarkMultiClip?: (id: string, seq: number) => Promise<void>;
     /** 正在播放的片段 seq(高亮那一行)。 */
     previewingSeq?: number | null;
     /** 删除(可选,仅原始逐字稿视图传入)。表项移除,名下段落回到未标注;
@@ -420,13 +421,13 @@
                             {t("speakers.chipClipDetachShort")}
                           </button>
                         {/if}
-                        {#if onRemoveClip}
+                        {#if onMarkMultiClip}
                           <button
                             class="clip-act"
-                            title={t("speakers.chipClipRemoveTitle")}
-                            onclick={() => run(() => onRemoveClip(id, c.seq))}
+                            title={t("speakers.chipClipMultiTitle")}
+                            onclick={() => run(() => onMarkMultiClip(id, c.seq))}
                           >
-                            {t("speakers.chipClipRemove")}
+                            {t("speakers.chipClipMulti")}
                           </button>
                         {/if}
                         </div>

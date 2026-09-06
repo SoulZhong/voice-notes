@@ -1859,9 +1859,9 @@ mod tests {
         speakers.insert("S1".into(), meta("", Some("P2"))); // 关联(经 redirect)
         speakers.insert("S2".into(), meta("现场名", None)); // 只有本地名
         let segments = vec![
-            crate::store::SegmentRecord { seq: 0, source: "mic".into(), text: "a".into(), start_ms: 0, end_ms: 1000, speaker: Some("S1".into()), rms: None },
-            crate::store::SegmentRecord { seq: 1, source: "mic".into(), text: "b".into(), start_ms: 1000, end_ms: 2000, speaker: Some("S2".into()), rms: None },
-            crate::store::SegmentRecord { seq: 2, source: "mic".into(), text: "c".into(), start_ms: 2000, end_ms: 3000, speaker: Some("S2".into()), rms: None },
+            crate::store::SegmentRecord { seq: 0, source: "mic".into(), text: "a".into(), start_ms: 0, end_ms: 1000, speaker: Some("S1".into()), rms: None, multi: None },
+            crate::store::SegmentRecord { seq: 1, source: "mic".into(), text: "b".into(), start_ms: 1000, end_ms: 2000, speaker: Some("S2".into()), rms: None, multi: None },
+            crate::store::SegmentRecord { seq: 2, source: "mic".into(), text: "c".into(), start_ms: 2000, end_ms: 3000, speaker: Some("S2".into()), rms: None, multi: None },
         ];
         let mut doc = RefinedDoc {
             llm_failed_paragraphs: Vec::new(),

@@ -750,7 +750,7 @@ mod tests {
                     start_ms: 0,
                     end_ms: 1000,
                     speaker: Some("S1".into()),
-                    rms: None,
+                    rms: None, multi: None,
                 },
                 crate::store::SegmentRecord {
                     seq: 1,
@@ -759,7 +759,7 @@ mod tests {
                     start_ms: 1000,
                     end_ms: 2000,
                     speaker: Some("S2".into()), // 表中无此 id
-                    rms: None,
+                    rms: None, multi: None,
                 },
                 crate::store::SegmentRecord {
                     seq: 2,
@@ -768,7 +768,7 @@ mod tests {
                     start_ms: 2000,
                     end_ms: 3000,
                     speaker: None,
-                    rms: None,
+                    rms: None, multi: None,
                 },
             ],
             suppressed_segments: vec![],

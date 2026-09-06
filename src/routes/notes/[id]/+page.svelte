@@ -1005,13 +1005,13 @@
     refresh();
     recording.bumpNotes();
   }
-  /** 试听段「移出」:多人混在一段里,不适合归给任何人——清除归属(后端 "none"
-      哨兵),文字保留、不拆新说话人;onsite 场界面兜底显示「未识别」。 */
-  async function removeClip(sid: string, seq: number) {
+  /** 试听段「多人」:几个人混在一段里实在分不开——标记为多人(后端 "multi"
+      哨兵:清归属 + 落旗),文字保留、不造新说话人,徽章显示「多人」。 */
+  async function markMultiClip(sid: string, seq: number) {
     const seg = segBySeq.get(seq);
     if (!seg) return;
-    if (preview?.seq === seq) endPreview("remove");
-    await setSegmentSpeaker(id, seq, seg.text, "none");
+    if (preview?.seq === seq) endPreview("multi");
+    await setSegmentSpeaker(id, seq, seg.text, "multi");
     if (lastAuditioned[sid] === seq) delete lastAuditioned[sid];
     refresh();
     recording.bumpNotes();
@@ -1980,6 +1980,11 @@
     const seg = note?.segments.find((s) => s.seq === attrs.seq);
     const speaker = seg?.speaker ?? null;
     const source = seg?.source ?? "mic";
+    // 多人混杂段(用户手标,2026-09-06):优先于一切兜底——它不是"没认出来",
+    // 是"分不开",徽章明说「多人」。
+    if (seg?.multi) {
+      return { label: t("notes.speaker.multi"), bg: "var(--surface-press)", ink: "var(--ink-secondary)" };
+    }
     // 无主段兜底按场景分流(2026-09-05 用户实报):「我/对方」的老约定来自线上会
     // 双轨(mic=自己、system=远端);现场会(onsite)单麦所有人都进 mic 轨,短到没
     // 声纹的段兜底成「我」是把别人安到用户头上——改中性灰「未识别」。
@@ -2681,7 +2686,7 @@
               assignNoteSpeakerPerson(id, sid, personId, sample?.auditedSeq ?? lastAuditioned[sid], sample?.selectedSeqs?.length ? sample.selectedSeqs : undefined)
           : undefined}
         onDetachClip={canEdit ? detachClip : undefined}
-        onRemoveClip={canEdit ? removeClip : undefined}
+        onMarkMultiClip={canEdit ? markMultiClip : undefined}
         onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
         onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
         onMarkMulti={canEdit ? runAutoSplit : undefined}
