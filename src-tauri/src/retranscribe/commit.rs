@@ -137,7 +137,7 @@ mod tests {
     fn seg(seq: u64, text: &str) -> SegmentRecord {
         SegmentRecord {
             seq, source: "mic".into(), text: text.into(), start_ms: 0, end_ms: 1000,
-            speaker: Some("S1".into()), rms: Some(0.1),
+            speaker: Some("S1".into()), rms: Some(0.1), multi: None,
         }
     }
 

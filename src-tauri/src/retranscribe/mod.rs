@@ -230,7 +230,7 @@ pub fn run(
             start_ms: r.start_ms,
             end_ms: r.end_ms,
             speaker: sp.clone(),
-            rms: Some(r.rms),
+            rms: Some(r.rms), multi: None,
         })
         .collect();
     commit::commit(note_dir, lock, &records, &table)?;

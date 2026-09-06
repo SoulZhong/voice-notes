@@ -319,6 +319,7 @@ impl NoteWriter {
             end_ms,
             speaker: speaker.map(String::from),
             rms,
+            multi: None,
         };
         self.next_seq += 1;
         let line = serde_json::to_string(&rec)?;

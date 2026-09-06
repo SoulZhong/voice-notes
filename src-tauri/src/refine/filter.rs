@@ -102,7 +102,7 @@ mod tests {
     fn discarded_seqs_maps_over_records() {
         let mk = |seq, text: &str, dur: u64, rms| crate::store::SegmentRecord {
             seq, source: "mic".into(), text: text.into(),
-            start_ms: 0, end_ms: dur, speaker: None, rms: Some(rms),
+            start_ms: 0, end_ms: dur, speaker: None, rms: Some(rms), multi: None,
         };
         let segs = vec![mk(0, "噪声。", 642, 0.0146), mk(1, "好。", 1400, 0.005), mk(2, "正常说话内容在这里。", 4000, 0.02)];
         assert_eq!(discarded_seqs(&segs), vec![0]);

@@ -430,7 +430,7 @@ mod fold_tests {
             start_ms: a,
             end_ms: b,
             speaker: None,
-            rms: None,
+            rms: None, multi: None,
         }
     }
 

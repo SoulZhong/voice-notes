@@ -200,7 +200,7 @@ mod calendar_common_tests {
             start_ms: 0,
             end_ms: 120_000,
             speaker: None,
-            rms: None,
+            rms: None, multi: None,
         };
         let (s, e) = note_window_ms(&meta, &[seg]).unwrap();
         assert_eq!(e - s, 120_000, "ended_at 缺失用最后一段兜底");

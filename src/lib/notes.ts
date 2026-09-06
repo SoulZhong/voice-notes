@@ -49,6 +49,8 @@ export type SegmentRecord = {
   end_ms: number;
   speaker: string | null;
   rms?: number;
+  /** 多人混杂标记:几个人混在一段里分不开,不归任何人;徽章显示「多人」。 */
+  multi?: boolean;
 };
 
 export type Note = {

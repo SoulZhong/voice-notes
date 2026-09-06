@@ -124,6 +124,11 @@ pub struct SegmentRecord {
     /// 旧笔记无此键 → None;None 不写盘,新旧行形状双向兼容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rms: Option<f32>,
+    /// 多人混杂标记(2026-09-06 用户点名):这一段几个人混着说,实在分不开——
+    /// 不归任何人(speaker=None)也不造新说话人,徽章显示「多人」。
+    /// Some(true) 才写盘;归给真实说话人时清除(已被认领即不再是"分不开")。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi: Option<bool>,
 }
 
 /// 对原始段的可逆隐藏决定。原始 `segments.jsonl` 永不因自动规则删除；默认视图

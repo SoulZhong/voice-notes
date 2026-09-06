@@ -751,13 +751,16 @@ impl NoteStore {
         let _flock = write_lock(&dir)?;
         let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
         find_seg(&mut lines, seq, expected_text)?;
-        // 归属清除哨兵(2026-09-05 用户点名:多人混在一段里,不适合归给任何人):
-        // speaker 置空回到未标注,段落文字保留,不建新说话人;onsite 场界面兜底
-        // 显示「未识别」。哨兵不与真实 id 空间(S/R 前缀)冲突。
-        if speaker_id == "none" {
-            find_seg(&mut lines, seq, expected_text)?.speaker = None;
+        // 两个哨兵(不与真实 id 空间 S/R 前缀冲突),都不建新说话人、都保留文字:
+        // - "none"(2026-09-05):清除归属回未标注(onsite 场显示「未识别」)
+        // - "multi"(2026-09-06 用户点名):几个人混在一段里实在分不开——除清归属外
+        //   落 multi 旗,徽章显示「多人」,与"只是还没认出来"区分开
+        if speaker_id == "none" || speaker_id == "multi" {
+            let seg = find_seg(&mut lines, seq, expected_text)?;
+            seg.speaker = None;
+            seg.multi = (speaker_id == "multi").then_some(true);
             write_jsonl_atomic(&dir, &lines)?;
-            return Ok("none".into());
+            return Ok(speaker_id.to_string());
         }
         let mut speakers = read_speakers(&dir);
         let target = if speaker_id == "new" {
@@ -795,7 +798,10 @@ impl NoteStore {
             }
             speaker_id.to_string()
         };
-        find_seg(&mut lines, seq, expected_text)?.speaker = Some(target.clone());
+        let seg = find_seg(&mut lines, seq, expected_text)?;
+        seg.speaker = Some(target.clone());
+        // 归给真实说话人即清多人旗:已被认领的段不再是"分不开"。
+        seg.multi = None;
         write_jsonl_atomic(&dir, &lines)?;
         Ok(target)
     }
@@ -1266,6 +1272,17 @@ mod tests {
         assert_eq!(note.segments[0].speaker, None, "归属已清除");
         assert_eq!(note.segments[0].text, "混杂段", "文字保留");
         assert!(note.speakers.contains_key("S1"), "不动说话人表");
+
+        // "multi" 哨兵:清归属 + 落多人旗
+        assert_eq!(store.set_segment_speaker("20260101-000002", 0, "混杂段", "multi").unwrap(), "multi");
+        let note = store.load("20260101-000002").unwrap();
+        assert_eq!(note.segments[0].speaker, None);
+        assert_eq!(note.segments[0].multi, Some(true), "多人旗已落");
+        // 归给真实说话人:多人旗清除(已被认领即不再是"分不开")
+        store.set_segment_speaker("20260101-000002", 0, "混杂段", "S1").unwrap();
+        let note = store.load("20260101-000002").unwrap();
+        assert_eq!(note.segments[0].speaker.as_deref(), Some("S1"));
+        assert_eq!(note.segments[0].multi, None, "认领后多人旗清除");
     }
 
     /// 自动标题的条件改名:默认名可换;用户手动命名后拒写(手动标题优先级最高,

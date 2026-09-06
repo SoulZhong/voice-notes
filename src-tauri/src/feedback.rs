@@ -640,7 +640,7 @@ mod tests {
             start_ms,
             end_ms,
             speaker: Some("S1".into()),
-            rms: Some(0.0),
+            rms: Some(0.0), multi: None,
         }
     }
 

@@ -1436,7 +1436,7 @@ mod tests {
             start_ms: start,
             end_ms: end,
             speaker: Some(spk.into()),
-            rms: Some(0.02),
+            rms: Some(0.02), multi: None,
         }
     }
 

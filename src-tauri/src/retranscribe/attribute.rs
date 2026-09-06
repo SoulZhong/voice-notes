@@ -291,7 +291,7 @@ mod tests {
     fn old_seg(seq: u64, source: &str, start: u64, end: u64, speaker: Option<&str>) -> SegmentRecord {
         SegmentRecord {
             seq, source: source.into(), text: "旧".into(), start_ms: start, end_ms: end,
-            speaker: speaker.map(String::from), rms: None,
+            speaker: speaker.map(String::from), rms: None, multi: None,
         }
     }
 
