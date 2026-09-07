@@ -2823,14 +2823,17 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
     if state.download_running.load(Ordering::SeqCst) {
         return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later").into());
     }
-    // F1 修复:该笔记正在 Aing 中就拒绝续录——Aing 完成后才 transcode.enqueue,而续录
-    // 先 cancel_and_wait 再向 mic.wav 追加写;若放行,Aing 收尾时才入队的转码会把
-    // 「活跃在追加」的 WAV 编码后删除,续录段音频永久丢失。
+    // Aing 中**放行**续录(2026-09-07 用户点名:即使 Aing 也得可以继续录制)。
+    // 原 F1 入口拒绝防的是「Aing 收尾入队的转码把正在追加写的 WAV 编码后删除」,
+    // 但 worker 侧的 F1(b) 守卫早已齐备:所有 transcode.enqueue 与云端二遍都在
+    // 执行时按 is_resumed_by_active_session 跳过(跳过不丢转码,续录停止时重走
+    // Aing+转码)。续录 writer 持 NoteLock 后,在跑 Aing 的落盘(aing.json 分块/
+    // speakers 关联)会以「被占用」失败降级——结果本就会被续录后的重跑覆盖,属
+    // 可弃稿;停录后新一轮 Aing 以更新代次接管,旧 worker 的收工戳按代次让位。
+    // 已知边界:云端二遍(cloud_second_pass)阶段持 NoteLock 长跑时,续录会在
+    // NoteWriter::resume 拿锁处以「被占用」拒绝——那是真正的写冲突,该拒。
     if refining {
-        return Err(tr!(
-            "该笔记正在 Aing,请稍后再试",
-            "This note is being refined by AI; try again later"
-        ));
+        eprintln!("resume({note_id}): Aing 进行中,放行续录;在跑 Aing 的产物将由停录后的重跑覆盖");
     }
     // 全局互斥于重转写(不限本篇——升级自"仅同笔记"的旧检查):重转写与实时 ASR 各起
     // 一套 ORT 管线,叠跑抢核,这条互斥与 do_start_recording 一样是双向对称的
