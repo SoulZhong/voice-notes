@@ -2801,17 +2801,20 @@
             <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
           </div>
         {:else}
+          <!-- 带文字的「重新分析」入口(2026-09-07 用户点名):此前是纯图标幽灵钮,
+               和当年"拆分按钮在但没人找到"同病——重切段/重认人的算法升级后,
+               这个入口是存量笔记受益的唯一通道,必须一眼可见。 -->
           <button
-            class="ghost"
+            class="retrans-btn"
             disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
-            title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : `${t("notes.retrans.run")}——${t("notes.retrans.hint")}`}
-            aria-label={t("notes.retrans.run")}
+            title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
             onclick={() => (retransConfirm = true)}
           >
-            <svg class:spin={retranscribing} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <svg class:spin={retranscribing} width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
               <path d="M13.4 1.8v2.8h-2.8" />
             </svg>
+            {retranscribing ? t("notes.retrans.runningShort") : t("notes.retrans.run")}
           </button>
         {/if}
       </div>
@@ -3311,6 +3314,35 @@
   }
   @media (prefers-reduced-motion: reduce) {
     .ghost svg.spin { animation: none; }
+  }
+  /* 「重新分析」:带文字的胶囊(与剪辑行按钮同族),不再是纯图标幽灵钮——
+     它是算法升级后存量笔记受益的唯一通道,必须可发现 */
+  .retrans-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.3em 0.8em;
+    font-size: 0.78rem;
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+      background 120ms ease,
+      color 120ms ease;
+  }
+  .retrans-btn:hover:not(:disabled) {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .retrans-btn:active:not(:disabled) {
+    transform: translateY(0.5px);
+  }
+  .retrans-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
   }
   .ghost {
     display: inline-flex;
