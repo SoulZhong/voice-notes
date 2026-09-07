@@ -8562,15 +8562,20 @@ fn export_note(
     result
 }
 
-/// 试听候选排序:每个说话人按「段落声纹与该人质心的余弦」降序给出 seq 序。
-/// 动机(2026-09-05 用户实报):试听清单原按"最长的段",而现场会里越长的段越可能
-/// 是多人来回对话,拿来"听清是谁"正好选反;混了多人的段声纹偏离质心,按相似度
-/// 排自然沉底。纯读嵌入缓存(embeddings.json,录制期预热/Aing/拆分都会写),
-/// 不跑模型不读音频;无缓存或某人无覆盖段则该人缺席,前端回落时长序。
-/// 太短的段(听不出人)排到达标段之后而非剔除——有些人只有短段。
+/// 试听候选排序:每个说话人按「区分度」降序给出 seq 序。
+///
+/// 打分演化(两次用户实报):
+/// - 2026-09-05:原按"最长的段",现场会里越长越可能是多人对话,选反 → 改按
+///   「与本簇质心的余弦」;
+/// - 2026-09-07:重度混杂的簇里质心本身就是"几个人的混合物",混杂段反而离
+///   质心最近、被顶到最前 → 改按**区分度** = 像本簇 − 最像的他簇。混杂段对
+///   两边都像,区分度低沉底;纯段只像自己人,区分度高浮上来。单簇笔记无"他簇"
+///   可比,退回像本簇。
+///
+/// 纯读嵌入缓存(embeddings.json),不跑模型不读音频;无缓存或某人无覆盖段则
+/// 该人缺席,前端回落时长序。太短的段(听不出人)排到达标段之后而非剔除。
 #[tauri::command]
 fn note_clip_ranks(app: AppHandle, id: String) -> Result<std::collections::HashMap<String, Vec<u64>>, String> {
-    const MIN_AUDITION_MS: u64 = 4_000;
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     let note_dir = dir.join(&id);
@@ -8584,42 +8589,70 @@ fn note_clip_ranks(app: AppHandle, id: String) -> Result<std::collections::HashM
         .iter()
         .map(|e| ((e.seq, e.start_ms, e.end_ms, e.source.as_str()), &e.vec))
         .collect();
-    let mut per: std::collections::HashMap<&str, Vec<(u64, &Vec<f32>, u64)>> = Default::default();
+    let mut per: std::collections::HashMap<String, Vec<(u64, Vec<f32>, u64)>> = Default::default();
     for s in &note.segments {
         let Some(sp) = s.speaker.as_deref() else { continue };
         if let Some(v) = by_key.get(&(s.seq, s.start_ms, s.end_ms, s.source.as_str())) {
-            per.entry(sp).or_default().push((s.seq, v, s.end_ms.saturating_sub(s.start_ms)));
+            per.entry(sp.to_string())
+                .or_default()
+                .push((s.seq, (*v).clone(), s.end_ms.saturating_sub(s.start_ms)));
         }
     }
+    Ok(rank_clips_by_margin(&per))
+}
+
+/// note_clip_ranks 的纯打分本体(可测)。见命令注释:分数 = cos(本簇质心) −
+/// max cos(他簇质心);无他簇退回 cos(本簇)。时长达标(≥4s)优先于分数。
+pub(crate) fn rank_clips_by_margin(
+    per: &std::collections::HashMap<String, Vec<(u64, Vec<f32>, u64)>>,
+) -> std::collections::HashMap<String, Vec<u64>> {
+    const MIN_AUDITION_MS: u64 = 4_000;
+    fn norm(v: &[f32]) -> f32 {
+        v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    }
+    fn cos(a: &[f32], b: &[f32]) -> f64 {
+        let (na, nb) = (norm(a), norm(b));
+        if na <= 0.0 || nb <= 0.0 {
+            return -1.0;
+        }
+        f64::from(a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() / (na * nb))
+    }
+    // 各簇未归一化均值质心(段数 ≥2 才有质心可言)
+    let centroids: std::collections::HashMap<&str, Vec<f32>> = per
+        .iter()
+        .filter(|(_, items)| items.len() >= 2)
+        .map(|(sid, items)| {
+            let dim = items[0].1.len();
+            let mut mean = vec![0f32; dim];
+            for (_, v, _) in items {
+                for (m, x) in mean.iter_mut().zip(v.iter()) {
+                    *m += x;
+                }
+            }
+            (sid.as_str(), mean)
+        })
+        .collect();
     let mut out = std::collections::HashMap::new();
     for (sid, items) in per {
-        if items.len() < 2 {
-            continue; // 单段无质心可言,前端回落时长序
-        }
-        let dim = items[0].1.len();
-        let mut mean = vec![0f32; dim];
-        for (_, v, _) in &items {
-            for (m, x) in mean.iter_mut().zip(v.iter()) {
-                *m += x;
-            }
-        }
-        let nm: f32 = mean.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let Some(own) = centroids.get(sid.as_str()) else { continue };
+        let others: Vec<&Vec<f32>> =
+            centroids.iter().filter(|(k, _)| **k != sid.as_str()).map(|(_, c)| c).collect();
         let mut scored: Vec<(f64, u64, u64)> = items
             .iter()
             .map(|(seq, v, dur)| {
-                let dot: f32 = mean.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-                let nv: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let cos = if nv > 0.0 && nm > 0.0 { f64::from(dot / (nv * nm)) } else { -1.0 };
-                (cos, *dur, *seq)
+                let own_sim = cos(own, v);
+                let rival = others.iter().map(|c| cos(c, v)).fold(f64::NEG_INFINITY, f64::max);
+                let score = if rival.is_finite() { own_sim - rival } else { own_sim };
+                (score, *dur, *seq)
             })
             .collect();
         scored.sort_by(|a, b| {
             let (ap, bp) = (u8::from(a.1 >= MIN_AUDITION_MS), u8::from(b.1 >= MIN_AUDITION_MS));
             bp.cmp(&ap).then(b.0.total_cmp(&a.0))
         });
-        out.insert(sid.to_string(), scored.into_iter().map(|(_, _, seq)| seq).collect());
+        out.insert(sid.clone(), scored.into_iter().map(|(_, _, seq)| seq).collect());
     }
-    Ok(out)
+    out
 }
 
 /// 读笔记的音频剪辑表(edits.json;无文件即空表)。
@@ -11292,6 +11325,49 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             let _ = (app, &event);
         });
+}
+
+#[cfg(test)]
+mod clip_rank_tests {
+    use super::rank_clips_by_margin;
+    use std::collections::HashMap;
+
+    /// 区分度排序:双簇场景下,对两簇都像的混杂段沉底、只像自家的纯段浮顶
+    /// (2026-09-07 用户实报:质心相似度排序在重混簇里把混杂段顶到最前)。
+    #[test]
+    fn margin_ranking_sinks_mixed_segments() {
+        let a = |x: f32, y: f32| vec![x, y];
+        let mut per: HashMap<String, Vec<(u64, Vec<f32>, u64)>> = HashMap::new();
+        per.insert(
+            "S1".into(),
+            vec![
+                (10, a(1.0, 0.05), 6_000),  // 纯 A
+                (11, a(0.72, 0.70), 12_000), // A+B 混杂:对两簇都像
+                (12, a(0.98, 0.10), 5_000),  // 纯 A
+            ],
+        );
+        per.insert("S2".into(), vec![(20, a(0.05, 1.0), 6_000), (21, a(0.1, 0.97), 6_000)]);
+        let out = rank_clips_by_margin(&per);
+        let s1 = &out["S1"];
+        assert_eq!(*s1.last().unwrap(), 11, "混杂段(对两簇都像)排最后: {s1:?}");
+        assert!(s1[0] == 10 || s1[0] == 12, "纯段浮顶: {s1:?}");
+    }
+
+    /// 单簇(无他簇可比)退回"像本簇";不足 4s 的段排达标段之后。
+    #[test]
+    fn margin_ranking_single_cluster_and_short_floor() {
+        let mut per: HashMap<String, Vec<(u64, Vec<f32>, u64)>> = HashMap::new();
+        per.insert(
+            "S1".into(),
+            vec![
+                (1, vec![1.0, 0.0], 2_000), // 最像但太短
+                (2, vec![0.9, 0.3], 6_000),
+                (3, vec![0.7, 0.6], 6_000),
+            ],
+        );
+        let out = rank_clips_by_margin(&per);
+        assert_eq!(out["S1"], vec![2, 3, 1], "达标段优先,短段垫底");
+    }
 }
 
 #[cfg(test)]

@@ -7,8 +7,19 @@ pub const SPLIT_MIN_SEGMENT_MS: u64 = 3000;
 pub const SPLIT_WIN_MS: u64 = 1500;
 /// 滑窗步长(ms)。待真实会议数据校准。
 pub const SPLIT_HOP_MS: u64 = 500;
-/// 相邻有效窗余弦低于此值 → 候选变更点。待真实会议数据校准。
+/// 相邻有效窗余弦低于此值 → 候选变更点(绝对下限)。
+/// 2026-09-07 真实会议标定(17 分钟双人对话,49 个 ≥8s 长段、950 对相邻窗):
+/// 同房间底纹把窗间相似度整体抬到中位 0.846,绝对 0.55 只触发 7 次——检测器
+/// 对现场录音基本全瞎,这正是"每段试听都是两人对话"的根因之一。
 pub const CHANGE_SIM_THRESHOLD: f32 = 0.55;
+/// 自适应低谷落差:阈值 = max(绝对下限, 段内相邻窗相似度中位 − 本值)。
+/// 同一场标定:各段最深凹陷落差 p50=0.169,取 0.12 时 49 段切出 65 点
+/// (平均 1.3、最多 3,正是"一段里一两次换人"的形状,无碎片化)。
+/// 只会比绝对阈值更敏感,不会更迟钝;误切代价低(同人两段仍会聚回同簇),
+/// 漏切代价高(混杂段污染质心与样本)。
+pub const CHANGE_DIP_DELTA: f32 = 0.12;
+/// 自适应基线生效所需的最少相邻窗对数:对数太少时中位数不稳,退回绝对阈值。
+pub const MIN_PAIRS_FOR_BASELINE: usize = 5;
 /// 变更点切出的子段短于此(ms)则丢弃该变更点(短子段声纹不可靠)。待真实会议数据校准。
 pub const MIN_SUBSEG_MS: u64 = 1200;
 
@@ -68,12 +79,24 @@ pub fn detect_change_points(embs: &[Option<Vec<f32>>], total_ms: u64) -> Vec<u64
         })
         .collect();
 
+    // 有效阈值:绝对下限 + 自适应低谷(段内基线中位 − 落差)取更敏感者。
+    // 远场同房间底纹会把基线整体抬高(实测中位 0.846),绝对阈值永远踩不到;
+    // 换人凹陷是相对自身基线的,自适应才看得见。对数不足退回绝对阈值。
+    let threshold = if pairs.len() >= MIN_PAIRS_FOR_BASELINE {
+        let mut sims: Vec<f32> = pairs.iter().map(|p| p.sim).collect();
+        sims.sort_by(f32::total_cmp);
+        let median = sims[sims.len() / 2];
+        CHANGE_SIM_THRESHOLD.max(median - CHANGE_DIP_DELTA)
+    } else {
+        CHANGE_SIM_THRESHOLD
+    };
+
     // 低谷 run 归并:同一次说话人切换在重叠窗上会连续触发多个相邻对低于
     // 阈值;按 pair 下标是否连续分 run,每个 run 只取相似度最低的一对。
     let mut candidates: Vec<u64> = Vec::new();
     let mut run_start: Option<usize> = None;
     for (i, p) in pairs.iter().enumerate() {
-        if p.sim < CHANGE_SIM_THRESHOLD {
+        if p.sim < threshold {
             if run_start.is_none() {
                 run_start = Some(i);
             }
@@ -155,6 +178,36 @@ mod tests {
     fn no_change_when_all_embeddings_identical() {
         let e1 = [1.0, 0.0, 0.0];
         let embs = vec![unit(e1), unit(e1), unit(e1), unit(e1), unit(e1)];
+        assert_eq!(detect_change_points(&embs, 5000), Vec::<u64>::new());
+    }
+
+    /// 远场画像(2026-09-07 实测标定):同房间底纹把窗间相似度整体抬高,换人凹陷
+    /// 只到 ~0.72,绝对阈值 0.55 永远看不见——自适应低谷(基线中位 − 0.12)必须
+    /// 抓到它。同时:全程同人(无凹陷)不许误切。
+    #[test]
+    fn adaptive_dip_catches_far_field_speaker_change_above_absolute_floor() {
+        // A 组与 B 组夹角取 cos≈0.72(> 绝对阈值 0.55):A=(1,0,0), B=(0.72, 0.694, 0)
+        let a = [1.0, 0.0, 0.0];
+        let b = [0.72, 0.694, 0.0];
+        // 6 窗 A + 6 窗 B:11 对相邻窗,组内 sim=1.0,交界一对 ~0.72。
+        let embs: Vec<Option<Vec<f32>>> =
+            (0..6).map(|_| unit(a)).chain((0..6).map(|_| unit(b))).collect();
+        // 基线中位 1.0 → 阈值 max(0.55, 0.88);交界对 0.72 < 0.88 → 检出。
+        // 交界中点 = (5*hop+win/2 + 6*hop+win/2)/2 = 3500ms;total 7000,两侧 ≥ MIN_SUBSEG。
+        assert_eq!(detect_change_points(&embs, 7000), vec![3500]);
+        // 全程同人:无凹陷,自适应阈值下也不许切。
+        let same: Vec<Option<Vec<f32>>> = (0..12).map(|_| unit(a)).collect();
+        assert_eq!(detect_change_points(&same, 7000), Vec::<u64>::new());
+    }
+
+    /// 相邻对数不足(基线不稳)退回绝对阈值:0.72 的凹陷此时不触发。
+    #[test]
+    fn adaptive_dip_needs_enough_pairs_else_absolute_floor() {
+        let a = [1.0, 0.0, 0.0];
+        let b = [0.72, 0.694, 0.0];
+        // 3 窗 A + 2 窗 B = 4 对 < MIN_PAIRS_FOR_BASELINE
+        let embs: Vec<Option<Vec<f32>>> =
+            (0..3).map(|_| unit(a)).chain((0..2).map(|_| unit(b))).collect();
         assert_eq!(detect_change_points(&embs, 5000), Vec::<u64>::new());
     }
 
