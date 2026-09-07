@@ -105,8 +105,9 @@ export const zh = {
   "notes.refine.rerunFailed": "重新执行 AI 失败：{e}",
 
   // 详情页:文件重转写(三期)
-  "notes.retrans.run": "重转写",
-  "notes.retrans.hint": "用盘上音频离线重新转写全文(覆盖原始逐字稿,自动备份)",
+  "notes.retrans.run": "重新分析",
+  "notes.retrans.runningShort": "分析中…",
+  "notes.retrans.hint": "用盘上音频重新切段、转写并认人——切分/识别算法升级后,旧笔记靠它受益(覆盖原始逐字稿,自动备份)",
   "notes.retrans.warn": "将覆盖原始逐字稿并重建说话人,原稿备份为 segments.orig.jsonl",
   "notes.retrans.confirmDual": "双轨重转写",
   "notes.retrans.confirmMixed": "成品轨重转写",
@@ -280,8 +281,9 @@ export const en = {
   "notes.refine.failedHint": "AI failed; click to retry",
   "notes.refine.rerunFailed": "Failed to re-run AI: {e}",
 
-  "notes.retrans.run": "Re-transcribe",
-  "notes.retrans.hint": "Re-run ASR offline from the audio on disk (overwrites the raw transcript; a backup is kept)",
+  "notes.retrans.run": "Re-analyze",
+  "notes.retrans.runningShort": "Analyzing…",
+  "notes.retrans.hint": "Re-segment, re-transcribe and re-identify speakers from the audio on disk — how older notes benefit from algorithm upgrades (overwrites the raw transcript; a backup is kept)",
   "notes.retrans.warn": "This overwrites the raw transcript and rebuilds speakers. The original is backed up as segments.orig.jsonl.",
   "notes.retrans.confirmDual": "Dual-track",
   "notes.retrans.confirmMixed": "Mixed-track",
