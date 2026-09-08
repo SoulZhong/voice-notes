@@ -8222,7 +8222,9 @@ fn enroll_named_speaker(
         let note = store::NoteStore::new(root).load(note_id)?;
         let Some(m) = note.speakers.get(speaker_id) else { return Ok(()) };
         if m.person_id.is_some() {
-            return Ok(()); // 已有关联:改名不换人
+            // 走到这里仍关联 = 新名与库中现名相同(改成不同名字的场合,上游
+            // rename_speaker 已先解除关联再进本函数):保持关联,无事可做。
+            return Ok(());
         }
         let vp_store = open_voiceprint_store(app).map_err(anyhow::Error::msg)?;
         let vp = vp_store.load();
@@ -8301,6 +8303,32 @@ fn rename_speaker(
             lifecycle::machine::Msg::RenameActiveSpeaker { note_id, speaker_id, name: name.into() },
         );
     }
+    // 改名 = 指认(2026-09-08 用户点名:"不是已经修改了说话人了吗,为什么还关联着
+    // 曾老师")。已关联说话人改成**不同于库中现名**的名字,视为"这不是库里那个
+    // 人":先解除旧关联(EditOp::ClearPerson + 退还有溯源样本,与手动取消关联同一
+    // 条路),下方 enroll_named_speaker 再按命名即入库重新走——库中唯一同名者关联
+    // 之,无同名者建新档。改回与库名相同的名字则关联保持不动(旧"只改显示名"
+    // 语义仅剩这一种场合,也正是它唯一说得通的场合)。
+    let relink = (|| -> Option<String> {
+        let root = notes_dir(&app).ok()?;
+        let note = store::NoteStore::new(root).load(&note_id).ok()?;
+        let pid = note.speakers.get(&speaker_id)?.person_id.clone()?;
+        let vp = open_voiceprint_store(&app).ok()?.load();
+        let lib_name = store::VoiceprintStore::resolve(&vp, &pid)
+            .and_then(|rid| vp.people.get(rid))
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        (lib_name != name).then_some(pid)
+    })();
+    if let Some(old_pid) = relink {
+        app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+            op: lifecycle::machine::EditOp::ClearPerson {
+                id: note_id.clone(),
+                speaker_id: speaker_id.clone(),
+            },
+        })?;
+        retire_traced_samples_async(&app, old_pid, note_id.clone(), speaker_id.clone());
+    }
     // 非活动笔记：经 actor 串行执行(取代 NoteStore 直写)。
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::RenameSpeaker {
@@ -8310,7 +8338,7 @@ fn rename_speaker(
         },
     })?;
     // 命名即确认(codex 末轮 P1):无主说话人得名 → 转正入库(建人/唯一同名关联,
-    // 带样本与回灌);已有关联者只改显示名,不动库。
+    // 带样本与回灌);仍关联者(= 名字与库名相同)不动库。
     enroll_named_speaker(&app, &note_id, &speaker_id, name, audited_seq, selected_seqs.as_deref().unwrap_or(&[]));
     Ok(())
 }
