@@ -442,6 +442,37 @@
     }
   }
 
+  /** 说话人徽章签名:改名/关联/删除会改它,其他 refresh 不会——徽章重放只认它,
+      避免每次 refresh 都整份重建修订稿编辑器(滚动/选区抖动)。 */
+  const speakerBadgeSig = $derived(
+    JSON.stringify(
+      Object.entries(note?.speakers ?? {})
+        .map(([k, v]) => [k, v.name ?? "", v.person_id ?? null])
+        .sort(),
+    ),
+  );
+  let lastBadgeSig = "";
+  // 修订稿徽章是 NodeView 构造期快照:说话人改名后 refinedSpeakers 虽已更新,
+  // 既有 DOM 不会重绘——用户看到"改了没生效",切到原始稿再切回来(重挂编辑器)
+  // 才变(2026-09-08 用户实报)。原始稿由 syncSegments 对 note.speakers 的依赖
+  // 覆盖;这里给修订稿补同款:徽章签名变化且编辑器无焦点时,把编辑器当前已
+  // 同步的那份稿整份重放(setRefined 幂等重建,NodeView 重建即拿到新名字)。
+  // 有焦点跳过(不吹掉输入中的未提交编辑),该窗口内的改名靠切视图自愈——
+  // 改名发生在胸牌浮层,编辑器彼时必已失焦,实际踩不到。
+  $effect(() => {
+    const sig = speakerBadgeSig;
+    const ed = refinedEditor;
+    const doc = syncedRefined;
+    if (!ed || !doc || effectiveView !== "refined") {
+      lastBadgeSig = sig;
+      return;
+    }
+    if (sig === lastBadgeSig) return;
+    lastBadgeSig = sig;
+    if (ed.hasFocus()) return;
+    ed.setRefined(doc);
+  });
+
   function refinedBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
     const sid = attrs.speaker;
     return {
