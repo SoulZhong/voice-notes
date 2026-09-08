@@ -1252,10 +1252,15 @@ pub fn join_note_identities(
             Some(rid) => {
                 let lib_name = vp.people.get(rid).map(|per| per.name.clone()).unwrap_or_default();
                 p.person_id = Some(rid.to_string());
-                p.name = if !lib_name.is_empty() {
-                    Some(lib_name)
-                } else if !meta.name.is_empty() {
+                // 本地名优先于库名(2026-09-08 用户实报:界面显示改后的名,导出却是
+                // 库里旧名)。关联时 assign_speaker_person 会清空本地名,所以正常态
+                // 本地为空、库名生效;本地非空只有一种来路——用户在关联**之后**又
+                // 亲手改名(rename_speaker 对已关联者"只改显示名,不动库"的刻意
+                // 语义),那就是明确的显示意图,必须与前端 speakerLabel 同序。
+                p.name = if !meta.name.is_empty() {
                     Some(meta.name.clone())
+                } else if !lib_name.is_empty() {
+                    Some(lib_name)
                 } else {
                     None
                 };
@@ -1858,6 +1863,10 @@ mod tests {
         };
         speakers.insert("S1".into(), meta("", Some("P2"))); // 关联(经 redirect)
         speakers.insert("S2".into(), meta("现场名", None)); // 只有本地名
+        // 关联后又手动改名(rename_speaker 对已关联者"只改显示名不动库"):
+        // 本地名必须压过库名,与前端 speakerLabel 同序(2026-09-08 用户实报:
+        // 界面陈伟丹、导出曾老师)。
+        speakers.insert("S3".into(), meta("本地改名", Some("P1")));
         let segments = vec![
             crate::store::SegmentRecord { seq: 0, source: "mic".into(), text: "a".into(), start_ms: 0, end_ms: 1000, speaker: Some("S1".into()), rms: None, multi: None },
             crate::store::SegmentRecord { seq: 1, source: "mic".into(), text: "b".into(), start_ms: 1000, end_ms: 2000, speaker: Some("S2".into()), rms: None, multi: None },
@@ -1887,6 +1896,8 @@ mod tests {
                 { let mut p = para("R7", Some("旧名"), None, 1000); p.source_seqs = vec![1, 2]; p },
                 // 无源段的遗留段:保留字段,但 person 归一 redirects + 跟库名。
                 { let mut p = para("R8", Some("旧快照名"), Some("P2"), 3000); p.source_seqs = vec![]; p },
+                // 关联+本地改名并存:本地名优先。
+                { let mut p = para("S3", None, None, 4000); p.source_seqs = vec![]; p },
             ],
         };
         join_note_identities(&mut doc, &speakers, &segments, &vp);
@@ -1898,6 +1909,8 @@ mod tests {
         assert_eq!(doc.paragraphs[2].speaker, "R8", "无源段:不硬造映射");
         assert_eq!(doc.paragraphs[2].person_id.as_deref(), Some("P1"), "遗留引用仍归一 redirects");
         assert_eq!(doc.paragraphs[2].name.as_deref(), Some("张三"));
+        assert_eq!(doc.paragraphs[3].person_id.as_deref(), Some("P1"));
+        assert_eq!(doc.paragraphs[3].name.as_deref(), Some("本地改名"), "本地改名压过库名(与前端同序)");
     }
 
     fn editable_doc() -> RefinedDoc {
