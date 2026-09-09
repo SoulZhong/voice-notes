@@ -113,7 +113,18 @@ impl NoteStore {
             .filter(|e| e.path().is_dir())
             .map(|e| summarize(&e.path()))
             .collect();
-        out.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.id.cmp(&a.id)));
+        // 按**真实时刻**倒序,不按字符串(2026-09-09 用户实报:系统时区曾被代理 IP
+        // 定位漂到 -07:00,当晚两篇笔记的 started_at 带美西偏移——纯字符串比较把
+        // 实际 20:31 的会排到 14:00 之下,侧栏时间忽大忽小)。解析失败(损坏的
+        // meta)回退字符串序,恒有全序。
+        let key = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+        out.sort_by(|a, b| {
+            match (key(&a.started_at), key(&b.started_at)) {
+                (Some(x), Some(y)) => y.cmp(&x),
+                _ => b.started_at.cmp(&a.started_at),
+            }
+            .then_with(|| b.id.cmp(&a.id))
+        });
         out
     }
 
@@ -1283,6 +1294,45 @@ mod tests {
         let note = store.load("20260101-000002").unwrap();
         assert_eq!(note.segments[0].speaker.as_deref(), Some("S1"));
         assert_eq!(note.segments[0].multi, None, "认领后多人旗清除");
+    }
+
+    /// 混合时区排序:系统时区漂移期录的笔记(-07:00)与常态(+08:00)混在一起时,
+    /// 列表按真实时刻排,不按字符串(2026-09-09 用户实报的乱序)。
+    #[test]
+    fn list_sorts_by_instant_across_mixed_timezones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let mk = |id: &str, started: &str| {
+            let dir = tmp.path().join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("meta.json"),
+                serde_json::to_vec(&NoteMeta {
+                    schema_version: SCHEMA_VERSION,
+                    id: id.into(),
+                    title: id.into(),
+                    started_at: started.into(),
+                    ended_at: None,
+                    state: "complete".into(),
+                    calendar: None,
+                    calendar_cleared: false,
+                    asr_engine: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        // 北京 14:00(+08)与"美西 05:31"(-07,真实=北京 20:31):字符串序 14:00 在前,
+        // 真实时刻序 20:31 在前。
+        mk("20260908-140044", "2026-09-08T14:00:44.143714+08:00");
+        mk("20260908-053117", "2026-09-08T05:31:17.069653-07:00");
+        mk("20260908-100120", "2026-09-08T10:01:20.993374+08:00");
+        let ids: Vec<String> = store.list().into_iter().map(|n| n.id).collect();
+        assert_eq!(
+            ids,
+            vec!["20260908-053117", "20260908-140044", "20260908-100120"],
+            "真实时刻倒序:美西写法的 20:31 排最上"
+        );
     }
 
     /// 自动标题的条件改名:默认名可换;用户手动命名后拒写(手动标题优先级最高,
