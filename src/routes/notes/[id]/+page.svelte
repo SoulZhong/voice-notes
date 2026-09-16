@@ -60,6 +60,7 @@
     addNoteCut,
     removeNoteCut,
     getClipRanks,
+    setNoteAttendees,
     type CutRange,
     type CalendarCandidate,
   } from "$lib/notes";
@@ -474,7 +475,7 @@
   });
 
   /** 与会人员名单(说话人浮层一键指认用):日历参会人(排除「我」,无名用邮箱
-      名兜底)。手动与会人后端落地后在此并入。 */
+      名兜底)+ 手动录入,按序去重。 */
   const attendeeNames = $derived.by(() => {
     const out: string[] = [];
     for (const a of note?.meta.calendar?.attendees ?? []) {
@@ -482,8 +483,42 @@
       const n = (a.name || a.email.split("@")[0] || "").trim();
       if (n && !out.includes(n)) out.push(n);
     }
+    for (const n of note?.meta.attendees ?? []) {
+      if (n && !out.includes(n)) out.push(n);
+    }
     return out;
   });
+
+  // ── 手动与会人员编辑(头部行):输入回车添加,点 × 移除;整表替换落盘。 ──
+  let attendeeInput = $state("");
+  let attendeesErr = $state("");
+  async function saveAttendees(next: string[]) {
+    attendeesErr = "";
+    const forId = id;
+    try {
+      await setNoteAttendees(forId, next);
+      if (forId !== id) return;
+      await refresh();
+    } catch (e) {
+      if (forId !== id) return;
+      attendeesErr = t("notes.attendees.failed", { e });
+    }
+  }
+  function addAttendee() {
+    const n = attendeeInput.trim();
+    if (!n) return;
+    const cur = note?.meta.attendees ?? [];
+    if (cur.includes(n) || attendeeNames.includes(n)) {
+      attendeeInput = "";
+      return; // 已在名单(含日历侧):静默收下,不重复
+    }
+    attendeeInput = "";
+    void saveAttendees([...cur, n]);
+  }
+  function removeAttendee(n: string) {
+    const cur = note?.meta.attendees ?? [];
+    void saveAttendees(cur.filter((x) => x !== n));
+  }
 
   function refinedBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
     const sid = attrs.speaker;
@@ -2501,6 +2536,37 @@
                 <span class="cal-hint">{t("notes.calendar.needAuth")}</span>
               {/if}
             </p>
+          {/if}
+          <!-- 手动与会人员(2026-09-16):没日程/日程无参会人的会议也要有闭集先验。
+               整份名单(日历+手动)喂 identify,并在说话人浮层一键指认。日历侧只读,
+               手动侧可删;输入回车添加。 -->
+          {#if canEdit}
+            <p class="meta att-row">
+              <span class="att-label">{t("notes.attendees.label")}</span>
+              {#each note.meta.calendar?.attendees ?? [] as a (a.name + a.email)}
+                {#if !a.is_me && (a.name || a.email)}
+                  <span class="att-tag cal" title={t("notes.attendees.fromCalendar")}>{a.name || a.email.split("@")[0]}</span>
+                {/if}
+              {/each}
+              {#each note.meta.attendees ?? [] as n (n)}
+                <span class="att-tag">
+                  {n}
+                  <button class="att-x" title={t("notes.attendees.remove", { name: n })} onclick={() => removeAttendee(n)}>×</button>
+                </span>
+              {/each}
+              <input
+                class="att-input"
+                placeholder={t("notes.attendees.placeholder")}
+                bind:value={attendeeInput}
+                onkeydown={(e) => {
+                  if (e.key === "Enter") addAttendee();
+                }}
+                onblur={addAttendee}
+              />
+              {#if attendeesErr}<span class="att-err">{attendeesErr}</span>{/if}
+            </p>
+          {/if}
+          {#if calPerm !== "unavailable"}
             {#if calMenuOpen}
               <div class="cal-menu">
                 {#if calCandidates.length === 0}
@@ -4039,6 +4105,60 @@
   }
 
   /* ── P3 日历行 ── */
+  /* 与会人员行:小标签横排;日历侧只读淡显,手动侧带 × 可删;行内输入无边框显影 */
+  .att-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+  .att-label {
+    color: var(--ink-faint);
+    font-size: 0.78rem;
+  }
+  .att-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15em;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-full);
+    padding: 0.05em 0.55em;
+    font-size: 0.78rem;
+    color: var(--ink-secondary);
+  }
+  .att-tag.cal {
+    border-style: dashed; /* 来自日历:只读,虚线区分 */
+  }
+  .att-x {
+    border: none;
+    background: none;
+    color: var(--ink-faint);
+    cursor: pointer;
+    padding: 0 0 0 0.15em;
+    font-size: 0.85em;
+    line-height: 1;
+  }
+  .att-x:hover {
+    color: var(--danger);
+  }
+  .att-input {
+    border: none;
+    background: transparent;
+    color: var(--ink);
+    font-size: 0.78rem;
+    min-width: 9em;
+    padding: 0.1em 0.3em;
+    border-radius: var(--radius-sm);
+  }
+  .att-input:hover,
+  .att-input:focus {
+    background: var(--surface-soft);
+    outline: none;
+  }
+  .att-err {
+    color: var(--danger);
+    font-size: 0.75rem;
+  }
   .cal-row {
     display: flex;
     align-items: center;

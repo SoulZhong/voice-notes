@@ -77,6 +77,11 @@ pub struct NoteMeta {
     /// 手动改选会复位。没有它,「清除」在下一次 backfill 就被推翻。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub calendar_cleared: bool,
+    /// 手动录入的与会人员名单(2026-09-16 用户点名):没日程/日程无参会人的会议
+    /// 也要有闭集先验。与日历参会人在 identify 前合并(attendees_prior),
+    /// 说话人浮层一键指认同吃。serde default 兼容旧 meta,空表不落盘。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attendees: Vec<String>,
     /// 本场转写实际使用的识别引擎("firered"/"qwen3"/…,云端记 "cloud:厂商")。
     /// 每场覆盖:续录换了引擎以最后一场为准(与 SyncInfo 同限制)。2026-08-14
     /// 排查教训:引擎选型与实际生效可能不一致(模型未就绪、录制中切换),
