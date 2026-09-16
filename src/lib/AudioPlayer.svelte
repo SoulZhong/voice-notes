@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { untrack } from "svelte";
   import { onPlayerPos, onPlayerStopped } from "$lib/events";
   import { formatTs, type TrackInfo } from "$lib/notes";
   import { t } from "$lib/i18n/index.svelte";
@@ -93,14 +94,14 @@
    * 用途:双轨串音的笔记(外放+蓝牙延迟致 AEC 失效)静掉一轨即无回音。
    * 声明提前到装载 effect 之上:每次装载成功要按它补发一遍(见下方)。 */
   let muted = $state<Record<string, boolean>>({});
-  $effect(() => {
-    // 托盘停播后的重装入口:核被后端拆了,本 effect 必须再跑一轮才有得播(见下方
-    // onPlayerStopped)。读一下即建立依赖,值本身无意义。
-    void reloadKey;
-    trackErrors = [];
-    if (tracks.length === 0) {
-      loadPromise = null;
-    } else {
+  /** 后台播放让路(2026-09-16 用户点名:浏览别的会议不该打断播放):别篇的播放
+      会话在场时,本页播放器**待命不装载**——装载入口就会杀旧核(player_load 进门
+      stop_stream),挂载即装载等于逛到哪停到哪。待命页点播放/拖进度才接管
+      (ensureLoaded);#108 原表「打开另一篇笔记→停下当前」的取舍就此升级。 */
+  let deferred = $state(false);
+
+  function launchLoad() {
+    {
       const gen = ++loadGen;
       const payload = tracks.map((t) => ({ path: t.path, offset_ms: t.offset_ms, source: t.source }));
       const prev = loadChain;
@@ -177,6 +178,34 @@
       // 链在 loadPromise 上,仍能看到拒绝,不受影响。
       loadPromise.catch(() => {});
     }
+  }
+
+  /** 待命页接管:点播放/拖进度视为用户在本页的明确意图,此刻才装载(杀别篇的核,
+      会话作废由装载路径既有逻辑处理)。 */
+  function ensureLoaded() {
+    if (deferred && tracks.length > 0) {
+      deferred = false;
+      launchLoad();
+    }
+  }
+
+  $effect(() => {
+    // 托盘停播后的重装入口:核被后端拆了,本 effect 必须再跑一轮才有得播(见下方
+    // onPlayerStopped)。读一下即建立依赖,值本身无意义。
+    void reloadKey;
+    trackErrors = [];
+    if (tracks.length === 0) {
+      loadPromise = null;
+      deferred = false;
+    } else if (untrack(() => playback.session !== null && playback.session?.noteId !== noteId)) {
+      // 别篇播放会话在场(播放中或暂停待回):不抢内核,浮层继续管那边。
+      // untrack:会话变化不重跑本 effect——本页自己开播建立会话时,重跑会二次装载。
+      deferred = true;
+      loadPromise = null;
+    } else {
+      deferred = false;
+      launchLoad();
+    }
     return () => {
       // 换代:让已排队但尚未发起的旧装载放弃(上方 gen 检查),防旧实例的装载
       // 在切笔记后才进入后端、掐掉新页面刚起的播放(2026-08-10 排障)。
@@ -201,6 +230,9 @@
   // Rust 时钟 → UI:位置事件驱动进度/歌词跟随;播完事件自带 playing=false。
   $effect(() => {
     const un = onPlayerPos((e) => {
+      // 只认自己内核的事件:待命页(deferred)与装载间隙会收到别篇会话的心跳,
+      // 不过滤会把别篇的进度画到本页波形上。
+      if (lastBackendGen === null || e.gen !== lastBackendGen) return;
       currentMs = Math.min(e.pos_ms, totalMs);
       playing = e.playing;
     });
@@ -293,6 +325,7 @@
     };
   });
   export function play() {
+    ensureLoaded();
     if (!loadPromise) return;
     playing = true; // 乐观置位:事件到达前按钮即时反馈;失败在 catch 复位
     loadPromise
@@ -319,6 +352,7 @@
   export function seek(ms: number) {
     const target = Math.max(0, Math.min(ms, totalMs));
     currentMs = target; // 乐观更新:拖拽跟手,事件到达后以 Rust 为准
+    ensureLoaded();
     if (!loadPromise) return;
     void loadPromise.then(() => invoke("player_seek", { ms: Math.round(target) })).catch(() => {});
   }
