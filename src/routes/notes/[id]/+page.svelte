@@ -1036,20 +1036,33 @@
             .flatMap((p) => p.source_seqs)
             .map((seq) => segBySeq.get(seq))
             .filter((s) => s !== undefined);
+    // 时间多样性:同一句话常被 VAD 切成 2-3 个相邻段,声纹几乎一样会一起挤进
+    // 前五——既浪费坑位,拆出一段后邻段又顶上来,看起来"点了没反应"
+    // (2026-09-16 用户实报:连点两次拆出,清单上"1:40:xx"始终在)。
+    // 取前五时跳过与已选段起点相距 <20s 的候选;不足五段再放宽兜底。
+    const MIN_CLIP_GAP_MS = 20_000;
+    const diverse = (ordered: { seq: number; start_ms: number; end_ms: number }[]) => {
+      const picked: typeof ordered = [];
+      for (const s of ordered) {
+        if (picked.length >= 5) break;
+        if (picked.some((p) => Math.abs(p.start_ms - s.start_ms) < MIN_CLIP_GAP_MS)) continue;
+        picked.push(s);
+      }
+      for (const s of ordered) {
+        if (picked.length >= 5) break;
+        if (!picked.includes(s)) picked.push(s);
+      }
+      return picked.map((s) => ({ seq: s.seq, start_ms: s.start_ms, end_ms: s.end_ms }));
+    };
     // 优先按声纹相似度序(后端 note_clip_ranks;多人混杂段沉底);该人无排序数据
     // (无嵌入缓存/段太少)回落最长序。
     const rank = clipRanks[sid];
     if (rank && rank.length > 0) {
       const bySeq = new Map(pool.map((s) => [s.seq, s]));
       const ranked = rank.map((q) => bySeq.get(q)).filter((s) => s !== undefined);
-      if (ranked.length > 0) {
-        return ranked.slice(0, 5).map((s) => ({ seq: s.seq, start_ms: s.start_ms, end_ms: s.end_ms }));
-      }
+      if (ranked.length > 0) return diverse(ranked);
     }
-    return pool
-      .sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms))
-      .slice(0, 5)
-      .map((s) => ({ seq: s.seq, start_ms: s.start_ms, end_ms: s.end_ms }));
+    return diverse(pool.sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms)));
   }
   /** 播放指定片段(面板片段列表点选;2026-08-30 起不再"再点一次换下一段")。 */
   function previewSpeakerClip(sid: string, seq: number) {
