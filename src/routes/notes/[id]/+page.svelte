@@ -473,6 +473,18 @@
     ed.setRefined(doc);
   });
 
+  /** 与会人员名单(说话人浮层一键指认用):日历参会人(排除「我」,无名用邮箱
+      名兜底)。手动与会人后端落地后在此并入。 */
+  const attendeeNames = $derived.by(() => {
+    const out: string[] = [];
+    for (const a of note?.meta.calendar?.attendees ?? []) {
+      if (a.is_me) continue;
+      const n = (a.name || a.email.split("@")[0] || "").trim();
+      if (n && !out.includes(n)) out.push(n);
+    }
+    return out;
+  });
+
   function refinedBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
     const sid = attrs.speaker;
     return {
@@ -2718,6 +2730,7 @@
           : undefined}
         onDetachClip={canEdit ? detachClip : undefined}
         onMarkMultiClip={canEdit ? markMultiClip : undefined}
+        attendees={canEdit ? attendeeNames : undefined}
         onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
         onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
         onMarkMulti={canEdit ? runAutoSplit : undefined}

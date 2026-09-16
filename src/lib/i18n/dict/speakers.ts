@@ -5,6 +5,9 @@ import type { Dict, Msg } from "../types";
 export const zh = {
   // ── 通用(领域内复用) ──
   "speakers.title": "会议搭子",
+  "speakers.attendees": "与会人员,点名字即指认",
+  "speakers.attendeePick": "把这个说话人指认为「{name}」:库中有同名即关联,没有则建档入库",
+  "speakers.attendeeUsed": "「{name}」已被本篇某个说话人使用;确认这个声音才是他再点",
   "speakers.personFallback": "说话人 {n}",
   "speakers.personFallbackRecent": "说话人 {n} · 最近 {date}",
   "speakers.recentShort": "最近 {d}",
@@ -272,6 +275,9 @@ export const zh = {
 
 export const en = {
   "speakers.title": "Meeting Buddies",
+  "speakers.attendees": "Attendees — click a name to identify",
+  "speakers.attendeePick": "Identify this speaker as \"{name}\": links the library person of that name, or enrolls a new one",
+  "speakers.attendeeUsed": "\"{name}\" is already used by a speaker in this note; click only if this voice is really them",
   "speakers.personFallback": "Speaker {n}",
   "speakers.personFallbackRecent": "Speaker {n} · last seen {date}",
   "speakers.recentShort": "last seen {d}",
