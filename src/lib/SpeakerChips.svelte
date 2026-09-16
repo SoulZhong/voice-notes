@@ -179,15 +179,27 @@
    *  裸 await 无 catch,错误被吞——用户看到的是「面板关了、什么都没发生」,且错误
    *  只走 IPC 回执不进日志,排查时毫无线索。成功才通知外部刷新(与原行为一致:
    *  原先失败会抛出,onRenamed 同样不执行)。 */
-  async function run(fn: () => Promise<void>) {
+  async function run(fn: () => Promise<void>): Promise<boolean> {
     actionErr = null;
     try {
       await fn();
     } catch (e) {
       actionErr = describeActionError(e, t("speakers.actionFailed"));
-      return;
+      return false;
     }
     onRenamed?.();
+    return true;
+  }
+
+  /** 片段动作回执(2026-09-16 用户实报:同一句话的相邻段声纹几乎一样,拆出后
+      邻段顶上来,看着像"点了没反应"):成功后在清单区闪 4 秒确认语,说清刚才
+      处理的是哪个时刻的段。 */
+  let clipActionMsg = $state<string | null>(null);
+  let clipActionTimer: ReturnType<typeof setTimeout> | undefined;
+  function flashClipAction(msg: string) {
+    clipActionMsg = msg;
+    clearTimeout(clipActionTimer);
+    clipActionTimer = setTimeout(() => (clipActionMsg = null), 4000);
   }
 
   /** 取消关联:与选人走同一条 run() 通道,失败必须看得见(那条 2026-08-17 事故的教训)。 */
@@ -447,7 +459,10 @@
                           <button
                             class="clip-act"
                             title={t("speakers.chipClipDetachTitle")}
-                            onclick={() => run(() => onDetachClip(id, c.seq))}
+                            onclick={async () => {
+                              if (await run(() => onDetachClip(id, c.seq)))
+                                flashClipAction(t("speakers.clipDetached", { at: clockOf(c.start_ms) }));
+                            }}
                           >
                             {t("speakers.chipClipDetachShort")}
                           </button>
@@ -456,13 +471,19 @@
                           <button
                             class="clip-act"
                             title={t("speakers.chipClipMultiTitle")}
-                            onclick={() => run(() => onMarkMultiClip(id, c.seq))}
+                            onclick={async () => {
+                              if (await run(() => onMarkMultiClip(id, c.seq)))
+                                flashClipAction(t("speakers.clipMarkedMulti", { at: clockOf(c.start_ms) }));
+                            }}
                           >
                             {t("speakers.chipClipMulti")}
                           </button>
                         {/if}
                         </div>
                       {/each}
+                      {#if clipActionMsg}
+                        <div class="clips-done">{clipActionMsg}</div>
+                      {/if}
                       {#if sampleSel.length > 0}
                         {@const secs = Math.round(clips.filter((c) => sampleSel.includes(c.seq)).reduce((a, c) => a + (c.end_ms - c.start_ms), 0) / 1000)}
                         <div class="clips-hint" class:warn={secs < 10}>
@@ -847,6 +868,12 @@
   }
   .clip-act:last-child {
     margin-right: 0.25rem;
+  }
+  /* 片段动作回执:accent 小字,4 秒消散 */
+  .clips-done {
+    color: var(--accent);
+    font-size: 0.75rem;
+    padding: 0.15rem 0.55rem 0;
   }
   .clips-hint.warn {
     color: var(--warning-ink);
