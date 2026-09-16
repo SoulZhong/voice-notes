@@ -140,7 +140,7 @@ impl NoteWriter {
             ended_at: None,
             state: "recording".into(),
             calendar: None,
-            calendar_cleared: false,
+            calendar_cleared: false, attendees: vec![],
             asr_engine: None,
         };
         write_meta_atomic(&dir, &meta)?;

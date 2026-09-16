@@ -130,6 +130,8 @@ pub enum PipelineOp {
 #[derive(Debug)]
 pub enum EditOp {
     Rename { id: String, title: String },
+    /// 手动与会人员整表替换(2026-09-16 与会人先验)。
+    SetAttendees { id: String, attendees: Vec<String> },
     Delete { id: String },
     RenameSpeaker { id: String, speaker_id: String, name: String },
     DeleteSpeaker { id: String, speaker_id: String },

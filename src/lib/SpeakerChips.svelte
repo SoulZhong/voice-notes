@@ -22,6 +22,7 @@
     previewingSeq,
     onDetachClip,
     onMarkMultiClip,
+    attendees,
     onDelete,
     onUnlink,
     onMarkMulti,
@@ -66,6 +67,9 @@
         不造新说话人(文字保留)。2026-09-06 用户点名:此前「拆出/移出」误用会
         造出一排假说话人。 */
     onMarkMultiClip?: (id: string, seq: number) => Promise<void>;
+    /** 与会人员名单(2026-09-16 用户点名:日历/手动与会人要能一键指认)。
+        点名字 = 以该名指认此说话人:库中有唯一同名即关联,没有则命名入库建档。 */
+    attendees?: string[];
     /** 正在播放的片段 seq(高亮那一行)。 */
     previewingSeq?: number | null;
     /** 删除(可选,仅原始逐字稿视图传入)。表项移除,名下段落回到未标注;
@@ -242,6 +246,33 @@
     if (!d) return;
     cancelEdit();
     await run(() => doRename(d.id, d.name));
+  }
+
+  /** 已被本篇某说话人占用的名字(本地名或关联人物的库名):与会人名单上打勾淡显,
+      一眼看出还剩谁没认。 */
+  const usedNames = $derived.by(() => {
+    const used = new Set<string>();
+    for (const m of Object.values(speakers)) {
+      if (m?.name) used.add(m.name);
+      const p = m?.person_id ? people?.find((x) => x.id === m.person_id) : undefined;
+      if (p?.name) used.add(p.name);
+    }
+    return used;
+  });
+
+  /** 与会人一键指认:点名单等于明确指认,不走重名确认——库中有唯一同名者直接
+      关联,否则改名(命名即入库建档/关联,后端语义同打字改名)。 */
+  async function pickAttendee(id: string, name: string) {
+    cancelEdit();
+    const hit = people?.find((p) => p.name && p.name === name && p.id !== speakers[id]?.person_id);
+    if (hit && onPick) {
+      const sample = sampleOf(id);
+      await run(async () => {
+        await onPick(id, hit.id, sample);
+      });
+      return;
+    }
+    await run(() => doRename(id, name));
   }
 
   async function commitPick(id: string, personId: string) {
@@ -522,6 +553,26 @@
                   </button>
                 {/if}
               {/if}
+              {#if attendees && attendees.length > 0}
+                <!-- 与会人员一键指认:来自日历/手动名单。已被占用的名字打勾淡显。 -->
+                <div class="caption">{t("speakers.attendees")}</div>
+                <div class="att-wrap">
+                  {#each attendees as an (an)}
+                    {@const used = usedNames.has(an)}
+                    <button
+                      class="att-pill"
+                      class:used
+                      title={used ? t("speakers.attendeeUsed", { name: an }) : t("speakers.attendeePick", { name: an })}
+                      onclick={() => void pickAttendee(id, an)}
+                    >
+                      {#if used}
+                        <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
+                      {/if}
+                      {an}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
               {#if people && onPick}
                 <div class="caption">{t("speakers.title")}</div>
                 <PersonPickList
@@ -671,6 +722,40 @@
     height: 1px;
     background: var(--hairline);
     margin: 0 -0.3rem 0.2rem;
+  }
+  /* 与会人一键指认:小胶囊横排换行;已占用的打勾+accent 点亮(还剩谁没认一眼看出) */
+  .att-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    padding: 0.1rem 0.15rem 0.35rem;
+  }
+  .att-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3em;
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink);
+    border-radius: var(--radius-full);
+    padding: 0.15em 0.6em;
+    font-size: 0.78rem;
+    cursor: pointer;
+    transition:
+      background 120ms ease,
+      color 120ms ease,
+      border-color 120ms ease;
+  }
+  .att-pill:hover {
+    background: var(--surface-soft);
+  }
+  .att-pill:active {
+    transform: translateY(0.5px);
+  }
+  .att-pill.used {
+    color: var(--accent);
+    border-color: var(--accent);
+    opacity: 0.75;
   }
   .caption {
     padding: 0.35rem 0.55rem 0.1rem;

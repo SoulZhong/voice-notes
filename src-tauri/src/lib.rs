@@ -1004,10 +1004,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
                         let acoustic_enabled = vp.embedding_model == s.speaker_model;
                         // 日历快照在本线程开头已匹配落盘,此处重读最新 meta。
+                        // 与会人先验 = 日历参会人 + 手动名单合并(attendees_prior)。
                         let cal = store::NoteStore::new(notes_dir(&app)?)
                             .load(&note_id)
                             .ok()
-                            .and_then(|n| n.meta.calendar);
+                            .and_then(|n| attendees_prior(&n.meta));
                         let now = chrono::Local::now().to_rfc3339();
                         // 未完成 op 无条件先恢复(不依赖开关/推断成败):崩溃在
                         // assign 后时,不先前滚,新一轮推断会因簇已关联吞掉条目。
@@ -7248,7 +7249,7 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
                     &stats,
                     &vp,
                     acoustic_enabled,
-                    note.meta.calendar.as_ref(),
+                    attendees_prior(&note.meta).as_ref(),
                     executor.as_ref(),
                     log_ctx.as_ref(),
                     &now,
@@ -8681,6 +8682,44 @@ pub(crate) fn rank_clips_by_margin(
         out.insert(sid.clone(), scored.into_iter().map(|(_, _, seq)| seq).collect());
     }
     out
+}
+
+/// 手动与会人员整表替换(2026-09-16):与日历参会人合并后作 identify 闭集先验,
+/// 说话人浮层一键指认同吃。录制中拒绝(meta 写锁被 writer 持有,快速失败给原因)。
+#[tauri::command]
+fn set_note_attendees(app: AppHandle, state: State<AppState>, id: String, attendees: Vec<String>) -> Result<(), String> {
+    if is_active_note(&state, &id) {
+        return Err(tr!("录制中的笔记稍后再编辑与会人员", "Edit attendees after this recording stops"));
+    }
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::SetAttendees { id, attendees },
+    })
+}
+
+/// identify 的与会人先验:日历参会人 + 手动与会人合并成一份快照(手动名无邮箱,
+/// 同名去重,手动来源 match_kind 标注)。两边都空 → None,与旧行为逐位一致。
+fn attendees_prior(meta: &store::NoteMeta) -> Option<store::CalendarSnapshot> {
+    if meta.calendar.is_none() && meta.attendees.is_empty() {
+        return None;
+    }
+    let mut snap = meta.calendar.clone().unwrap_or_else(|| store::CalendarSnapshot {
+        event_id: String::new(),
+        title: String::new(),
+        attendees: Vec::new(),
+        matched_at: String::new(),
+        match_kind: "manual-attendees".into(),
+    });
+    for n in &meta.attendees {
+        if !snap.attendees.iter().any(|a| a.name == *n) {
+            snap.attendees.push(store::CalendarAttendee {
+                name: n.clone(),
+                email: String::new(),
+                is_me: false,
+            });
+        }
+    }
+    Some(snap)
 }
 
 /// 读笔记的音频剪辑表(edits.json;无文件即空表)。
@@ -11316,6 +11355,7 @@ pub fn run() {
             add_note_cut,
             remove_note_cut,
             note_clip_ranks,
+            set_note_attendees,
             player::player_stop,
             set_playback_active,
             mic_mode,
@@ -11353,6 +11393,53 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             let _ = (app, &event);
         });
+}
+
+#[cfg(test)]
+mod attendees_prior_tests {
+    use super::attendees_prior;
+    use crate::store::{CalendarAttendee, CalendarSnapshot, NoteMeta};
+
+    fn meta(cal: Option<CalendarSnapshot>, manual: &[&str]) -> NoteMeta {
+        NoteMeta {
+            schema_version: crate::store::SCHEMA_VERSION,
+            id: "n".into(),
+            title: "t".into(),
+            started_at: "t".into(),
+            ended_at: None,
+            state: "complete".into(),
+            calendar: cal,
+            calendar_cleared: false,
+            attendees: manual.iter().map(|s| s.to_string()).collect(),
+            asr_engine: None,
+        }
+    }
+
+    /// 两边都空 → None(与旧行为逐位一致);只有手动 → 合成快照;两边都有 → 并集去重。
+    #[test]
+    fn merges_calendar_and_manual_attendees() {
+        assert!(attendees_prior(&meta(None, &[])).is_none());
+
+        let only_manual = attendees_prior(&meta(None, &["孙柯", "王磊"])).unwrap();
+        assert_eq!(only_manual.match_kind, "manual-attendees");
+        assert_eq!(
+            only_manual.attendees.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["孙柯", "王磊"]
+        );
+
+        let cal = CalendarSnapshot {
+            event_id: "e1".into(),
+            title: "周会".into(),
+            attendees: vec![CalendarAttendee { name: "孙柯".into(), email: "sk@x.com".into(), is_me: false }],
+            matched_at: "t".into(),
+            match_kind: "auto".into(),
+        };
+        let merged = attendees_prior(&meta(Some(cal), &["孙柯", "王磊"])).unwrap();
+        assert_eq!(merged.title, "周会", "日历字段保留");
+        let names: Vec<_> = merged.attendees.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["孙柯", "王磊"], "同名不重复,手动名并入");
+        assert_eq!(merged.attendees[0].email, "sk@x.com", "日历侧邮箱保留(邮箱先验不丢)");
+    }
 }
 
 #[cfg(test)]

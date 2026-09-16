@@ -36,6 +36,8 @@ export type NoteMeta = {
   state: string;
   calendar?: CalendarSnapshot | null;
   calendar_cleared?: boolean;
+  /** 手动录入的与会人员(与日历参会人合并作识别先验与一键指认)。 */
+  attendees?: string[];
   /** 本场转写实际用的识别引擎("firered"/"sense_voice"/…,云端记 "cloud:厂商")。
       后端 2026-08-14 起每场落盘;更早的笔记没有这个字段。 */
   asr_engine?: string | null;
@@ -313,6 +315,9 @@ export const exportNote = (id: string, format: "md" | "txt", preferRefined: bool
  * range 圈定时裁剪出该时间段(整篇导出仍走原样拷贝)。 */
 export const exportNoteAudio = (id: string, dest: string, range?: ExportRange) =>
   invoke<string>("export_note_audio", { id, dest, rangeStartMs: range?.start ?? null, rangeEndMs: range?.end ?? null });
+/** 手动与会人员整表替换(trim/去重/上限 50 由后端负责)。 */
+export const setNoteAttendees = (id: string, attendees: string[]) =>
+  invoke<void>("set_note_attendees", { id, attendees });
 /** 在系统文件管理器中打开该笔记的存储目录。 */
 export const openNoteDir = (id: string) => invoke<void>("open_note_dir", { id });
 
