@@ -8684,6 +8684,100 @@ pub(crate) fn rank_clips_by_margin(
     out
 }
 
+// ─── 笔记页实体编辑四命令(2026-09-17 设计:note-entity-list-design)───
+// 共同纪律:validate id;Aing 中拒绝(worker 稍后整写 aing.json 会盖掉编辑);
+// 成功后排队全局图谱重建(与治理操作同款,派生索引自然跟上)。
+
+fn entity_edit_gate(app: &AppHandle, id: &str) -> Result<std::path::PathBuf, String> {
+    store::validate_note_id(id).map_err(|e| e.to_string())?;
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(id) {
+        return Err(tr!("该笔记正在 Aing 中,整理结束后再编辑实体", "This note is being refined; edit entities after it finishes"));
+    }
+    notes_dir(app).map(|d| d.join(id)).map_err(|e| e.to_string())
+}
+
+fn entity_edit_rebuild(app: &AppHandle) {
+    let Ok(root) = data_root(app) else { return };
+    let graph_events = app.clone();
+    if let Err(e) = app.state::<AppState>().graph_scheduler.request(root, move |status| {
+        let _ = graph_events.emit("graph_index_status", status);
+    }) {
+        eprintln!("entity_edit: 图谱重建排队失败(索引暂时陈旧,不影响本篇): {e}");
+    }
+}
+
+/// 批量新增本篇实体([name, kind] 数组)。返回实际新增数(与既有名/别名撞归一键的跳过)。
+#[tauri::command]
+fn note_entities_add(app: AppHandle, id: String, entries: Vec<(String, String)>) -> Result<usize, String> {
+    let dir = entity_edit_gate(&app, &id)?;
+    let n = store::add_note_entities(&dir, &id, &entries).map_err(|e| e.to_string())?;
+    if n > 0 {
+        entity_edit_rebuild(&app);
+    }
+    Ok(n)
+}
+
+/// 改名:本篇改(旧名转别名,提及不丢)+ 全局账本 RenameEntity 同步(非人实体;
+/// kg id 经 entity_mentions 表按本篇提及反查,索引陈旧查不到时只改本篇并打日志,
+/// 重建后全局至少跟上本篇投影)。人实体不动全局——人的名字真值在声纹库,归
+/// 说话人/搭子流程管。
+#[tauri::command]
+fn note_entity_rename(app: AppHandle, id: String, entity_id: String, name: String) -> Result<(), String> {
+    let dir = entity_edit_gate(&app, &id)?;
+    let (_old, kind) = store::rename_note_entity(&dir, &id, &entity_id, &name).map_err(|e| e.to_string())?;
+    if kind != "person" {
+        match kg_id_for_note_entity(&app, &id, &entity_id) {
+            Some(kg) => {
+                let op = ipc::KnowledgeOperationInput::RenameEntity { entity_id: kg, name: name.trim().to_string() };
+                if let Ok(root) = data_root(&app) {
+                    match graph::query::apply_operation(&root, &op) {
+                        Ok(result) => {
+                            let _ = queue_knowledge_rebuild(&app, root, result);
+                            return Ok(());
+                        }
+                        Err(e) => eprintln!("entity_rename({id}/{entity_id}): 全局账本同步失败(本篇已改): {e}"),
+                    }
+                }
+            }
+            None => eprintln!("entity_rename({id}/{entity_id}): 索引查不到全局 id(可能待重建),本次只改本篇"),
+        }
+    }
+    entity_edit_rebuild(&app);
+    Ok(())
+}
+
+/// 删除(仅本篇)。
+#[tauri::command]
+fn note_entity_delete(app: AppHandle, id: String, entity_id: String) -> Result<(), String> {
+    let dir = entity_edit_gate(&app, &id)?;
+    store::delete_note_entity(&dir, &id, &entity_id).map_err(|e| e.to_string())?;
+    entity_edit_rebuild(&app);
+    Ok(())
+}
+
+/// 改类型(仅本篇,重建传播)。
+#[tauri::command]
+fn note_entity_set_kind(app: AppHandle, id: String, entity_id: String, kind: String) -> Result<(), String> {
+    let dir = entity_edit_gate(&app, &id)?;
+    store::set_note_entity_kind(&dir, &entity_id, &kind).map_err(|e| e.to_string())?;
+    entity_edit_rebuild(&app);
+    Ok(())
+}
+
+/// 本篇局部实体 → 全局 kg id:用该实体在本篇的 live 提及 id(内容哈希,重建时
+/// 原样入库)查 entity_mentions 表,精确无歧义。索引陈旧/降级返回 None。
+fn kg_id_for_note_entity(app: &AppHandle, note_id: &str, entity_id: &str) -> Option<String> {
+    let root = data_root(app).ok()?;
+    let doc = store::load_refined(&root.join("notes").join(note_id))?;
+    let mid = doc
+        .paragraphs
+        .iter()
+        .flat_map(|p| p.mentions.iter())
+        .find(|m| m.entity == entity_id && !m.id.is_empty())
+        .map(|m| m.id.clone())?;
+    graph::kg_entity_for_mention(&root, note_id, &mid)
+}
+
 /// 手动与会人员整表替换(2026-09-16):与日历参会人合并后作 identify 闭集先验,
 /// 说话人浮层一键指认同吃。录制中拒绝(meta 写锁被 writer 持有,快速失败给原因)。
 #[tauri::command]
@@ -11356,6 +11450,10 @@ pub fn run() {
             remove_note_cut,
             note_clip_ranks,
             set_note_attendees,
+            note_entities_add,
+            note_entity_rename,
+            note_entity_delete,
+            note_entity_set_kind,
             player::player_stop,
             set_playback_active,
             mic_mode,

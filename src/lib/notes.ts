@@ -315,6 +315,20 @@ export const exportNote = (id: string, format: "md" | "txt", preferRefined: bool
  * range 圈定时裁剪出该时间段(整篇导出仍走原样拷贝)。 */
 export const exportNoteAudio = (id: string, dest: string, range?: ExportRange) =>
   invoke<string>("export_note_audio", { id, dest, rangeStartMs: range?.start ?? null, rangeEndMs: range?.end ?? null });
+// ── 笔记页实体编辑(2026-09-17 设计):真值写本篇 aing.json,全局图谱重建传播 ──
+/** 批量新增实体([name, kind]);与既有名/别名重复的跳过,返回实际新增数。 */
+export const noteEntitiesAdd = (id: string, entries: [string, string][]) =>
+  invoke<number>("note_entities_add", { id, entries });
+/** 改名:本篇改(旧名转别名,提及不丢)+ 非人实体同步全局账本。 */
+export const noteEntityRename = (id: string, entityId: string, name: string) =>
+  invoke<void>("note_entity_rename", { id, entityId, name });
+/** 删除(仅本篇):提及与本篇关系连带移除。 */
+export const noteEntityDelete = (id: string, entityId: string) =>
+  invoke<void>("note_entity_delete", { id, entityId });
+/** 改类型(仅本篇,重建传播)。 */
+export const noteEntitySetKind = (id: string, entityId: string, kind: string) =>
+  invoke<void>("note_entity_set_kind", { id, entityId, kind });
+
 /** 手动与会人员整表替换(trim/去重/上限 50 由后端负责)。 */
 export const setNoteAttendees = (id: string, attendees: string[]) =>
   invoke<void>("set_note_attendees", { id, attendees });

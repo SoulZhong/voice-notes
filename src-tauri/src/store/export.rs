@@ -295,6 +295,44 @@ pub fn render_refined(title: &str, doc: &RefinedDoc, md: bool) -> String {
     } else {
         out.push_str(&format!("{title}\n\n"));
     }
+    // 关键实体一节(2026-09-17 设计):按提及数降序,类型加中文标签;人/组织/项目/
+    // 术语之外的类型(date/task 等)不进导出——与笔记页清单同口径。
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for p in &doc.paragraphs {
+        for m in &p.mentions {
+            *counts.entry(m.entity.as_str()).or_default() += 1;
+        }
+    }
+    let kind_label = |k: &str| match k {
+        "person" => Some("人物"),
+        "org" => Some("组织"),
+        "project" => Some("产品/项目"),
+        "term" | "concept" => Some("术语"),
+        _ => None,
+    };
+    let mut listed: Vec<(&crate::store::Entity, usize, &str)> = doc
+        .entities
+        .iter()
+        .filter(|e| !e.name.trim().is_empty())
+        .filter_map(|e| kind_label(&e.kind).map(|kl| (e, counts.get(e.id.as_str()).copied().unwrap_or(0), kl)))
+        .collect();
+    if !listed.is_empty() {
+        listed.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.name.cmp(&b.0.name)));
+        if md {
+            out.push_str("## 关键实体\n\n");
+        } else {
+            out.push_str("关键实体\n");
+        }
+        for (e, n, kl) in listed {
+            let times = if n > 0 { format!("(提及 {n} 次)") } else { String::new() };
+            if md {
+                out.push_str(&format!("- **{}** · {kl}{times}\n", e.name));
+            } else {
+                out.push_str(&format!("- {} · {kl}{times}\n", e.name));
+            }
+        }
+        out.push('\n');
+    }
     for p in &doc.paragraphs {
         // 用户在笔记页插入的自由 markdown 块(空 speaker、无关联人物):只出正文。
         let speakerless =
@@ -581,6 +619,52 @@ mod tests {
         let md = std::fs::read_to_string(&dest).unwrap();
         assert!(md.contains("中段。"), "{md}");
         assert!(!md.contains("开场。") && !md.contains("收尾。"), "{md}");
+    }
+
+    /// 关键实体一节:有白名单类型实体才出现,按提及数降序,带中文类型标签;
+    /// date/task 等类型不进导出(与笔记页清单同口径)。
+    #[test]
+    fn export_refined_renders_entity_section() {
+        use crate::store::{Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph};
+        let para = RefinedParagraph {
+            speaker: "S1".into(),
+            name: Some("甲".into()),
+            person_id: None,
+            start_ms: 0,
+            end_ms: 5_000,
+            text: "巨凡科技聊足球数据,巨凡科技很感兴趣".into(),
+            source_seqs: vec![],
+            mentions: vec![
+                Mention { id: "m1".into(), entity: "ent_1".into(), start: 0, end: 4 },
+                Mention { id: "m2".into(), entity: "ent_1".into(), start: 11, end: 15 },
+            ],
+        };
+        let doc = RefinedDoc {
+            llm_failed_paragraphs: vec![],
+            schema_version: 2,
+            generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![
+                Entity { id: "ent_1".into(), kind: "org".into(), name: "巨凡科技".into(), aliases: vec![] },
+                Entity { id: "ent_2".into(), kind: "date".into(), name: "9月30日".into(), aliases: vec![] },
+            ],
+            graph_extraction: None,
+            relations: vec![],
+            graph_support_mentions: vec![],
+            revision: 0,
+            stale: false,
+            paragraphs: vec![para],
+        };
+        let md = render_refined("标题", &doc, true);
+        assert!(md.contains("## 关键实体"), "{md}");
+        assert!(md.contains("**巨凡科技** · 组织(提及 2 次)"), "{md}");
+        assert!(!md.contains("9月30日"), "date 类型不进导出: {md}");
     }
 
     /// 用户插入的自由块(无说话人,start==end==0)不参与范围/删减过滤:从 0 开始的
