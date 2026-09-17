@@ -1097,6 +1097,138 @@ pub struct ParagraphPayload {
 /// - 证据:paragraph_index 按新布局重定位,落在被删/脏段上的证据丢弃(偏移无效);
 /// - 新块:空 speaker + 零时间戳 + 空 source_seqs(导出侧对空 speaker 不加前缀)。
 /// revision 乐观并发:不匹配即拒绝;成功后经 update_refined 统一 +1,返回新值。
+// ─── 笔记页实体编辑(2026-09-17 设计:docs/superpowers/specs/2026-09-17-note-entity-list-design.md)───
+// 本篇真值编辑:只写本篇 aing.json,全局图谱靠重建传播;改名的全局账本同步在命令层。
+// 全部经 update_refined(NoteLock+进程锁+revision 推进,编辑器旧会话随之失效防互盖)。
+
+/// 实体名归一(去首尾空白+小写):新增去重与改名撞名判定共用。与 refine::entity_key
+/// 的 Unicode casefold 口径略宽松(ASCII lowercase),对中文名无差异。
+fn entity_norm(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+/// 全量重算提及并重盖稳定 id:实体表变更后调用。同一区间内容哈希出同一 id,
+/// 既有关系证据引用不漂移;被用户改过的段落若仍含实体名,重新获得 live 提及。
+fn recompute_all_mentions(note_id: &str, doc: &mut RefinedDoc) {
+    let mentions = crate::refine::compute_mentions(&doc.paragraphs, &doc.entities);
+    for (p, m) in doc.paragraphs.iter_mut().zip(mentions) {
+        p.mentions = m;
+    }
+    super::aing_graph::ensure_graph_ids(note_id, doc);
+}
+
+/// 批量新增实体(名字+类型):与既有实体名/别名撞归一键的跳过(不报错——批量粘贴
+/// 里混着已有实体是常态)。返回实际新增数。
+pub fn add_note_entities(note_dir: &Path, note_id: &str, entries: &[(String, String)]) -> anyhow::Result<usize> {
+    let mut added = 0usize;
+    update_refined(note_dir, |doc| {
+        let mut known: std::collections::BTreeSet<String> = doc
+            .entities
+            .iter()
+            .flat_map(|e| std::iter::once(&e.name).chain(e.aliases.iter()))
+            .map(|n| entity_norm(n))
+            .collect();
+        // 手动实体 id 续用 ent_N 空间:取现有最大号 +1(P<n> 人实体不占这个空间)。
+        let mut next = doc
+            .entities
+            .iter()
+            .filter_map(|e| e.id.strip_prefix("ent_").and_then(|n| n.parse::<u64>().ok()))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for (name, kind) in entries {
+            let name = name.trim();
+            if name.is_empty() || !known.insert(entity_norm(name)) {
+                continue;
+            }
+            doc.entities.push(Entity {
+                id: format!("ent_{next}"),
+                kind: kind.trim().to_string(),
+                name: name.to_string(),
+                aliases: Vec::new(),
+            });
+            next += 1;
+            added += 1;
+        }
+        if added > 0 {
+            recompute_all_mentions(note_id, doc);
+        }
+        Ok(())
+    })?;
+    Ok(added)
+}
+
+/// 改名:旧名转为别名保留(正文原文仍是旧写法,提及区间不动——高亮不丢)。
+/// 撞上另一个实体的名/别名时拒绝(该走合并,二期)。返回 (旧名, kind) 供命令层
+/// 做全局账本同步。
+pub fn rename_note_entity(
+    note_dir: &Path,
+    note_id: &str,
+    entity_id: &str,
+    new_name: &str,
+) -> anyhow::Result<(String, String)> {
+    let new_name = new_name.trim();
+    anyhow::ensure!(!new_name.is_empty(), "名字不能为空");
+    let mut out = (String::new(), String::new());
+    update_refined(note_dir, |doc| {
+        let clash = doc.entities.iter().any(|e| {
+            e.id != entity_id
+                && std::iter::once(&e.name)
+                    .chain(e.aliases.iter())
+                    .any(|n| entity_norm(n) == entity_norm(new_name))
+        });
+        anyhow::ensure!(!clash, "已有同名实体「{new_name}」;如是同一个请先删除本条(合并功能二期提供)");
+        let ent = doc
+            .entities
+            .iter_mut()
+            .find(|e| e.id == entity_id)
+            .ok_or_else(|| anyhow::anyhow!("本篇没有该实体: {entity_id}"))?;
+        out = (ent.name.clone(), ent.kind.clone());
+        if entity_norm(&ent.name) != entity_norm(new_name)
+            && !ent.aliases.iter().any(|a| entity_norm(a) == entity_norm(&ent.name))
+        {
+            let old = std::mem::take(&mut ent.name);
+            ent.aliases.push(old);
+        }
+        ent.name = new_name.to_string();
+        recompute_all_mentions(note_id, doc);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// 删除(仅本篇):实体、其全部提及(live 与 support)、以它为端点的本篇关系一并移除。
+pub fn delete_note_entity(note_dir: &Path, note_id: &str, entity_id: &str) -> anyhow::Result<()> {
+    update_refined(note_dir, |doc| {
+        let before = doc.entities.len();
+        doc.entities.retain(|e| e.id != entity_id);
+        anyhow::ensure!(doc.entities.len() < before, "本篇没有该实体: {entity_id}");
+        for p in doc.paragraphs.iter_mut() {
+            p.mentions.retain(|m| m.entity != entity_id);
+        }
+        // graph_support_mentions 是 id 表(内容哈希),按实体无从筛;悬空 id 前端本就
+        // 过滤、重建也不消费,留着无害——本实体的关系(其证据的宿主)下一行已删。
+        doc.relations.retain(|r| r.subject != entity_id && r.object != entity_id);
+        recompute_all_mentions(note_id, doc);
+        Ok(())
+    })
+}
+
+/// 改类型(仅本篇):类型是实体身份的一部分,本篇改对了全局重建跟着对。
+pub fn set_note_entity_kind(note_dir: &Path, entity_id: &str, kind: &str) -> anyhow::Result<()> {
+    let kind = kind.trim().to_string();
+    anyhow::ensure!(!kind.is_empty(), "类型不能为空");
+    update_refined(note_dir, |doc| {
+        let ent = doc
+            .entities
+            .iter_mut()
+            .find(|e| e.id == entity_id)
+            .ok_or_else(|| anyhow::anyhow!("本篇没有该实体: {entity_id}"))?;
+        ent.kind = kind.clone();
+        Ok(())
+    })
+}
+
 pub fn save_refined_paragraphs(
     note_dir: &Path,
     expected_revision: u64,
@@ -1277,6 +1409,86 @@ pub fn join_note_identities(
 mod tests {
     use super::*;
     use crate::store::{ensure_graph_ids, evidence_id};
+
+    /// 笔记页实体编辑四操作:增(去重+找提及)/改名(旧名转别名不丢提及+撞名拒)/
+    /// 删(提及与关系连带)/改类型;全程 revision 递增。
+    #[test]
+    fn note_entity_crud_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("20260101-000000");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut doc = RefinedDoc {
+            llm_failed_paragraphs: vec![],
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![Entity { id: "ent_1".into(), kind: "org".into(), name: "聚凡科技".into(), aliases: vec![] }],
+            graph_extraction: None,
+            relations: vec![crate::store::RelationFact {
+                id: "rel1".into(),
+                subject: "ent_1".into(),
+                predicate: crate::store::RelationPredicate { kind: "mentions".into(), label: None },
+                object: "ent_1".into(),
+                confidence: 0.9,
+                valid_from: None,
+                valid_to: None,
+                subject_mentions: vec![],
+                object_mentions: vec![],
+                evidence: vec![],
+            }],
+            graph_support_mentions: vec![],
+            revision: 0,
+            stale: false,
+            paragraphs: vec![RefinedParagraph {
+                speaker: "S1".into(),
+                name: None,
+                person_id: None,
+                start_ms: 0,
+                end_ms: 5_000,
+                text: "聚凡科技想跟灯塔计划合作".into(),
+                source_seqs: vec![],
+                mentions: vec![],
+            }],
+        };
+        crate::store::aing_graph::ensure_graph_ids("n1", &mut doc);
+        write_refined_atomic(&dir, &doc).unwrap();
+
+        // 增:灯塔计划入表并找到提及;重复名跳过
+        let n = add_note_entities(&dir, "n1", &[("灯塔计划".into(), "project".into()), ("聚凡科技".into(), "org".into())]).unwrap();
+        assert_eq!(n, 1, "重复名跳过");
+        let d = load_aing_file(&dir).unwrap().unwrap();
+        let dt = d.entities.iter().find(|e| e.name == "灯塔计划").unwrap();
+        assert!(d.paragraphs[0].mentions.iter().any(|m| m.entity == dt.id), "新增自动找提及");
+
+        // 改名:旧名转别名,原提及区间仍在(旧写法仍被找到)
+        let (old, kind) = rename_note_entity(&dir, "n1", "ent_1", "巨凡科技").unwrap();
+        assert_eq!((old.as_str(), kind.as_str()), ("聚凡科技", "org"));
+        let d = load_aing_file(&dir).unwrap().unwrap();
+        let e1 = d.entities.iter().find(|e| e.id == "ent_1").unwrap();
+        assert_eq!(e1.name, "巨凡科技");
+        assert!(e1.aliases.iter().any(|a| a == "聚凡科技"), "旧名转别名");
+        assert!(d.paragraphs[0].mentions.iter().any(|m| m.entity == "ent_1"), "提及不丢(按别名命中)");
+        // 撞名拒绝
+        assert!(rename_note_entity(&dir, "n1", "ent_1", "灯塔计划").is_err());
+
+        // 改类型
+        set_note_entity_kind(&dir, "ent_1", "project").unwrap();
+        assert_eq!(load_aing_file(&dir).unwrap().unwrap().entities.iter().find(|e| e.id == "ent_1").unwrap().kind, "project");
+
+        // 删:实体、提及、关系连带
+        delete_note_entity(&dir, "n1", "ent_1").unwrap();
+        let d = load_aing_file(&dir).unwrap().unwrap();
+        assert!(d.entities.iter().all(|e| e.id != "ent_1"));
+        assert!(d.paragraphs[0].mentions.iter().all(|m| m.entity != "ent_1"));
+        assert!(d.relations.is_empty(), "以它为端点的关系一并移除");
+        assert!(d.revision >= 4, "每次锁内编辑推进 revision");
+    }
 
     #[test]
     fn heal_stale_covers_missing_intermediate_and_finished_docs() {

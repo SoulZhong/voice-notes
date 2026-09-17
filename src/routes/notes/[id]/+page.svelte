@@ -61,6 +61,10 @@
     removeNoteCut,
     getClipRanks,
     setNoteAttendees,
+    noteEntitiesAdd,
+    noteEntityRename,
+    noteEntityDelete,
+    noteEntitySetKind,
     type CutRange,
     type CalendarCandidate,
   } from "$lib/notes";
@@ -74,6 +78,7 @@
   import { lowDensityStat, shouldOfferBetterEngine } from "$lib/lowDensity";
   import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
+  import EntityChips from "$lib/EntityChips.svelte";
   import MultiSpeakerPanel from "$lib/MultiSpeakerPanel.svelte";
   import { autoSplitSpeaker, undoAutoSplit, latestUndoableSplit, listSplitOps, type AutoSplitOut, type SplitOp } from "$lib/multiSpeaker";
   import NoticeStrip from "$lib/NoticeStrip.svelte";
@@ -521,6 +526,74 @@
   function removeAttendee(n: string) {
     const cur = note?.meta.attendees ?? [];
     void saveAttendees(cur.filter((x) => x !== n));
+  }
+
+  // ── 关键实体行(2026-09-17 设计):数据取自 refined.entities;提及数从段落 live
+  //    mentions 聚合。操作后经既有取稿闸门重载(编辑器与列表同步换新)。 ──
+  let entityChipsEl = $state<ReturnType<typeof EntityChips> | null>(null);
+  const entityCounts = $derived.by(() => {
+    const m: Record<string, number> = {};
+    for (const p of refined?.paragraphs ?? []) {
+      for (const q of p.mentions ?? []) m[q.entity] = (m[q.entity] ?? 0) + 1;
+    }
+    return m;
+  });
+  async function reloadRefinedForEntities() {
+    const forId = id;
+    const seq = beginRefinedLoad();
+    let ok = false;
+    try {
+      const latest = await getRefined(forId);
+      if (latest && forId === id) {
+        ok = commitRefined(seq, latest, forId);
+        if (ok && !refinedEditor?.hasFocus()) {
+          syncedRefined = latest;
+          syncedEditor = refinedEditor;
+          refinedEditor?.setRefined(latest);
+        }
+      }
+    } finally {
+      endRefinedLoad(seq, ok);
+    }
+  }
+  async function entityAdd(entries: [string, string][]) {
+    await noteEntitiesAdd(id, entries);
+    await reloadRefinedForEntities();
+  }
+  async function entityRename(entityId: string, name: string) {
+    await noteEntityRename(id, entityId, name);
+    await reloadRefinedForEntities();
+  }
+  async function entityDelete(entityId: string) {
+    await noteEntityDelete(id, entityId);
+    await reloadRefinedForEntities();
+  }
+  async function entitySetKind(entityId: string, kind: string) {
+    await noteEntitySetKind(id, entityId, kind);
+    await reloadRefinedForEntities();
+  }
+  /** 点实体定位正文提及:滚到第一处并高亮全部,再点同一实体跳下一处。
+      实体只存在于修订稿,原始稿视图先切过去(段落异步渲染,重试一拍)。 */
+  let entityLocate: { id: string; idx: number } | null = null;
+  let entityLocateTimer: ReturnType<typeof setTimeout> | undefined;
+  function locateEntity(entId: string, retried = false) {
+    if (effectiveView !== "refined") viewMode = "refined";
+    const spans = Array.from(
+      transcriptEl?.querySelectorAll<HTMLElement>(`.entity-mention[data-entity-id="${entId}"]`) ?? [],
+    );
+    if (spans.length === 0) {
+      if (!retried) setTimeout(() => locateEntity(entId, true), 350);
+      return;
+    }
+    const idx = entityLocate?.id === entId ? (entityLocate.idx + 1) % spans.length : 0;
+    entityLocate = { id: entId, idx };
+    for (const sp of spans) sp.classList.add("entity-located");
+    spans[idx].classList.add("entity-located-current");
+    spans[idx].scrollIntoView({ block: "center", behavior: "smooth" });
+    clearTimeout(entityLocateTimer);
+    entityLocateTimer = setTimeout(() => {
+      for (const sp of spans) sp.classList.remove("entity-located", "entity-located-current");
+    }, 2600);
   }
 
   function refinedBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
@@ -2492,6 +2565,7 @@
   onclick={() => {
     exportMenuOpen = false;
     editsManage = false;
+    entityChipsEl?.closeAll();
   }}
   onkeydown={(e) => {
     if (e.key === "Escape") {
@@ -2827,6 +2901,21 @@
           recording.bumpNotes();
         }}
       />
+
+      <!-- 关键实体行(修订稿在盘才有;点名定位提及,⌄ 编辑,＋ 手动补充) -->
+      {#if refined}
+        <EntityChips
+          bind:this={entityChipsEl}
+          entities={refined.entities ?? []}
+          counts={entityCounts}
+          editable={canEdit && !refining}
+          onLocate={locateEntity}
+          onAdd={entityAdd}
+          onRename={entityRename}
+          onDelete={entityDelete}
+          onSetKind={entitySetKind}
+        />
+      {/if}
 
       {#if autoSplitRunning}
         <div class="banner">
@@ -3615,6 +3704,15 @@
   /* 播放跟随:当前段 accent-tint 底,与 editable hover 同色系,安静不抢内容 */
   .transcript :global(.md-seg.playing) {
     background: var(--accent-tint);
+  }
+  /* 实体定位:点实体 chip 后全部提及浮 accent 底,当前一处加描边(2.6s 消散) */
+  .transcript :global(.entity-mention.entity-located) {
+    background: var(--accent-tint);
+    border-radius: var(--radius-sm);
+  }
+  .transcript :global(.entity-mention.entity-located-current) {
+    outline: 1.5px solid var(--accent);
+    outline-offset: 1px;
   }
   /* 圈选游标联动:拖动游标时离它最近的段 accent-tint 底 + 切线交代边界方向——
      开始游标的线在文字上方(从这里起导出)、结束游标在下方(到这里为止)。

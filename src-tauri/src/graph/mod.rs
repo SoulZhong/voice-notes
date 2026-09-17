@@ -116,6 +116,19 @@ pub(crate) fn resolve_global_id(vp: &store::Voiceprints, e: &store::Entity) -> (
 
 /// 把一篇笔记 aing.json 里的局部实体(ent_N)逐个解析成全局 id,供笔记页高亮点击导航用。
 /// 无 aing.json/无实体 → 空;名为空的实体跳过。读盘失败不 panic(load_refined 返回 None)。
+/// 本篇某条提及(内容哈希 id)在派生索引里归的 kg 实体:笔记页实体改名的全局
+/// 账本同步靠它把局部 ent_N 精确桥到 v2 身份。索引缺表/查无返回 None(调用方
+/// 降级为只改本篇)。
+pub(crate) fn kg_entity_for_mention(data_root: &Path, note_id: &str, mention_id: &str) -> Option<String> {
+    let conn = open(data_root).ok()?;
+    conn.query_row(
+        "SELECT entity_id FROM entity_mentions WHERE note_id = ?1 AND id = ?2",
+        rusqlite::params![note_id, mention_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
 pub(crate) fn resolve_local_ids(data_root: &Path, note_id: &str) -> anyhow::Result<Vec<(String, String, bool)>> {
     store::validate_note_id(note_id)?;
     let dir = data_root.join("notes").join(note_id);
