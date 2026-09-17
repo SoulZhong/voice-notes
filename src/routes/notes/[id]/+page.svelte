@@ -505,15 +505,18 @@
     }
   }
   function addAttendee() {
-    const n = attendeeInput.trim();
-    if (!n) return;
-    const cur = note?.meta.attendees ?? [];
-    if (cur.includes(n) || attendeeNames.includes(n)) {
-      attendeeInput = "";
-      return; // 已在名单(含日历侧):静默收下,不重复
-    }
+    // 多分隔符一次拆(2026-09-17 用户实报:整串「甲,乙,丙」被当成一个名字):
+    // 中英文逗号/分号 + 顿号。不拆空格——英文人名带空格(John Smith)。
+    const parts = attendeeInput
+      .split(/[,，;；、]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
     attendeeInput = "";
-    void saveAttendees([...cur, n]);
+    if (parts.length === 0) return;
+    const cur = note?.meta.attendees ?? [];
+    const add = parts.filter((n, i) => parts.indexOf(n) === i && !cur.includes(n) && !attendeeNames.includes(n));
+    if (add.length === 0) return; // 全部已在名单(含日历侧):静默收下,不重复
+    void saveAttendees([...cur, ...add]);
   }
   function removeAttendee(n: string) {
     const cur = note?.meta.attendees ?? [];

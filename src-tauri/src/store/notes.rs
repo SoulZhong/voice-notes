@@ -231,7 +231,9 @@ impl NoteStore {
         write_meta_atomic(&dir, &meta)
     }
 
-    /// 手动与会人员名单整表替换(2026-09-16):trim、去空、按序去重,上限 50 人
+    /// 手动与会人员名单整表替换(2026-09-16):每项先按中英文逗号/分号/顿号再拆
+    /// (2026-09-17 用户实报:整串「甲,乙,丙」曾被当成一个名字;后端同拆是防线,
+    /// 也让存量坏条目在下次编辑时自愈),再 trim、去空、按序去重,上限 50 人
     /// (再多是名单粘贴错了)。与 rename 同一锁纪律。
     pub fn set_attendees(&self, id: &str, names: &[String]) -> anyhow::Result<()> {
         let _guard = edit_guard();
@@ -241,6 +243,7 @@ impl NoteStore {
         let mut seen = std::collections::BTreeSet::new();
         meta.attendees = names
             .iter()
+            .flat_map(|n| n.split(['，', ',', '；', ';', '、']))
             .map(|n| n.trim().to_string())
             .filter(|n| !n.is_empty() && seen.insert(n.clone()))
             .take(50)
@@ -1342,6 +1345,16 @@ mod tests {
             .unwrap();
         let meta = store.load("20260101-000003").unwrap().meta;
         assert_eq!(meta.attendees, vec!["孙柯", "仲维建"], "trim+去重保序");
+        // 整串多分隔符(中英文逗号/分号/顿号)一次拆开;英文名内的空格不拆
+        store
+            .set_attendees("20260101-000003", &["仲维建，王京,曲凯乐；张利文;毛老师、John Smith，".into()])
+            .unwrap();
+        let meta = store.load("20260101-000003").unwrap().meta;
+        assert_eq!(
+            meta.attendees,
+            vec!["仲维建", "王京", "曲凯乐", "张利文", "毛老师", "John Smith"],
+            "多分隔符拆分;空格保留在英文名内"
+        );
         store.set_attendees("20260101-000003", &[]).unwrap();
         let raw = std::fs::read_to_string(dir.join("meta.json")).unwrap();
         assert!(!raw.contains("attendees"), "空表不落盘键(旧 meta 形状兼容)");
