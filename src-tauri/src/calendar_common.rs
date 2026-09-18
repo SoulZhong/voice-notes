@@ -190,7 +190,7 @@ mod calendar_common_tests {
             ended_at: None,
             state: "recording".into(),
             calendar: None,
-            calendar_cleared: false, attendees: vec![],
+            calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
         };
         let seg = crate::store::SegmentRecord {

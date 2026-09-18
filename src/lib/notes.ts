@@ -38,6 +38,8 @@ export type NoteMeta = {
   calendar_cleared?: boolean;
   /** 手动录入的与会人员(与日历参会人合并作识别先验与一键指认)。 */
   attendees?: string[];
+  /** 本篇隐藏的日历参会人键(邮箱或名字,小写)。 */
+  attendees_removed?: string[];
   /** 本场转写实际用的识别引擎("firered"/"sense_voice"/…,云端记 "cloud:厂商")。
       后端 2026-08-14 起每场落盘;更早的笔记没有这个字段。 */
   asr_engine?: string | null;
@@ -332,6 +334,9 @@ export const noteEntitySetKind = (id: string, entityId: string, kind: string) =>
 /** 给人物档案补邮箱(与会人指认学习回路;幂等)。 */
 export const personAddEmail = (personId: string, email: string) =>
   invoke<void>("person_add_email", { personId, email });
+/** 本篇隐藏的日历参会人整表替换(键=邮箱或名字)。 */
+export const setNoteAttendeesRemoved = (id: string, keys: string[]) =>
+  invoke<void>("set_note_attendees_removed", { id, keys });
 /** 手动与会人员整表替换(trim/去重/上限 50 由后端负责)。 */
 export const setNoteAttendees = (id: string, attendees: string[]) =>
   invoke<void>("set_note_attendees", { id, attendees });

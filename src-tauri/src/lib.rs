@@ -8821,8 +8821,19 @@ fn set_note_attendees(app: AppHandle, state: State<AppState>, id: String, attend
     })
 }
 
-/// identify 的与会人先验:日历参会人 + 手动与会人合并成一份快照(手动名无邮箱,
-/// 同名去重,手动来源 match_kind 标注)。两边都空 → None,与旧行为逐位一致。
+/// 本篇隐藏名单整表替换(键=日历参会人的邮箱或名字)。
+#[tauri::command]
+fn set_note_attendees_removed(app: AppHandle, state: State<AppState>, id: String, keys: Vec<String>) -> Result<(), String> {
+    if is_active_note(&state, &id) {
+        return Err(tr!("录制中的笔记稍后再编辑与会人员", "Edit attendees after this recording stops"));
+    }
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir).set_attendees_removed(&id, &keys).map_err(|e| e.to_string())
+}
+
+/// identify 的与会人先验:日历参会人(剔除本篇隐藏名单)+ 手动与会人合并成一份
+/// 快照(手动名无邮箱,同名去重)。两边都空 → None,与旧行为逐位一致。
 fn attendees_prior(meta: &store::NoteMeta) -> Option<store::CalendarSnapshot> {
     if meta.calendar.is_none() && meta.attendees.is_empty() {
         return None;
@@ -8834,6 +8845,15 @@ fn attendees_prior(meta: &store::NoteMeta) -> Option<store::CalendarSnapshot> {
         matched_at: String::new(),
         match_kind: "manual-attendees".into(),
     });
+    // 隐藏名单过滤:用户明确说"这人没来",先验里留着会把声音硬往他身上靠。
+    if !meta.attendees_removed.is_empty() {
+        let removed: std::collections::BTreeSet<&str> =
+            meta.attendees_removed.iter().map(|s| s.as_str()).collect();
+        snap.attendees.retain(|a| {
+            !removed.contains(a.email.to_lowercase().as_str())
+                && !removed.contains(a.name.to_lowercase().as_str())
+        });
+    }
     for n in &meta.attendees {
         if !snap.attendees.iter().any(|a| a.name == *n) {
             snap.attendees.push(store::CalendarAttendee {
@@ -11482,6 +11502,7 @@ pub fn run() {
             remove_note_cut,
             note_clip_ranks,
             set_note_attendees,
+            set_note_attendees_removed,
             note_entities_add,
             note_entity_rename,
             note_entity_delete,
@@ -11541,7 +11562,7 @@ mod attendees_prior_tests {
             state: "complete".into(),
             calendar: cal,
             calendar_cleared: false,
-            attendees: manual.iter().map(|s| s.to_string()).collect(),
+            attendees: manual.iter().map(|s| s.to_string()).collect(), attendees_removed: vec![],
             asr_engine: None,
         }
     }
@@ -11565,11 +11586,17 @@ mod attendees_prior_tests {
             matched_at: "t".into(),
             match_kind: "auto".into(),
         };
-        let merged = attendees_prior(&meta(Some(cal), &["孙柯", "王磊"])).unwrap();
+        let merged = attendees_prior(&meta(Some(cal.clone()), &["孙柯", "王磊"])).unwrap();
         assert_eq!(merged.title, "周会", "日历字段保留");
         let names: Vec<_> = merged.attendees.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["孙柯", "王磊"], "同名不重复,手动名并入");
         assert_eq!(merged.attendees[0].email, "sk@x.com", "日历侧邮箱保留(邮箱先验不丢)");
+
+        // 本篇隐藏名单:按邮箱键剔除日历参会人,先验不再往没来的人身上靠
+        let mut m = meta(Some(cal), &[]);
+        m.attendees_removed = vec!["sk@x.com".into()];
+        let filtered = attendees_prior(&m).unwrap();
+        assert!(filtered.attendees.iter().all(|a| a.name != "孙柯"), "隐藏键(邮箱)剔除");
     }
 }
 
