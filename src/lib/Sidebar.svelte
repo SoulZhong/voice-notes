@@ -25,7 +25,7 @@
   import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
   import { noteGraphState } from "$lib/noteGraph.svelte";
-  import { t } from "$lib/i18n/index.svelte";
+  import { i18n, t } from "$lib/i18n/index.svelte";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -356,8 +356,11 @@
       href="/hooks"
       data-sveltekit-preload-code="eager">{t("shell.tab.hooks")}</a
     >
+    <!-- AI 页签按语言分流(2026-09-18 用户点名:中英各守各的排版习惯):
+         中文竖排里拉丁缩略语用縦中横正立;英文界面与其余页签一致按书脊惯例旋转 -->
     <a
-      class="vtab vtab-upright"
+      class="vtab"
+      class:vtab-upright={i18n.locale === "zh"}
       class:active={tab === "ai"}
       href="/ai">AI</a
     >
@@ -693,10 +696,15 @@
     cursor: pointer;
     text-decoration: none;
   }
-  /* 拉丁标签(AI):竖排会把字母放倒或上下堆叠,改横排让「AI」两字母同行并排 */
+  /* 拉丁标签(AI,仅中文界面):中文竖排里拉丁缩略语用縦中横正立横排;
+     英文界面不加本类,与其余页签一致旋转 */
   .vtab-upright {
     writing-mode: horizontal-tb;
     letter-spacing: 0.04em;
+  }
+  /* 英文界面:0.12em 字距是给汉字设计的,拉丁单词按英文习惯收紧 */
+  :global(html[lang="en"]) .vtab {
+    letter-spacing: 0.05em;
   }
   .vtab:hover {
     background: var(--surface-soft);
