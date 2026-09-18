@@ -251,6 +251,22 @@ impl NoteStore {
         write_meta_atomic(&dir, &meta)
     }
 
+    /// 本篇隐藏的日历参会人整表替换(键=邮箱或名字,小写归一去重,上限 100)。
+    pub fn set_attendees_removed(&self, id: &str, keys: &[String]) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
+        let mut seen = std::collections::BTreeSet::new();
+        meta.attendees_removed = keys
+            .iter()
+            .map(|k| k.trim().to_lowercase())
+            .filter(|k| !k.is_empty() && seen.insert(k.clone()))
+            .take(100)
+            .collect();
+        write_meta_atomic(&dir, &meta)
+    }
+
     /// 仅当**盘上当前标题**仍是默认样式才改名(Aing 自动标题专用),返回是否写入。
     /// 判定与写入在同一把锁内:自动标题的调用方在跑批开始时拿的标题快照会过期
     /// ——Aing 跑几十分钟,用户中途手动改名后,按快照判定会把手动名覆盖掉
@@ -1197,7 +1213,7 @@ fn fallback_meta(dir: &Path) -> NoteMeta {
         ended_at: None,
         state: "complete".into(),
         calendar: None,
-        calendar_cleared: false, attendees: vec![],
+        calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
     }
 }
@@ -1284,7 +1300,7 @@ mod tests {
                 ended_at: Some("t".into()),
                 state: "complete".into(),
                 calendar: None,
-                calendar_cleared: false, attendees: vec![],
+                calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
             })
             .unwrap(),
@@ -1334,7 +1350,7 @@ mod tests {
                 state: "complete".into(),
                 calendar: None,
                 calendar_cleared: false,
-                attendees: vec![],
+                attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
             })
             .unwrap(),
@@ -1379,7 +1395,7 @@ mod tests {
                     ended_at: None,
                     state: "complete".into(),
                     calendar: None,
-                    calendar_cleared: false, attendees: vec![],
+                    calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                     asr_engine: None,
                 })
                 .unwrap(),
@@ -1417,7 +1433,7 @@ mod tests {
                 ended_at: Some("t".into()),
                 state: "complete".into(),
                 calendar: None,
-                calendar_cleared: false, attendees: vec![],
+                calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
             })
             .unwrap(),
@@ -1449,7 +1465,7 @@ mod tests {
                 ended_at: Some("t".into()),
                 state: "complete".into(),
                 calendar: None,
-                calendar_cleared: false, attendees: vec![],
+                calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
             })
             .unwrap(),
@@ -2227,7 +2243,7 @@ mod tests {
             ended_at: Some("2026-08-08T10:00:00+08:00".into()),
             state: "complete".into(),
             calendar: None,
-            calendar_cleared: false, attendees: vec![],
+            calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
         };
         write_meta_atomic(&dir, &meta).unwrap();

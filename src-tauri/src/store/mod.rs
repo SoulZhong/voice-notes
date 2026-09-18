@@ -83,6 +83,11 @@ pub struct NoteMeta {
     /// 说话人浮层一键指认同吃。serde default 兼容旧 meta,空表不落盘。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attendees: Vec<String>,
+    /// 本篇隐藏的日历参会人(2026-09-18 用户点名:没到场的要能删)。日历快照本身
+    /// 是事件副本不动;这里记隐藏键(邮箱优先,无邮箱记名字,均小写归一)。展示、
+    /// 一键指认、identify 先验三处同过滤;整表清空即全部恢复。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attendees_removed: Vec<String>,
     /// 本场转写实际使用的识别引擎("firered"/"qwen3"/…,云端记 "cloud:厂商")。
     /// 每场覆盖:续录换了引擎以最后一场为准(与 SyncInfo 同限制)。2026-08-14
     /// 排查教训:引擎选型与实际生效可能不一致(模型未就绪、录制中切换),

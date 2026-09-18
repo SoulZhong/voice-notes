@@ -66,6 +66,7 @@
     noteEntityDelete,
     noteEntitySetKind,
     personAddEmail,
+    setNoteAttendeesRemoved,
     type CutRange,
     type CalendarCandidate,
   } from "$lib/notes";
@@ -522,10 +523,13 @@
 
   /** 与会人员名单(说话人浮层一键指认用):日历参会人(排除「我」,四级解析,
       附邮箱供学习回路)+ 手动录入,按序去重。 */
+  const removedAttendeeKeys = $derived(new Set(note?.meta.attendees_removed ?? []));
+  const attendeeRemoved = (a: { name: string; email: string }) =>
+    removedAttendeeKeys.has(a.email.toLowerCase()) || removedAttendeeKeys.has(a.name.toLowerCase());
   const attendeeEntries = $derived.by(() => {
     const out: { name: string; email: string }[] = [];
     for (const a of note?.meta.calendar?.attendees ?? []) {
-      if (a.is_me) continue;
+      if (a.is_me || attendeeRemoved(a)) continue;
       const n = attendeeDisplay(a);
       if (n && !out.some((x) => x.name === n)) out.push({ name: n, email: a.email });
     }
@@ -537,6 +541,28 @@
   const attendeeNames = $derived(attendeeEntries.map((x) => x.name));
   /** 指认学习回路:用拼音邮箱参会人完成指认后,把邮箱记到该人档案——下次同一
       日历按邮箱精确显示中文名,不再依赖拼音猜。 */
+  /** 隐藏一位日历参会人(键=邮箱优先):没到场的从展示/指认/识别先验同步剔除。 */
+  async function removeCalAttendee(a: { name: string; email: string }) {
+    const key = (a.email || a.name).toLowerCase();
+    if (!key) return;
+    const cur = note?.meta.attendees_removed ?? [];
+    const forId = id;
+    try {
+      await setNoteAttendeesRemoved(forId, [...cur, key]);
+      if (forId === id) await refresh();
+    } catch (e) {
+      if (forId === id) attendeesErr = t("notes.attendees.failed", { e });
+    }
+  }
+  async function restoreCalAttendees() {
+    const forId = id;
+    try {
+      await setNoteAttendeesRemoved(forId, []);
+      if (forId === id) await refresh();
+    } catch (e) {
+      if (forId === id) attendeesErr = t("notes.attendees.failed", { e });
+    }
+  }
   async function attendeeUsed(sid: string, email: string) {
     if (!email) return;
     try {
@@ -2688,10 +2714,18 @@
             <p class="meta att-row">
               <span class="att-label">{t("notes.attendees.label")}</span>
               {#each note.meta.calendar?.attendees ?? [] as a (a.name + a.email)}
-                {#if !a.is_me && (a.name || a.email)}
-                  <span class="att-tag cal" title={t("notes.attendees.fromCalendar")}>{attendeeDisplay(a)}</span>
+                {#if !a.is_me && (a.name || a.email) && !attendeeRemoved(a)}
+                  <span class="att-tag cal" title={t("notes.attendees.fromCalendar")}>
+                    {attendeeDisplay(a)}
+                    <button class="att-x" title={t("notes.attendees.removeCal", { name: attendeeDisplay(a) })} onclick={() => void removeCalAttendee(a)}>×</button>
+                  </span>
                 {/if}
               {/each}
+              {#if (note.meta.attendees_removed ?? []).length > 0}
+                <button class="att-restore" onclick={() => void restoreCalAttendees()}>
+                  {t("notes.attendees.restoreN", { n: (note.meta.attendees_removed ?? []).length })}
+                </button>
+              {/if}
               {#each note.meta.attendees ?? [] as n (n)}
                 <span class="att-tag">
                   {n}
@@ -4323,6 +4357,19 @@
   .att-input:focus {
     background: var(--surface-soft);
     outline: none;
+  }
+  .att-restore {
+    border: none;
+    background: none;
+    color: var(--ink-faint);
+    font-size: 0.75rem;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    padding: 0;
+  }
+  .att-restore:hover {
+    color: var(--ink);
   }
   .att-err {
     color: var(--danger);
