@@ -329,6 +329,9 @@ export const noteEntityDelete = (id: string, entityId: string) =>
 export const noteEntitySetKind = (id: string, entityId: string, kind: string) =>
   invoke<void>("note_entity_set_kind", { id, entityId, kind });
 
+/** 给人物档案补邮箱(与会人指认学习回路;幂等)。 */
+export const personAddEmail = (personId: string, email: string) =>
+  invoke<void>("person_add_email", { personId, email });
 /** 手动与会人员整表替换(trim/去重/上限 50 由后端负责)。 */
 export const setNoteAttendees = (id: string, attendees: string[]) =>
   invoke<void>("set_note_attendees", { id, attendees });

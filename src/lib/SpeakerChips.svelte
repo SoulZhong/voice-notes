@@ -23,6 +23,7 @@
     onDetachClip,
     onMarkMultiClip,
     attendees,
+    onAttendeeUsed,
     onDelete,
     onUnlink,
     onMarkMulti,
@@ -68,8 +69,11 @@
         造出一排假说话人。 */
     onMarkMultiClip?: (id: string, seq: number) => Promise<void>;
     /** 与会人员名单(2026-09-16 用户点名:日历/手动与会人要能一键指认)。
-        点名字 = 以该名指认此说话人:库中有唯一同名即关联,没有则命名入库建档。 */
-    attendees?: string[];
+        点名字 = 以该名指认此说话人:库中有唯一同名即关联,没有则命名入库建档。
+        email 供指认学习回路(空串 = 手动与会人,无邮箱)。 */
+    attendees?: { name: string; email: string }[];
+    /** 指认成功后回调(带该与会人的邮箱):宿主把邮箱记到人物档案。 */
+    onAttendeeUsed?: (id: string, email: string) => void;
     /** 正在播放的片段 seq(高亮那一行)。 */
     previewingSeq?: number | null;
     /** 删除(可选,仅原始逐字稿视图传入)。表项移除,名下段落回到未标注;
@@ -274,17 +278,19 @@
 
   /** 与会人一键指认:点名单等于明确指认,不走重名确认——库中有唯一同名者直接
       关联,否则改名(命名即入库建档/关联,后端语义同打字改名)。 */
-  async function pickAttendee(id: string, name: string) {
+  async function pickAttendee(id: string, name: string, email: string) {
     cancelEdit();
     const hit = people?.find((p) => p.name && p.name === name && p.id !== speakers[id]?.person_id);
+    let ok: boolean;
     if (hit && onPick) {
       const sample = sampleOf(id);
-      await run(async () => {
+      ok = await run(async () => {
         await onPick(id, hit.id, sample);
       });
-      return;
+    } else {
+      ok = await run(() => doRename(id, name));
     }
-    await run(() => doRename(id, name));
+    if (ok) onAttendeeUsed?.(id, email);
   }
 
   async function commitPick(id: string, personId: string) {
@@ -578,18 +584,18 @@
                 <!-- 与会人员一键指认:来自日历/手动名单。已被占用的名字打勾淡显。 -->
                 <div class="caption">{t("speakers.attendees")}</div>
                 <div class="att-wrap">
-                  {#each attendees as an (an)}
-                    {@const used = usedNames.has(an)}
+                  {#each attendees as an (an.name)}
+                    {@const used = usedNames.has(an.name)}
                     <button
                       class="att-pill"
                       class:used
-                      title={used ? t("speakers.attendeeUsed", { name: an }) : t("speakers.attendeePick", { name: an })}
-                      onclick={() => void pickAttendee(id, an)}
+                      title={used ? t("speakers.attendeeUsed", { name: an.name }) : t("speakers.attendeePick", { name: an.name })}
+                      onclick={() => void pickAttendee(id, an.name, an.email)}
                     >
                       {#if used}
                         <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
                       {/if}
-                      {an}
+                      {an.name}
                     </button>
                   {/each}
                 </div>
