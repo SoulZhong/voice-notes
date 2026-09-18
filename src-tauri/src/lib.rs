@@ -8778,6 +8778,36 @@ fn kg_id_for_note_entity(app: &AppHandle, note_id: &str, entity_id: &str) -> Opt
     graph::kg_entity_for_mention(&root, note_id, &mid)
 }
 
+/// 人名 → 全拼(小写无分隔;非汉字字符原样小写,忽略空白)。企微邮箱前缀即人名
+/// 拼音,与会人员展示靠它把 wangyuqi@… 对回「王宇琪」(2026-09-18)。多音字取
+/// 首读音——姓氏多音(曾/单/解)会错拼,学习回路(指认即记邮箱)兜底。
+fn name_to_pinyin(name: &str) -> String {
+    use pinyin::ToPinyin;
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        match ch.to_pinyin() {
+            Some(py) => out.push_str(py.plain()),
+            None => out.extend(ch.to_lowercase()),
+        }
+    }
+    out
+}
+
+/// 给人物档案补一条邮箱(与会人指认的学习回路:用户点拼音邮箱参会人完成指认后,
+/// 把该邮箱记到人物上,下次同一日历直接精确显示中文名)。幂等,归一小写。
+#[tauri::command]
+fn person_add_email(app: AppHandle, person_id: String, email: String) -> Result<(), String> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() {
+        return Ok(());
+    }
+    let store = open_voiceprint_store(&app)?;
+    store.add_person_email(&person_id, &email).map_err(|e| e.to_string())
+}
+
 /// 手动与会人员整表替换(2026-09-16):与日历参会人合并后作 identify 闭集先验,
 /// 说话人浮层一键指认同吃。录制中拒绝(meta 写锁被 writer 持有,快速失败给原因)。
 #[tauri::command]
@@ -9217,6 +9247,8 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
                 sample_paths: sample_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
                 sample_dates,
                 sample_notes,
+                emails: p.emails.clone(),
+                name_pinyin: name_to_pinyin(&p.name),
             }
         })
         .collect();
@@ -11454,6 +11486,7 @@ pub fn run() {
             note_entity_rename,
             note_entity_delete,
             note_entity_set_kind,
+            person_add_email,
             player::player_stop,
             set_playback_active,
             mic_mode,

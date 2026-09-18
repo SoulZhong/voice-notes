@@ -175,6 +175,14 @@ pub struct PersonSummary {
     /// receipt 的取真值;没有的(8/20 之前的老样本)按文件时间≈会议结束时间推断
     /// 并标 inferred;推不出给 None。
     pub sample_notes: Vec<Option<SampleNoteRef>>,
+    /// 该人档案上的邮箱(P3 确认关联时从参会人记录;已规范化)。与会人员展示用它
+    /// 把企微日历的拼音邮箱解析成中文名(2026-09-18:企微订阅日历参会人无姓名字段)。
+    #[serde(default)]
+    pub emails: Vec<String>,
+    /// 人名全拼(小写无分隔,如 王宇琪→wangyuqi;非汉字字符原样小写)。与会人员
+    /// 展示用它把拼音邮箱前缀对回中文名——企微邮箱前缀即人名拼音。
+    #[serde(default)]
+    pub name_pinyin: String,
 }
 
 /// 一份样本的来源会议。cluster_id 只有溯源真值才有(推断时不知道是哪个簇)。

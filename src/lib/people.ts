@@ -16,6 +16,10 @@ export type PersonSummary = {
   /** 与 sample_paths 一一对应的来源会议:溯源真值(inferred=false,带 cluster_id)或
       按文件时间≈会议结束时间推断(inferred=true);推不出为 null。 */
   sample_notes: (SampleNoteRef | null)[];
+  /** 档案邮箱(确认关联时从参会人记录):企微日历拼音邮箱 → 中文名的解析键。 */
+  emails?: string[];
+  /** 人名全拼(小写无分隔):拼音邮箱前缀 → 中文名的兜底解析键。 */
+  name_pinyin?: string;
 };
 
 export type SampleNoteRef = {
