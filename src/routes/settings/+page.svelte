@@ -1657,7 +1657,10 @@
   .row {
     display: flex;
     align-items: center;
-    gap: 0.9rem;
+    /* 控件太宽(五档识别引擎的分段器)时换行到文字下方——row-info 有保底宽,
+       不再被挤成一字一行(2026-09-18 用户截图) */
+    flex-wrap: wrap;
+    gap: 0.55rem 0.9rem;
     padding: 0.55rem 1rem;
     border-bottom: 1px solid var(--hairline);
   }
@@ -1670,7 +1673,8 @@
   }
   .row-info {
     flex: 1;
-    min-width: 0;
+    /* 保底宽:低于它宁可让右侧控件换行,也不把中文说明压成竖排 */
+    min-width: min(16rem, 100%);
     display: flex;
     flex-direction: column;
     gap: 0.1rem;
