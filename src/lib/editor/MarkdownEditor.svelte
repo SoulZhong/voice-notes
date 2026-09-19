@@ -213,7 +213,12 @@
               .filter((r) => r.text)
               .map((r) =>
                 r.entityId
-                  ? schema.text(r.text, [schema.marks.entity_mention.create({ entityId: r.entityId })])
+                  ? schema.text(r.text, [
+                      schema.marks.entity_mention.create({
+                        entityId: r.entityId,
+                        entityKind: r.entityKind ?? "",
+                      }),
+                    ])
                   : schema.text(r.text),
               )
           : parseInline(ctx, b.markdown);

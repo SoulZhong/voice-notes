@@ -4,7 +4,10 @@ import { splitMentions, type RefinedDoc, type ParagraphPayload } from "../notes"
 
 export type { ParagraphPayload };
 
-export type InlineRun = { text: string; entityId: string | null };
+/** entityKind:该提及所属实体的类型(person/org/project/term/…),决定正文里这一处
+    用哪个色——与它头顶那枚 chip 同色是"一眼认出同一个东西"的全部依据。
+    entityId 为 null 的普通文本段恒为 null。 */
+export type InlineRun = { text: string; entityId: string | null; entityKind: string | null };
 
 /** 精修稿一个顶层块的构建说明。kind="runs":纯文本 + 实体标注(有 live mention 的
     干净段,文本按字面载入,不做 markdown 解析——mention 偏移只对字面文本有效);
@@ -22,6 +25,10 @@ export type BlockSpec = {
 
 export function refinedToBlocks(doc: RefinedDoc): BlockSpec[] {
   const support = new Set(doc.graph_support_mentions ?? []);
+  // 实体 id → kind。mention 只带 entity id,颜色要按类型取,这里先建好映射。
+  // 稿上有 mention 却在 entities 里查无此人(实体被删、稿未重跑)→ kind 为 null,
+  // 下游按中性色兜底,不因为一条悬空引用就把整段降级成无标注纯文本。
+  const kindOf = new Map((doc.entities ?? []).map((e) => [e.id, e.kind] as const));
   return doc.paragraphs.map((p, i) => {
     const live = (p.mentions ?? []).filter((m) => !m.id || !support.has(m.id));
     const base = {
@@ -32,7 +39,15 @@ export function refinedToBlocks(doc: RefinedDoc): BlockSpec[] {
       startMs: p.start_ms,
     };
     return live.length > 0
-      ? { ...base, kind: "runs" as const, runs: splitMentions(p.text, live), markdown: p.text }
+      ? {
+          ...base,
+          kind: "runs" as const,
+          runs: splitMentions(p.text, live).map((r) => ({
+            ...r,
+            entityKind: r.entityId ? (kindOf.get(r.entityId) ?? null) : null,
+          })),
+          markdown: p.text,
+        }
       : { ...base, kind: "markdown" as const, runs: [], markdown: p.text };
   });
 }
