@@ -65,6 +65,7 @@
     noteEntityRename,
     noteEntityDelete,
     noteEntitySetKind,
+    noteEntityMerge,
     personAddEmail,
     setNoteAttendeesRemoved,
     type CutRange,
@@ -651,6 +652,23 @@
   async function entitySetKind(entityId: string, kind: string) {
     await noteEntitySetKind(id, entityId, kind);
     await reloadRefinedForEntities();
+  }
+  /** 合并(二期):本篇立即合,全局治理账本由后端同步。合完正文提及会改指胜方,
+      所以要整份重载修订稿(与增/删/改名同一条闸门)。 */
+  async function entityMerge(entityId: string, targetId: string) {
+    await noteEntityMerge(id, entityId, targetId);
+    // 定位态可能还指着刚被并掉的那个实体:清掉,免得下次点 chip 找一个不存在的 id。
+    entityLocate = null;
+    await reloadRefinedForEntities();
+  }
+  /** 实体 → 图谱/人物页链接(解析不到全局 id 的返回 null,浮层不出这个入口)。
+      与正文悬浮浮层的 gotoEntity 同一份 entityLinks,口径不分叉。 */
+  function entityGraphHref(eid: string): string | null {
+    const link = entityLinks[eid];
+    if (!link) return null;
+    return link.is_person
+      ? "/speakers/" + link.global_id
+      : "/graph?e=" + encodeURIComponent(link.global_id);
   }
   /** 点实体定位正文提及:滚到第一处并高亮全部,再点同一实体跳下一处。
       实体只存在于修订稿,原始稿视图先切过去(段落异步渲染,重试一拍)。 */
@@ -3014,6 +3032,8 @@
           onRename={entityRename}
           onDelete={entityDelete}
           onSetKind={entitySetKind}
+          onMerge={entityMerge}
+          graphHref={entityGraphHref}
         />
       {/if}
 

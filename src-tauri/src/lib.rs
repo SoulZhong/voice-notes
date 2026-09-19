@@ -8893,6 +8893,54 @@ fn note_entity_rename(app: AppHandle, id: String, entity_id: String, name: Strin
     Ok(())
 }
 
+/// 合并(二期,2026-09-19):把 entity_id 并进 target_id。本篇 aing.json 先合,
+/// 再同步全局治理账本(复用图谱的 merge_operation),与改名的双写纪律同款。
+///
+/// 人实体不进全局账本:跟改名同一条理由——「人」在本仓由声纹库/人物系统治理,
+/// 图谱里的人节点是它的派生物,往知识账本里写人的合并会和声纹侧的归并打架。
+/// 本篇仍然合(本篇是本篇的真值),只是不往全局写。
+///
+/// 全局那一步失败只记日志不回滚:本篇已经合好了,为了一条账本把用户刚做的合并
+/// 撤销回去更糟;重建会在下次把本篇的事实带进全局。
+#[tauri::command]
+fn note_entity_merge(
+    app: AppHandle,
+    id: String,
+    entity_id: String,
+    target_id: String,
+) -> Result<(), String> {
+    let dir = entity_edit_gate(&app, &id)?;
+    // 全局 id 必须在合并**之前**解析:合并会删掉败方实体与它的提及标识,
+    // 事后再查 kg id 必然查不到(mention 已改指胜方)。
+    let loser_kg = kg_id_for_note_entity(&app, &id, &entity_id);
+    let winner_kg = kg_id_for_note_entity(&app, &id, &target_id);
+    let (_loser_name, _winner_name, kind) =
+        store::merge_note_entities(&dir, &id, &entity_id, &target_id).map_err(|e| e.to_string())?;
+    if kind != "person" {
+        match (loser_kg, winner_kg) {
+            (Some(src), Some(dst)) if src != dst => {
+                if let Ok(root) = data_root(&app) {
+                    match graph::query::merge_operation(&root, &src, &dst) {
+                        Ok(result) => {
+                            let _ = queue_knowledge_rebuild(&app, root, result);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("entity_merge({id}/{entity_id}→{target_id}): 全局账本同步失败(本篇已合): {e}")
+                        }
+                    }
+                }
+            }
+            (Some(_), Some(_)) => {} // 两边解析到同一个全局实体:全局无需再合
+            _ => eprintln!(
+                "entity_merge({id}/{entity_id}→{target_id}): 索引查不到全局 id(可能待重建),本次只合本篇"
+            ),
+        }
+    }
+    entity_edit_rebuild(&app);
+    Ok(())
+}
+
 /// 删除(仅本篇)。
 #[tauri::command]
 fn note_entity_delete(app: AppHandle, id: String, entity_id: String) -> Result<(), String> {
@@ -11653,6 +11701,7 @@ pub fn run() {
             set_note_attendees_removed,
             note_entities_add,
             note_entity_rename,
+            note_entity_merge,
             note_entity_delete,
             note_entity_set_kind,
             person_add_email,
