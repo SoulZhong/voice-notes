@@ -11,6 +11,7 @@ import type { Node as PMNode, Fragment } from "@milkdown/kit/prose/model";
 import type { EditorView, ViewMutationRecord } from "@milkdown/kit/prose/view";
 import type { MarkSerializerSpec } from "@milkdown/kit/transformer";
 import { normalizeOrigIndices } from "./editorDoc";
+import { entityMentionCssVars } from "$lib/entityKind";
 
 /** 剥掉 Fragment 尾部的 hardbreak 节点(如果有)。commonmark 段落序列化靠
     preset-commonmark 的 __internal__/serializeText 做同样的事,但该辅助未从包
@@ -67,17 +68,29 @@ export const entityMentionToMarkdown: MarkSerializerSpec = {
 };
 
 export const entityMentionSchema = $markSchema("entity_mention", () => ({
-  attrs: { entityId: { default: "" } },
+  // entityKind 决定这一处用哪个色(与头顶 chip 同色);缺省空串走中性兜底。
+  attrs: { entityId: { default: "" }, entityKind: { default: "" } },
   inclusive: false,
   parseDOM: [
     {
       tag: "span[data-entity-id]",
-      getAttrs: (dom) => ({ entityId: (dom as HTMLElement).dataset.entityId ?? "" }),
+      getAttrs: (dom) => ({
+        entityId: (dom as HTMLElement).dataset.entityId ?? "",
+        entityKind: (dom as HTMLElement).dataset.entityKind ?? "",
+      }),
     },
   ],
+  // 配色走行内 CSS 变量(--ent-tint / --ent-ink),取自 $lib/entityKind 那一份表;
+  // 样式表只认这两个变量,不再按类型名写一堆选择器,新增类型无需两处同步。
+  // data-entity-kind 仍然落到 DOM 上:parseDOM 往返要它,排障时也一眼看得见类型。
   toDOM: (mark) => [
     "span",
-    { "data-entity-id": mark.attrs.entityId as string, class: "entity-mention" },
+    {
+      "data-entity-id": mark.attrs.entityId as string,
+      "data-entity-kind": mark.attrs.entityKind as string,
+      style: entityMentionCssVars(mark.attrs.entityKind as string),
+      class: "entity-mention",
+    },
   ],
   parseMarkdown: { match: () => false, runner: () => {} },
   toMarkdown: entityMentionToMarkdown,
