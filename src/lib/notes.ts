@@ -336,6 +336,10 @@ export const noteEntitySetKind = (id: string, entityId: string, kind: string) =>
  *  本条出表;非人实体同步全局治理账本(复用图谱 merge)。 */
 export const noteEntityMerge = (id: string, entityId: string, targetId: string) =>
   invoke<void>("note_entity_merge", { id, entityId, targetId });
+/** 别名整表替换(仅本篇,随重建汇入全局)。别名决定正文里哪些写法算这个实体,
+ *  后端改完会重算提及:加了立刻高亮,删了对应高亮一并消失。 */
+export const noteEntitySetAliases = (id: string, entityId: string, aliases: string[]) =>
+  invoke<void>("note_entity_set_aliases", { id, entityId, aliases });
 
 /** 给人物档案补邮箱(与会人指认学习回路;幂等)。 */
 export const personAddEmail = (personId: string, email: string) =>

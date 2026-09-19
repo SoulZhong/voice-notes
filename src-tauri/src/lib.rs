@@ -8941,6 +8941,21 @@ fn note_entity_merge(
     Ok(())
 }
 
+/// 别名整表替换(仅本篇,随重建汇入全局)。别名决定正文里哪些写法会被认成这个实体,
+/// 所以后端改完会重算提及——加了立刻高亮,删了对应高亮一并消失。
+#[tauri::command]
+fn note_entity_set_aliases(
+    app: AppHandle,
+    id: String,
+    entity_id: String,
+    aliases: Vec<String>,
+) -> Result<(), String> {
+    let dir = entity_edit_gate(&app, &id)?;
+    store::set_note_entity_aliases(&dir, &id, &entity_id, &aliases).map_err(|e| e.to_string())?;
+    entity_edit_rebuild(&app);
+    Ok(())
+}
+
 /// 删除(仅本篇)。
 #[tauri::command]
 fn note_entity_delete(app: AppHandle, id: String, entity_id: String) -> Result<(), String> {
@@ -11702,6 +11717,7 @@ pub fn run() {
             note_entities_add,
             note_entity_rename,
             note_entity_merge,
+            note_entity_set_aliases,
             note_entity_delete,
             note_entity_set_kind,
             person_add_email,
