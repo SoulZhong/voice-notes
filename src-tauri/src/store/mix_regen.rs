@@ -152,7 +152,7 @@ pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
             anyhow::ensure!(m4a.is_file(), "缺少 {src} 轨(wav/m4a 都不在),无法补生成");
             // 解码到点前缀临时名:不会被 sources_with_suffix 的目录扫描当成轨
             let tmp = dir.join(format!(".mixregen_{src}.wav"));
-            crate::store::transcode::decode_m4a_to_standard_wav(&m4a, &tmp)
+            crate::store::transcode::decode_to_standard_wav(&m4a, &tmp)
                 .inspect_err(|_| {
                     let _ = std::fs::remove_file(&tmp);
                 })?;

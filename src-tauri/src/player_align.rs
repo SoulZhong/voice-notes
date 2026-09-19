@@ -1203,7 +1203,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let decode = |src: &str| -> Vec<u8> {
             let dest = tmp.join(format!("{src}.wav"));
-            crate::store::transcode::decode_m4a_to_standard_wav(
+            crate::store::transcode::decode_to_standard_wav(
                 &dir.join(format!("{src}.m4a")),
                 &dest,
             )

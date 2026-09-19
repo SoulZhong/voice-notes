@@ -2,7 +2,7 @@
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { ask } from "@tauri-apps/plugin-dialog";
+  import { ask, open } from "@tauri-apps/plugin-dialog";
   import { onNoteRenamed } from "$lib/events";
   import { recording } from "$lib/recording.svelte";
   import { recordRiskGate } from "$lib/recordRisk.svelte";
@@ -12,6 +12,8 @@
     listNotes,
     renameNote,
     deleteNote,
+    importAudio,
+    IMPORT_EXTS,
     formatDate,
     formatDuration,
     speakerColor,
@@ -246,6 +248,32 @@
     }
   }
 
+  // 导入音频:选文件 → 后端解码建档(数秒,期间按钮转忙态)→ 跳进新笔记。
+  // 转写不等——它在后台继续,新笔记页会按既有的「分析中」逻辑显示进度并在完成时自刷新
+  // (导入的后半程复用重转写的槽与事件,见后端 do_import_audio 注释)。
+  let importing = $state(false);
+
+  async function importAudioFile() {
+    if (importing || recording.isLive) return;
+    const picked = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: t("shell.import.filterName"), extensions: IMPORT_EXTS }],
+    });
+    if (typeof picked !== "string") return; // 取消
+    importing = true;
+    error = "";
+    try {
+      const id = await importAudio(picked);
+      recording.bumpNotes(); // 侧栏立刻出现这篇(此刻已有音频,还没有正文)
+      goto(`/notes/${id}`);
+    } catch (e) {
+      error = t("shell.import.failed", { e });
+    } finally {
+      importing = false;
+    }
+  }
+
   function beginRename(n: NoteSummary) {
     editingId = n.id;
     editingTitle = n.title;
@@ -388,6 +416,22 @@
   >
     <span class="rec-dot" class:square={recording.isLive}></span>
     {recording.stopping ? t("shell.record.stopping") : recording.isLive ? (recording.paused ? t("shell.record.paused") : t("shell.record.stop")) : t("shell.record.start")}
+  </button>
+
+  <!-- 导入已有录音:录制的次级入口,常驻在录制药丸下方。刻意带文字而非纯图标——
+       同样的幽灵图标钮在重转写入口上被实测"没人找到"(见笔记页 retrans-btn 注释)。
+       录制中禁用:后端同样会拒(录制与转写全局互斥),这里先一步说明原因。 -->
+  <button
+    class="import-btn"
+    onclick={importAudioFile}
+    disabled={importing || recording.isLive || recording.pending}
+    title={recording.isLive ? t("shell.import.busyRecording") : t("shell.import.hint")}
+  >
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M8 10.5V2.5M5 5.5L8 2.5l3 3" />
+      <path d="M2.5 10.5v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2" />
+    </svg>
+    {importing ? t("shell.import.running") : t("shell.import.action")}
   </button>
 
   {#if tab === "hooks"}
@@ -770,6 +814,30 @@
   }
   .record-btn:disabled {
     opacity: 0.6;
+    cursor: default;
+  }
+  /* 导入:录制的次级入口——幽灵态(无底色、弱文字)与上方实心录制药丸分主次,
+     同宽对齐,不抢视觉重心。 */
+  .import-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45em;
+    margin-top: 0.4em;
+    border: none;
+    background: none;
+    border-radius: var(--radius-full);
+    padding: 0.35em 1em;
+    font-size: 0.82rem;
+    color: var(--ink-secondary);
+    cursor: pointer;
+  }
+  .import-btn:hover:not(:disabled) {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .import-btn:disabled {
+    opacity: 0.5;
     cursor: default;
   }
   /* 人物行:小色点(与详情页头像同色源)+ 名字/最近出现;点击进主区详情(主从结构),
