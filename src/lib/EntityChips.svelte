@@ -160,7 +160,7 @@
           title={t("notes.entities.locate", { n: counts[e.id] ?? 0 })}
           onclick={() => onLocate?.(e.id)}
         >
-          {e.name}{#if (counts[e.id] ?? 0) > 1}<span class="ent-n">{counts[e.id]}</span>{/if}
+          <span class="ent-hash" aria-hidden="true">#</span>{e.name}{#if (counts[e.id] ?? 0) > 1}<span class="ent-n">{counts[e.id]}</span>{/if}
         </button>
         {#if editable}
           <button
@@ -249,7 +249,7 @@
                     class="ent-merge-item"
                     onclick={() => onMerge && void act(() => onMerge(e.id, tgt.id))}
                   >
-                    <span class="ent-chip-mini" style="background: {tk?.tint}; color: {tk?.ink}">{tgt.name}</span>
+                    <span class="ent-chip-mini" style="background: {tk?.tint}; color: {tk?.ink}"><span class="ent-hash" aria-hidden="true">#</span>{tgt.name}</span>
                     {#if (counts[tgt.id] ?? 0) > 0}<span class="ent-n">{counts[tgt.id]}</span>{/if}
                   </button>
                 {:else}
@@ -318,12 +318,22 @@
     gap: 0.35rem;
     margin: 0.5rem 0 0;
   }
+  /* 实体 chip 与说话人 chip 此前同为「圆药丸 + 淡底」,一眼分不清哪行是人哪行是词
+     (2026-09-20 用户实报)。两处区分:①名字前加 # 标记;②方角标签形 vs 说话人的
+     圆药丸形——标签是方的、人是圆的,是通行的视觉分工,不必再靠位置去记。
+     颜色不动:实体的色承载的是类型,与正文里的提及同色,那条信息更值钱。 */
   .ent-chip {
     position: relative;
     display: inline-flex;
     align-items: center;
-    border-radius: var(--radius-full);
+    border-radius: var(--radius-sm);
     font-size: 0.78rem;
+  }
+  /* # 标记:压到半透明,读起来是"这是个标签"的记号,不是名字的一部分 */
+  .ent-hash {
+    opacity: 0.55;
+    font-weight: 600;
+    margin-right: 0.05em;
   }
   .ent-name {
     display: inline-flex;
@@ -332,8 +342,8 @@
     border: none;
     background: none;
     color: inherit;
-    padding: 0.18em 0.3em 0.18em 0.7em;
-    border-radius: var(--radius-full) 0 0 var(--radius-full);
+    padding: 0.18em 0.3em 0.18em 0.6em;
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
     cursor: pointer;
     font-size: inherit;
   }
@@ -353,7 +363,7 @@
     opacity: 0.55;
     padding: 0.18em 0.5em 0.18em 0.1em;
     cursor: pointer;
-    border-radius: 0 var(--radius-full) var(--radius-full) 0;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   }
   .ent-edit:hover {
     opacity: 1;
@@ -362,7 +372,7 @@
     border: 1px solid var(--hairline-strong);
     background: transparent;
     color: var(--ink-secondary);
-    border-radius: var(--radius-full);
+    border-radius: var(--radius-sm);
     padding: 0.15em 0.6em;
     font-size: 0.78rem;
     cursor: pointer;
@@ -519,7 +529,7 @@
     background: var(--surface-soft);
   }
   .ent-chip-mini {
-    border-radius: var(--radius-full);
+    border-radius: var(--radius-sm);
     padding: 0.1em 0.55em;
     font-size: 0.78rem;
     white-space: nowrap;
