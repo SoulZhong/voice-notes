@@ -228,12 +228,15 @@ pub(crate) fn validate_note_id(id: &str) -> anyhow::Result<()> {
 /// 改写某篇笔记的 `asr_engine`(离线路径用:重转写换了引擎之后要如实记账,
 /// 否则「疑似识别失败,换引擎重转写」的建议会照着旧引擎反复提示同一篇)。
 /// 只动这一个字段,其余原样读回写回。
+/// 2026-09-19:改走 notes::update_meta_strict。此前它是**唯一一条裸读-改-写 meta
+/// 的路径**(一把锁都不拿):重转写结束时写引擎名,与同一刻用户填与会人员的编辑
+/// 交错就会互相整份覆盖。现在与其它 meta 编辑同在 `.meta.lock` 内,锁内重读。
 pub fn set_note_asr_engine(note_dir: &Path, engine: &str) -> anyhow::Result<()> {
-    let path = note_dir.join("meta.json");
-    let text = std::fs::read_to_string(&path)?;
-    let mut meta: NoteMeta = serde_json::from_str(&text)?;
-    meta.asr_engine = Some(engine.to_string());
-    write_meta_atomic(note_dir, &meta)
+    notes::update_meta_strict(note_dir, |meta| {
+        meta.asr_engine = Some(engine.to_string());
+        true
+    })?;
+    Ok(())
 }
 
 pub(crate) fn write_meta_atomic(note_dir: &Path, meta: &NoteMeta) -> anyhow::Result<()> {
