@@ -1,6 +1,7 @@
 <script lang="ts">
   import { t } from "$lib/i18n/index.svelte";
   import type { Entity } from "$lib/notes";
+  import { ENTITY_KINDS, entityKind, entityKindLabel } from "$lib/entityKind";
 
   /* 关键实体行(2026-09-17 设计:docs/superpowers/specs/2026-09-17-note-entity-list-design.md):
      说话人条下方同形态 chips。chip 本体点击 = 定位正文提及(再点跳下一处);
@@ -28,14 +29,10 @@
     onAdd?: (entries: [string, string][]) => Promise<void>;
   } = $props();
 
-  /** 展示类型白名单与配色/标签(与导出、侧栏全局实体列表同口径)。 */
-  const KINDS = [
-    { key: "person", label: () => t("notes.entities.kind.person"), tint: "var(--tint-sky)", ink: "var(--tint-sky-ink)" },
-    { key: "org", label: () => t("notes.entities.kind.org"), tint: "var(--tint-mint)", ink: "var(--tint-mint-ink)" },
-    { key: "project", label: () => t("notes.entities.kind.project"), tint: "var(--tint-lavender)", ink: "var(--tint-lavender-ink)" },
-    { key: "term", label: () => t("notes.entities.kind.term"), tint: "var(--tint-gray)", ink: "var(--tint-gray-ink)" },
-  ] as const;
-  const kindOf = (k: string) => KINDS.find((x) => x.key === (k === "concept" ? "term" : k));
+  /** 展示类型白名单与配色/标签:统一取自 $lib/entityKind(唯一真值源)。
+      正文里的实体提及用的是同一份表——chip 与正文同色才看得出是同一个东西。 */
+  const KINDS = ENTITY_KINDS;
+  const kindOf = (k: string) => entityKind(k);
 
   const COLLAPSED_MAX = 12;
   let showAll = $state(false);
@@ -146,7 +143,7 @@
                   class:on={kindOf(e.kind)?.key === kk.key}
                   onclick={() => onSetKind && void act(() => onSetKind(e.id, kk.key))}
                 >
-                  {kk.label()}
+                  {entityKindLabel(kk.key)}
                 </button>
               {/each}
             </div>
@@ -195,7 +192,7 @@
             <div class="ent-kinds">
               {#each KINDS as kk (kk.key)}
                 <button class="ent-kind" class:on={addKind === kk.key} onclick={() => (addKind = kk.key)}>
-                  {kk.label()}
+                  {entityKindLabel(kk.key)}
                 </button>
               {/each}
             </div>
