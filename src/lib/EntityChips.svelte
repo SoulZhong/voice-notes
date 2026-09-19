@@ -16,6 +16,7 @@
     onDelete,
     onSetKind,
     onMerge,
+    onSetAliases,
     onAdd,
     graphHref,
   }: {
@@ -29,6 +30,8 @@
     onSetKind?: (id: string, kind: string) => Promise<void>;
     /** 合并(二期):把 id 并进 targetId。本篇立即合,全局账本由后端同步。 */
     onMerge?: (id: string, targetId: string) => Promise<void>;
+    /** 别名整表替换。别名决定正文里哪些写法算这个实体,改完后端重算提及。 */
+    onSetAliases?: (id: string, aliases: string[]) => Promise<void>;
     /** 批量新增:[name, kind][]。 */
     onAdd?: (entries: [string, string][]) => Promise<void>;
     /** 实体 id → 知识图谱链接(解析不到全局 id 的返回 null,不出这个入口)。 */
@@ -63,12 +66,15 @@
   // 合并浮层:展开后在本篇其它实体里挑一个当"并进去"的目标(胜方)。
   let mergeOpen = $state(false);
   let mergeQuery = $state("");
+  // 别名新增输入(展示与删除直接在 chip 上,不另开态)。
+  let aliasInput = $state("");
 
   export function closeAll() {
     editingId = null;
     addOpen = false;
     mergeOpen = false;
     mergeQuery = "";
+    aliasInput = "";
     busyErr = null;
   }
 
@@ -76,9 +82,27 @@
     addOpen = false;
     mergeOpen = false;
     mergeQuery = "";
+    aliasInput = "";
     editingId = e.id;
     editingName = e.name;
     busyErr = null;
+  }
+
+  /** 加别名:与新增实体同款批量分隔(中英文逗号/分号/顿号),空格保留(英文名)。
+      整表替换——把现有别名连同新输入一起发下去,后端做归一去重与撞名校验。 */
+  function commitAlias(e: Entity) {
+    const parts = aliasInput
+      .split(/[,，;；、]+/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+    aliasInput = "";
+    if (parts.length === 0 || !onSetAliases) return;
+    void act(() => onSetAliases(e.id, [...(e.aliases ?? []), ...parts]));
+  }
+
+  function removeAlias(e: Entity, alias: string) {
+    if (!onSetAliases) return;
+    void act(() => onSetAliases(e.id, (e.aliases ?? []).filter((a) => a !== alias)));
   }
 
   /** 合并候选:本篇其它全部实体(**不受 chip 行的 12 个折叠上限约束**——要并的那个
@@ -173,6 +197,28 @@
                 </button>
               {/each}
             </div>
+            {#if onSetAliases}
+              <!-- 别名:正文里这个实体的其它写法。加了立刻多认出提及,删了对应高亮
+                   一并消失——所以每条都带 ×,而不是只读展示。合并/改名塞进来的别名
+                   也在这里,用户第一次有地方看见并纠正它们。 -->
+              <div class="ent-aliases">
+                {#each e.aliases ?? [] as al (al)}
+                  <span class="ent-alias">
+                    {al}
+                    <button class="ent-alias-x" aria-label={t("notes.entities.aliasRemove", { name: al })} onclick={() => removeAlias(e, al)}>×</button>
+                  </span>
+                {/each}
+                <input
+                  class="ent-alias-input"
+                  placeholder={t("notes.entities.aliasPlaceholder")}
+                  bind:value={aliasInput}
+                  onkeydown={(ev) => {
+                    if (ev.key === "Enter") commitAlias(e);
+                    if (ev.key === "Escape") closeAll();
+                  }}
+                />
+              </div>
+            {/if}
             <div class="ent-actions">
               {#if onMerge}
                 <button class="ent-act" class:on={mergeOpen} onclick={() => { mergeOpen = !mergeOpen; mergeQuery = ""; }}>
@@ -211,7 +257,7 @@
                 {/each}
               </div>
             {:else}
-              <span class="ent-hint">{t("notes.entities.renameHint")}</span>
+              <span class="ent-hint">{onSetAliases ? t("notes.entities.aliasHint") : t("notes.entities.renameHint")}</span>
             {/if}
             {#if busyErr}<div class="ent-err">{busyErr}</div>{/if}
           </div>
@@ -404,6 +450,52 @@
   .ent-act.on {
     border-color: var(--accent);
     color: var(--accent);
+  }
+  /* 别名区:已有别名做小药丸(各带 ×),末尾跟一个"加别名"输入框,同一行流式排布。 */
+  .ent-aliases {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+    margin-top: 0.5rem;
+  }
+  .ent-alias {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2em;
+    background: var(--surface-soft);
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.1em 0.2em 0.1em 0.55em;
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
+  .ent-alias-x {
+    border: none;
+    background: transparent;
+    color: var(--ink-faint);
+    font-size: 0.95em;
+    line-height: 1;
+    padding: 0 0.25em;
+    cursor: pointer;
+  }
+  .ent-alias-x:hover {
+    color: var(--danger);
+  }
+  .ent-alias-input {
+    flex: 1 1 6rem;
+    min-width: 5rem;
+    border: 1px dashed var(--hairline-strong);
+    background: transparent;
+    color: var(--ink);
+    border-radius: var(--radius-full);
+    padding: 0.1em 0.55em;
+    font-size: 0.75rem;
+  }
+  .ent-alias-input:focus {
+    outline: none;
+    border-style: solid;
+    border-color: var(--accent);
   }
   /* 合并目标选择区 */
   .ent-merge {

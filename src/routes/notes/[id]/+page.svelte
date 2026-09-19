@@ -66,6 +66,7 @@
     noteEntityDelete,
     noteEntitySetKind,
     noteEntityMerge,
+    noteEntitySetAliases,
     personAddEmail,
     setNoteAttendeesRemoved,
     type CutRange,
@@ -659,6 +660,11 @@
     await noteEntityMerge(id, entityId, targetId);
     // 定位态可能还指着刚被并掉的那个实体:清掉,免得下次点 chip 找一个不存在的 id。
     entityLocate = null;
+    await reloadRefinedForEntities();
+  }
+  /** 别名整表替换:改完提及会变(加了多认出、删了少认出),整份重载修订稿。 */
+  async function entitySetAliases(entityId: string, aliases: string[]) {
+    await noteEntitySetAliases(id, entityId, aliases);
     await reloadRefinedForEntities();
   }
   /** 实体 → 图谱/人物页链接(解析不到全局 id 的返回 null,浮层不出这个入口)。
@@ -3033,6 +3039,7 @@
           onDelete={entityDelete}
           onSetKind={entitySetKind}
           onMerge={entityMerge}
+          onSetAliases={entitySetAliases}
           graphHref={entityGraphHref}
         />
       {/if}

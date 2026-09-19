@@ -1312,6 +1312,75 @@ pub fn delete_note_entity(note_dir: &Path, note_id: &str, entity_id: &str) -> an
     })
 }
 
+/// 一个实体最多留多少别名。合并会把败方的名与别名一起并过来,长会议里连并几次
+/// 就可能攒出一长串;上限挡住"别名表变成垃圾桶",超出的按输入顺序截断。
+const MAX_ALIASES: usize = 50;
+
+/// 别名整表替换(仅本篇)。
+///
+/// 别名是"正文里这个实体的**其它写法**",它直接决定 compute_mentions 能认出哪些
+/// 片段——所以每次改完必须重算提及:加别名会让新写法立刻高亮,删别名会让按它命中的
+/// 高亮一并消失。后者不是副作用,正是别名的定义,UI 上要跟用户讲清楚。
+///
+/// 拒绝与**其它**实体的名/别名撞归一键:撞了就意味着同一段文字能同时指向两个实体,
+/// 提及归属无从判定——那种情况该走合并。与本实体自己的名字相同的别名静默丢弃
+/// (冗余而非错误,不值得打断用户)。
+///
+/// 只写本篇:别名随全局重建汇入图谱实体(index.rs 收各篇 aliases 后 sort+dedup),
+/// 与「改类型」同一条传播路径,不另写治理账本——账本那套叠加是图谱治理页的职责,
+/// 两处都写会让"本篇说的"与"账本说的"各有一份,冲突时无从裁决。
+pub fn set_note_entity_aliases(
+    note_dir: &Path,
+    note_id: &str,
+    entity_id: &str,
+    aliases: &[String],
+) -> anyhow::Result<()> {
+    update_refined(note_dir, |doc| {
+        let self_name = doc
+            .entities
+            .iter()
+            .find(|e| e.id == entity_id)
+            .ok_or_else(|| anyhow::anyhow!("本篇没有该实体: {entity_id}"))?
+            .name
+            .clone();
+        // 其它实体占用的归一键(名 + 别名):撞上就得走合并,不能靠别名蒙混。
+        let taken: std::collections::BTreeMap<String, String> = doc
+            .entities
+            .iter()
+            .filter(|e| e.id != entity_id)
+            .flat_map(|e| std::iter::once(&e.name).chain(e.aliases.iter()).map(|n| (entity_norm(n), e.name.clone())))
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        seen.insert(entity_norm(&self_name)); // 与本名相同的别名冗余,静默丢
+        let mut out: Vec<String> = Vec::new();
+        for a in aliases {
+            let a = a.trim();
+            if a.is_empty() {
+                continue;
+            }
+            let key = entity_norm(a);
+            if let Some(owner) = taken.get(&key) {
+                anyhow::bail!("「{a}」已经是实体「{owner}」的名字或别名;如果是同一个,用「合并到…」把它们并起来");
+            }
+            if !seen.insert(key) {
+                continue; // 表内重复
+            }
+            out.push(a.to_string());
+            if out.len() >= MAX_ALIASES {
+                break;
+            }
+        }
+        let ent = doc
+            .entities
+            .iter_mut()
+            .find(|e| e.id == entity_id)
+            .ok_or_else(|| anyhow::anyhow!("本篇没有该实体: {entity_id}"))?;
+        ent.aliases = out;
+        recompute_all_mentions(note_id, doc);
+        Ok(())
+    })
+}
+
 /// 改类型(仅本篇):类型是实体身份的一部分,本篇改对了全局重建跟着对。
 pub fn set_note_entity_kind(note_dir: &Path, entity_id: &str, kind: &str) -> anyhow::Result<()> {
     let kind = kind.trim().to_string();
@@ -1687,6 +1756,87 @@ mod tests {
         assert_eq!(k, "org", "胜方有 kind 就保留自己的");
         assert!(merge_note_entities(&dir, "n1", "ent_3", "ent_3").is_err(), "不能自合并");
         assert!(merge_note_entities(&dir, "n1", "ent_9", "ent_3").is_err(), "不存在的实体要报错");
+    }
+
+    /// 别名编辑(二期):加别名 → 正文里那个写法立刻被认出来;删别名 → 按它命中的
+    /// 提及一并消失。后者是别名的**定义**而非副作用,专门断言,免得日后有人把
+    /// recompute 去掉以为是优化。撞别的实体的名/别名要拒(该走合并)。
+    #[test]
+    fn set_note_entity_aliases_drives_mentions_and_rejects_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("20260101-000002");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut doc = RefinedDoc {
+            llm_failed_paragraphs: vec![],
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![
+                Entity { id: "ent_1".into(), kind: "person".into(), name: "郎佳奇".into(), aliases: vec![] },
+                Entity { id: "ent_2".into(), kind: "org".into(), name: "聚凡科技".into(), aliases: vec!["聚凡".into()] },
+            ],
+            graph_extraction: None,
+            relations: vec![],
+            graph_support_mentions: vec![],
+            revision: 0,
+            stale: false,
+            paragraphs: vec![RefinedParagraph {
+                speaker: "S1".into(),
+                name: None,
+                person_id: None,
+                start_ms: 0,
+                end_ms: 5_000,
+                text: "郎工今天来了,郎佳奇也在".into(),
+                source_seqs: vec![],
+                mentions: vec![],
+            }],
+        };
+        let ms = crate::refine::compute_mentions(&doc.paragraphs, &doc.entities);
+        for (p, m) in doc.paragraphs.iter_mut().zip(ms) {
+            p.mentions = m;
+        }
+        crate::store::aing_graph::ensure_graph_ids("n1", &mut doc);
+        write_refined_atomic(&dir, &doc).unwrap();
+        let count = |d: &RefinedDoc| d.paragraphs[0].mentions.iter().filter(|m| m.entity == "ent_1").count();
+        let before = count(&load_aing_file(&dir).unwrap().unwrap());
+
+        // 加别名「郎工」→ 正文里那处立刻算进提及
+        set_note_entity_aliases(&dir, "n1", "ent_1", &["郎工".into()]).unwrap();
+        let d = load_aing_file(&dir).unwrap().unwrap();
+        assert_eq!(d.entities.iter().find(|e| e.id == "ent_1").unwrap().aliases, vec!["郎工".to_string()]);
+        assert_eq!(count(&d), before + 1, "加别名应立刻多认出一处提及");
+
+        // 清空别名 → 按它命中的提及一并消失(这是别名的定义)
+        set_note_entity_aliases(&dir, "n1", "ent_1", &[]).unwrap();
+        let d = load_aing_file(&dir).unwrap().unwrap();
+        assert!(d.entities.iter().find(|e| e.id == "ent_1").unwrap().aliases.is_empty());
+        assert_eq!(count(&d), before, "删别名应把按它命中的提及一并撤掉");
+
+        // 归一去重 + 丢掉与本名相同的冗余别名
+        set_note_entity_aliases(&dir, "n1", "ent_1", &["郎工".into(), " 郎工 ".into(), "郎佳奇".into(), "".into()]).unwrap();
+        assert_eq!(
+            load_aing_file(&dir).unwrap().unwrap().entities.iter().find(|e| e.id == "ent_1").unwrap().aliases,
+            vec!["郎工".to_string()],
+            "重复/空白/与本名相同的一律丢"
+        );
+
+        // 撞别的实体的名或别名 → 拒,且盘上不动
+        for clash in ["聚凡科技", "聚凡"] {
+            let err = set_note_entity_aliases(&dir, "n1", "ent_1", &[clash.into()]).unwrap_err().to_string();
+            assert!(err.contains("合并"), "撞名要指路合并: {err}");
+        }
+        assert_eq!(
+            load_aing_file(&dir).unwrap().unwrap().entities.iter().find(|e| e.id == "ent_1").unwrap().aliases,
+            vec!["郎工".to_string()],
+            "被拒时别名表原样保留"
+        );
+        assert!(set_note_entity_aliases(&dir, "n1", "ent_9", &[]).is_err(), "不存在的实体要报错");
     }
 
     #[test]
