@@ -1159,7 +1159,7 @@ pub fn add_note_entities(note_dir: &Path, note_id: &str, entries: &[(String, Str
 }
 
 /// 改名:旧名转为别名保留(正文原文仍是旧写法,提及区间不动——高亮不丢)。
-/// 撞上另一个实体的名/别名时拒绝(该走合并,二期)。返回 (旧名, kind) 供命令层
+/// 撞上另一个实体的名/别名时拒绝(该走 merge_note_entities)。返回 (旧名, kind) 供命令层
 /// 做全局账本同步。
 pub fn rename_note_entity(
     note_dir: &Path,
@@ -1177,7 +1177,9 @@ pub fn rename_note_entity(
                     .chain(e.aliases.iter())
                     .any(|n| entity_norm(n) == entity_norm(new_name))
         });
-        anyhow::ensure!(!clash, "已有同名实体「{new_name}」;如是同一个请先删除本条(合并功能二期提供)");
+        // 二期起合并已可用:撞名不再让用户"先删一条"(那会丢掉本条的提及与关系),
+        // 改为指路合并——浮层上就有"合并到…"。
+        anyhow::ensure!(!clash, "已有同名实体「{new_name}」;如果是同一个,用浮层里的「合并到…」把它们并起来");
         let ent = doc
             .entities
             .iter_mut()
@@ -1191,6 +1193,102 @@ pub fn rename_note_entity(
             ent.aliases.push(old);
         }
         ent.name = new_name.to_string();
+        recompute_all_mentions(note_id, doc);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// 合并(二期,2026-09-19):把 `loser_id` 并进 `winner_id`,只动本篇 aing.json。
+/// 返回 (败方名, 胜方名, 胜方 kind) 供命令层做全局账本同步。
+///
+/// 语义(与删除的区别是**不丢东西**):
+/// - 败方的名字与别名全部转为胜方的别名(归一去重)。正文原文仍是旧写法,靠别名
+///   继续被认出来——这与改名"旧名转别名"是同一条不丢高亮的纪律。
+/// - 败方的提及改指胜方(不是删掉):合并的本意就是"这两处说的是同一个人/物",
+///   删掉提及等于把已经认出来的半数提及又扔了。
+/// - 以败方为端点的关系改指胜方;改完可能与既有关系撞成同一条三元组(主+谓+宾),
+///   此时合并证据而不是留两条重复边。自反关系(改完主宾同一)直接丢:"X 与 X 有关"
+///   不是事实,是合并的副产物。
+/// - 胜方缺 kind 时继承败方的(手动新增的实体可能留空)。
+///
+/// 拒绝自合并;两个 id 都必须存在于本篇。
+pub fn merge_note_entities(
+    note_dir: &Path,
+    note_id: &str,
+    loser_id: &str,
+    winner_id: &str,
+) -> anyhow::Result<(String, String, String)> {
+    anyhow::ensure!(loser_id != winner_id, "不能把实体合并到它自己");
+    let mut out = (String::new(), String::new(), String::new());
+    update_refined(note_dir, |doc| {
+        let loser = doc
+            .entities
+            .iter()
+            .find(|e| e.id == loser_id)
+            .ok_or_else(|| anyhow::anyhow!("本篇没有该实体: {loser_id}"))?
+            .clone();
+        let widx = doc
+            .entities
+            .iter()
+            .position(|e| e.id == winner_id)
+            .ok_or_else(|| anyhow::anyhow!("本篇没有该实体: {winner_id}"))?;
+
+        {
+            let winner = &mut doc.entities[widx];
+            // 败方的名与别名 → 胜方别名。已有的(含胜方本名)跳过,按归一键去重。
+            let mut known: std::collections::BTreeSet<String> =
+                std::iter::once(&winner.name).chain(winner.aliases.iter()).map(|n| entity_norm(n)).collect();
+            for n in std::iter::once(&loser.name).chain(loser.aliases.iter()) {
+                if n.trim().is_empty() || !known.insert(entity_norm(n)) {
+                    continue;
+                }
+                winner.aliases.push(n.clone());
+            }
+            if winner.kind.trim().is_empty() {
+                winner.kind = loser.kind.clone();
+            }
+            out = (loser.name.clone(), winner.name.clone(), winner.kind.clone());
+        }
+
+        doc.entities.retain(|e| e.id != loser_id);
+        for p in doc.paragraphs.iter_mut() {
+            for m in p.mentions.iter_mut() {
+                if m.entity == loser_id {
+                    m.entity = winner_id.to_string();
+                }
+            }
+        }
+        for r in doc.relations.iter_mut() {
+            if r.subject == loser_id {
+                r.subject = winner_id.to_string();
+            }
+            if r.object == loser_id {
+                r.object = winner_id.to_string();
+            }
+        }
+        // 自反边(合并的副产物)先丢,再按三元组并重复边的证据。
+        doc.relations.retain(|r| r.subject != r.object);
+        let mut merged: Vec<crate::store::RelationFact> = Vec::with_capacity(doc.relations.len());
+        for r in std::mem::take(&mut doc.relations) {
+            match merged
+                .iter_mut()
+                .find(|x| x.subject == r.subject && x.object == r.object && x.predicate == r.predicate)
+            {
+                Some(keep) => {
+                    keep.evidence.extend(r.evidence);
+                    keep.subject_mentions.extend(r.subject_mentions);
+                    keep.object_mentions.extend(r.object_mentions);
+                    // 两条独立证据指向同一事实 → 取更高的置信度,不做平均:
+                    // 平均会让"一条强证据 + 一条弱证据"比单独那条强证据还不可信。
+                    keep.confidence = keep.confidence.max(r.confidence);
+                }
+                None => merged.push(r),
+            }
+        }
+        doc.relations = merged;
+        // 证据/提及去重与稳定 id 重算交给 ensure_graph_ids(recompute_all_mentions 内),
+        // 与新增/改名走同一条收口路径,不在这里各自重排一套。
         recompute_all_mentions(note_id, doc);
         Ok(())
     })?;
@@ -1474,8 +1572,9 @@ mod tests {
         assert_eq!(e1.name, "巨凡科技");
         assert!(e1.aliases.iter().any(|a| a == "聚凡科技"), "旧名转别名");
         assert!(d.paragraphs[0].mentions.iter().any(|m| m.entity == "ent_1"), "提及不丢(按别名命中)");
-        // 撞名拒绝
-        assert!(rename_note_entity(&dir, "n1", "ent_1", "灯塔计划").is_err());
+        // 撞名拒绝(该走合并,文案里指路)
+        let err = rename_note_entity(&dir, "n1", "ent_1", "灯塔计划").unwrap_err().to_string();
+        assert!(err.contains("合并"), "撞名要指路合并而不是让人先删一条: {err}");
 
         // 改类型
         set_note_entity_kind(&dir, "ent_1", "project").unwrap();
@@ -1488,6 +1587,106 @@ mod tests {
         assert!(d.paragraphs[0].mentions.iter().all(|m| m.entity != "ent_1"));
         assert!(d.relations.is_empty(), "以它为端点的关系一并移除");
         assert!(d.revision >= 4, "每次锁内编辑推进 revision");
+    }
+
+    /// 合并(二期):败方的名与别名进胜方别名、提及**改指**胜方(不是删)、关系端点改写,
+    /// 撞成同一三元组的合证据、自反边丢弃;胜方 kind 为空时继承败方。
+    ///
+    /// 为什么专门断言"提及改指而不是删掉":合并的本意就是"这两处说的是同一个",
+    /// 把败方提及删掉等于把已经认出来的那一半又扔回未识别——那是删除的语义,不是合并的。
+    #[test]
+    fn merge_note_entities_absorbs_aliases_mentions_and_relations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("20260101-000001");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rel = |id: &str, subj: &str, obj: &str, conf: f64| crate::store::RelationFact {
+            id: id.into(),
+            subject: subj.into(),
+            predicate: crate::store::RelationPredicate { kind: "mentions".into(), label: None },
+            object: obj.into(),
+            confidence: conf,
+            valid_from: None,
+            valid_to: None,
+            subject_mentions: vec![],
+            object_mentions: vec![],
+            evidence: vec![],
+        };
+        let mut doc = RefinedDoc {
+            llm_failed_paragraphs: vec![],
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![
+                Entity { id: "ent_1".into(), kind: "person".into(), name: "郎佳奇".into(), aliases: vec!["小郎".into()] },
+                Entity { id: "ent_2".into(), kind: String::new(), name: "郎工".into(), aliases: vec![] },
+                Entity { id: "ent_3".into(), kind: "org".into(), name: "聚凡科技".into(), aliases: vec![] },
+            ],
+            graph_extraction: None,
+            relations: vec![
+                rel("r1", "ent_1", "ent_3", 0.4),
+                rel("r2", "ent_2", "ent_3", 0.9), // 合并后与 r1 撞同一三元组 → 并证据取高置信
+                rel("r3", "ent_1", "ent_2", 0.8), // 合并后自反 → 丢
+            ],
+            graph_support_mentions: vec![],
+            revision: 0,
+            stale: false,
+            paragraphs: vec![RefinedParagraph {
+                speaker: "S1".into(),
+                name: None,
+                person_id: None,
+                start_ms: 0,
+                end_ms: 5_000,
+                text: "郎佳奇和郎工是同一个人,都在聚凡科技".into(),
+                source_seqs: vec![],
+                mentions: vec![],
+            }],
+        };
+        // 提及由 compute_mentions 物化(与新增/改名后 recompute_all_mentions 同一条路径),
+        // 光 ensure_graph_ids 只补 id、不会凭空算出提及。
+        let ms = crate::refine::compute_mentions(&doc.paragraphs, &doc.entities);
+        for (p, m) in doc.paragraphs.iter_mut().zip(ms) {
+            p.mentions = m;
+        }
+        crate::store::aing_graph::ensure_graph_ids("n1", &mut doc);
+        write_refined_atomic(&dir, &doc).unwrap();
+        // 合并前:两个实体各自被正文命中
+        let d = load_aing_file(&dir).unwrap().unwrap();
+        let before_1 = d.paragraphs[0].mentions.iter().filter(|m| m.entity == "ent_1").count();
+        let before_2 = d.paragraphs[0].mentions.iter().filter(|m| m.entity == "ent_2").count();
+        assert!(before_1 > 0 && before_2 > 0, "前提:两边都有提及");
+
+        let (loser, winner, kind) = merge_note_entities(&dir, "n1", "ent_2", "ent_1").unwrap();
+        assert_eq!((loser.as_str(), winner.as_str(), kind.as_str()), ("郎工", "郎佳奇", "person"));
+
+        let d = load_aing_file(&dir).unwrap().unwrap();
+        assert!(d.entities.iter().all(|e| e.id != "ent_2"), "败方出表");
+        let w = d.entities.iter().find(|e| e.id == "ent_1").unwrap();
+        assert!(w.aliases.iter().any(|a| a == "郎工"), "败方本名转胜方别名");
+        assert!(w.aliases.iter().any(|a| a == "小郎"), "败方原有别名也带过来");
+        // 提及:败方那些**改指**胜方,总数不减(不是删)
+        assert!(d.paragraphs[0].mentions.iter().all(|m| m.entity != "ent_2"));
+        assert_eq!(
+            d.paragraphs[0].mentions.iter().filter(|m| m.entity == "ent_1").count(),
+            before_1 + before_2,
+            "败方提及应改指胜方而不是被丢掉"
+        );
+        // 关系:自反丢弃、重复三元组并成一条且取高置信
+        assert_eq!(d.relations.len(), 1, "自反边丢、重复边并: {:?}", d.relations);
+        let r = &d.relations[0];
+        assert_eq!((r.subject.as_str(), r.object.as_str()), ("ent_1", "ent_3"));
+        assert!((r.confidence - 0.9).abs() < 1e-9, "取更高的置信度,不做平均");
+
+        // 空 kind 的一方当胜方时继承败方 kind
+        let (_l, _w, k) = merge_note_entities(&dir, "n1", "ent_1", "ent_3").unwrap();
+        assert_eq!(k, "org", "胜方有 kind 就保留自己的");
+        assert!(merge_note_entities(&dir, "n1", "ent_3", "ent_3").is_err(), "不能自合并");
+        assert!(merge_note_entities(&dir, "n1", "ent_9", "ent_3").is_err(), "不存在的实体要报错");
     }
 
     #[test]

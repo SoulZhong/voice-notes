@@ -332,6 +332,10 @@ export const noteEntityDelete = (id: string, entityId: string) =>
 /** 改类型(仅本篇,重建传播)。 */
 export const noteEntitySetKind = (id: string, entityId: string, kind: string) =>
   invoke<void>("note_entity_set_kind", { id, entityId, kind });
+/** 合并(二期):把 entityId 并进 targetId——提及与关系改挂目标、名字转目标别名、
+ *  本条出表;非人实体同步全局治理账本(复用图谱 merge)。 */
+export const noteEntityMerge = (id: string, entityId: string, targetId: string) =>
+  invoke<void>("note_entity_merge", { id, entityId, targetId });
 
 /** 给人物档案补邮箱(与会人指认学习回路;幂等)。 */
 export const personAddEmail = (personId: string, email: string) =>

@@ -15,7 +15,9 @@
     onRename,
     onDelete,
     onSetKind,
+    onMerge,
     onAdd,
+    graphHref,
   }: {
     entities: Entity[];
     /** 实体 id → 本篇提及数(排序与「提及 n 次」展示用)。 */
@@ -25,8 +27,12 @@
     onRename?: (id: string, name: string) => Promise<void>;
     onDelete?: (id: string) => Promise<void>;
     onSetKind?: (id: string, kind: string) => Promise<void>;
+    /** 合并(二期):把 id 并进 targetId。本篇立即合,全局账本由后端同步。 */
+    onMerge?: (id: string, targetId: string) => Promise<void>;
     /** 批量新增:[name, kind][]。 */
     onAdd?: (entries: [string, string][]) => Promise<void>;
+    /** 实体 id → 知识图谱链接(解析不到全局 id 的返回 null,不出这个入口)。 */
+    graphHref?: (id: string) => string | null;
   } = $props();
 
   /** 展示类型白名单与配色/标签:统一取自 $lib/entityKind(唯一真值源)。
@@ -54,17 +60,37 @@
   let addKind = $state("person");
   let busyErr = $state<string | null>(null);
 
+  // 合并浮层:展开后在本篇其它实体里挑一个当"并进去"的目标(胜方)。
+  let mergeOpen = $state(false);
+  let mergeQuery = $state("");
+
   export function closeAll() {
     editingId = null;
     addOpen = false;
+    mergeOpen = false;
+    mergeQuery = "";
     busyErr = null;
   }
 
   function openEdit(e: Entity) {
     addOpen = false;
+    mergeOpen = false;
+    mergeQuery = "";
     editingId = e.id;
     editingName = e.name;
     busyErr = null;
+  }
+
+  /** 合并候选:本篇其它全部实体(**不受 chip 行的 12 个折叠上限约束**——要并的那个
+      很可能正躲在「+N」里),按名字过滤;同名的排前面,那是最常见的合并动机。 */
+  function mergeTargets(self: Entity): Entity[] {
+    const q = mergeQuery.trim().toLowerCase();
+    const same = (e: Entity) => e.name.trim().toLowerCase() === self.name.trim().toLowerCase();
+    return entities
+      .filter((e) => e.id !== self.id && e.name.trim())
+      .filter((e) => !q || e.name.toLowerCase().includes(q) || (e.aliases ?? []).some((a) => a.toLowerCase().includes(q)))
+      .sort((a, b) => Number(same(b)) - Number(same(a)) || (counts[b.id] ?? 0) - (counts[a.id] ?? 0))
+      .slice(0, 8);
   }
 
   async function act(fn: () => Promise<void>) {
@@ -148,11 +174,45 @@
               {/each}
             </div>
             <div class="ent-actions">
+              {#if onMerge}
+                <button class="ent-act" class:on={mergeOpen} onclick={() => { mergeOpen = !mergeOpen; mergeQuery = ""; }}>
+                  {t("notes.entities.merge")}
+                </button>
+              {/if}
+              {#if graphHref?.(e.id)}
+                <a class="ent-act" href={graphHref(e.id)}>{t("notes.entities.openGraph")}</a>
+              {/if}
               <button class="ent-del" onclick={() => onDelete && void act(() => onDelete(e.id))}>
                 {t("notes.entities.delete")}
               </button>
-              <span class="ent-hint">{t("notes.entities.renameHint")}</span>
             </div>
+            {#if mergeOpen}
+              <!-- 合并目标选择:并进谁。方向刻意是"本条并进目标"(本条消失),
+                   与浮层标题就是本条这件事一致,不做反向,免得点错把留下的那个删了。 -->
+              <div class="ent-merge">
+                <p class="ent-hint">{t("notes.entities.mergeHint", { name: e.name })}</p>
+                <input
+                  class="ent-input"
+                  placeholder={t("notes.entities.mergeSearch")}
+                  bind:value={mergeQuery}
+                  onkeydown={(ev) => { if (ev.key === "Escape") { mergeOpen = false; } }}
+                />
+                {#each mergeTargets(e) as tgt (tgt.id)}
+                  {@const tk = kindOf(tgt.kind)}
+                  <button
+                    class="ent-merge-item"
+                    onclick={() => onMerge && void act(() => onMerge(e.id, tgt.id))}
+                  >
+                    <span class="ent-chip-mini" style="background: {tk?.tint}; color: {tk?.ink}">{tgt.name}</span>
+                    {#if (counts[tgt.id] ?? 0) > 0}<span class="ent-n">{counts[tgt.id]}</span>{/if}
+                  </button>
+                {:else}
+                  <p class="ent-hint">{t("notes.entities.mergeNone")}</p>
+                {/each}
+              </div>
+            {:else}
+              <span class="ent-hint">{t("notes.entities.renameHint")}</span>
+            {/if}
             {#if busyErr}<div class="ent-err">{busyErr}</div>{/if}
           </div>
         {/if}
@@ -315,12 +375,62 @@
     border-color: var(--accent);
     background: var(--accent-tint);
   }
+  /* 动作行:合并 / 打开图谱 / 删除。flex-wrap 让窄浮层里换行而不是把药丸压扁——
+     此前 space-between + 不可换行的提示文字把「从本篇删除」挤成了两行(实测截图)。 */
   .ent-actions {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 0.6rem;
+    flex-wrap: wrap;
+    gap: 0.4rem;
     margin-top: 0.5rem;
+  }
+  /* 中性动作药丸(合并 / 打开图谱):与危险色的删除拉开,同尺寸同形状。 */
+  .ent-act {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.12em 0.6em;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    white-space: nowrap;
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .ent-act:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .ent-act.on {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  /* 合并目标选择区 */
+  .ent-merge {
+    margin-top: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .ent-merge-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    border: none;
+    background: transparent;
+    border-radius: var(--radius-sm);
+    padding: 0.2em 0.3em;
+    cursor: pointer;
+    text-align: left;
+  }
+  .ent-merge-item:hover {
+    background: var(--surface-soft);
+  }
+  .ent-chip-mini {
+    border-radius: var(--radius-full);
+    padding: 0.1em 0.55em;
+    font-size: 0.78rem;
+    white-space: nowrap;
   }
   .ent-del {
     border: 1px solid var(--danger-line);
@@ -329,6 +439,10 @@
     border-radius: var(--radius-full);
     padding: 0.12em 0.6em;
     font-size: 0.75rem;
+    line-height: 1.5;
+    /* 「从本篇删除」六个字不得被挤断行(截图实证) */
+    white-space: nowrap;
+    margin-left: auto;
     cursor: pointer;
   }
   .ent-del:hover {
@@ -336,8 +450,11 @@
     color: var(--danger-ink);
   }
   .ent-hint {
+    display: block;
+    margin-top: 0.4rem;
     color: var(--ink-faint);
     font-size: 0.72rem;
+    line-height: 1.5;
   }
   .ent-err {
     margin-top: 0.4rem;
