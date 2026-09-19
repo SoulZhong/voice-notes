@@ -3852,11 +3852,21 @@
     outline: 2px solid var(--accent);
     border-radius: var(--radius-sm);
   }
-  /* 实体提及高亮:正文单色,静态无底(不染正文),hover 才浮 accent-tint 底 + accent 字。
+  /* 实体提及高亮:常驻一层极淡的 accent-tint-soft 底(2026-09-19 用户点名改)。
+     此前是「静态无底,hover 才显形」——顾虑是别把正文染花,但代价太大:一篇 83 处
+     提及在页面上完全看不出来,人以为实体识别没生效(实际 offset 全都精准命中),
+     只能靠顶部实体行的「定位」按钮一处处跳。常驻底色让"哪些词被认出来了"一眼可见。
+     浓度必须停在 soft 这一档:再浓就和 hover / 实体定位 / 当前播放段那一档
+     (accent-tint)撞车,那三层信息就没法靠深浅区分了(见 app.css 的令牌注释)。
      :global 原因同上——原始稿(.md-seg 内)与修订稿(NodeView 的 .md-para 内)共用同一套
      class,两者都是 PM 命令式创建的 DOM,没有 Svelte scope hash。 */
   .transcript :global(.entity-mention) {
+    background: var(--accent-tint-soft);
     border-radius: var(--radius-sm);
+    /* 横向撑开一点,底色块不贴着字;负外边距抵掉,密排正文的字距不被推开。
+       纵向只给 0.05em:行高 1.7 的中文稿里再多就会和上下行的底色块糊在一起。 */
+    padding: 0.05em 0.15em;
+    margin: 0 -0.05em;
     cursor: default;
     transition:
       background 120ms ease,
