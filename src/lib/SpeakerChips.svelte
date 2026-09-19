@@ -556,11 +556,16 @@
                 {t("speakers.chipMe")}
               </button>
               {#if onUnlink && speakers[id]?.person_id}
+                <!-- 取消关联:文案里点名当前关联的是谁(2026-09-20 用户点名)。
+                     原文案「取消关联人物」不说是哪一个——而用到这一行的场景恰恰是
+                     "它关错人了",用户需要先确认关的是谁才敢按。副标题说明这一下
+                     不删段落、不造新人物,正是"关错了但又不想新建人物"该走的路。 -->
                 <button class="row" onclick={() => commitUnlink(id)}>
                   <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                     <path d="M6.5 9.5 4.8 11.2a2.4 2.4 0 0 1-3.4-3.4l1.7-1.7M9.5 6.5l1.7-1.7a2.4 2.4 0 0 1 3.4 3.4l-1.7 1.7M6 10l4-4" />
                   </svg>
-                  {t("speakers.chipUnlink")}
+                  {t("speakers.chipUnlinkNamed", { name: label(id) })}
+                  <span class="row-sub">{t("speakers.chipUnlinkSub")}</span>
                 </button>
               {/if}
               {#if onDelete && blockedReason}
