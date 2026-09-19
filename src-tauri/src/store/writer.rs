@@ -77,9 +77,33 @@ pub fn is_default_title(t: &str) -> bool {
     false
 }
 
+/// 分配一个新笔记目录:id = 本地时间 `YYYYmmdd-HHMMSS`(同秒冲突加 `-2`/`-3` 后缀),
+/// 建出目录并返回 `(id, dir)`。录制建档(`create`)与导入建档(`crate::import`)共用
+/// 同一份 id 规则——两边各写一份必然漂移,而同秒发起的"开录"与"导入"正是要靠这条
+/// 唯一性(先建目录者占名,后来者顺延)才不会撞进同一个目录。
+pub(crate) fn alloc_note_dir(
+    notes_dir: &Path,
+    now: &DateTime<Local>,
+) -> anyhow::Result<(String, PathBuf)> {
+    std::fs::create_dir_all(notes_dir)?;
+    let base = now.format("%Y%m%d-%H%M%S").to_string();
+    let mut id = base.clone();
+    let mut n = 1;
+    let dir = loop {
+        let d = notes_dir.join(&id);
+        if !d.exists() {
+            break d;
+        }
+        n += 1;
+        id = format!("{base}-{n}");
+    };
+    std::fs::create_dir(&dir)?;
+    Ok((id, dir))
+}
+
 /// 同日重名去重:「周二晚上的会议」已存在 → 「周二晚上的会议 2」。只扫同日(id 前缀
 /// 同 YYYYmmdd)兄弟目录的 meta 标题,一天内笔记数量级小,线性扫可忽略。
-fn unique_default_title(notes_dir: &Path, now: &DateTime<Local>) -> String {
+pub(crate) fn unique_default_title(notes_dir: &Path, now: &DateTime<Local>) -> String {
     let base = default_title(now);
     let day = now.format("%Y%m%d").to_string();
     let mut taken: Vec<String> = Vec::new();
@@ -112,19 +136,7 @@ impl NoteWriter {
     /// 在 notes_dir 下建会议文件夹（id = 本地时间 YYYYmmdd-HHMMSS，同秒冲突加 -2/-3 后缀），
     /// 写入 state=recording 的 meta，打开 segments.jsonl。
     pub fn create(notes_dir: &Path, now: DateTime<Local>) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(notes_dir)?;
-        let base = now.format("%Y%m%d-%H%M%S").to_string();
-        let mut id = base.clone();
-        let mut n = 1;
-        let dir = loop {
-            let d = notes_dir.join(&id);
-            if !d.exists() {
-                break d;
-            }
-            n += 1;
-            id = format!("{base}-{n}");
-        };
-        std::fs::create_dir(&dir)?;
+        let (id, dir) = alloc_note_dir(notes_dir, &now)?;
         // 目录已定、segments 句柄未开:此处取锁(有界重试吸收瞬时竞争,见 NoteLock::acquire),
         // 全部重试仍拿不到说明另一实例正占着本笔记。
         let lock = super::notelock::NoteLock::acquire(&dir)
@@ -142,6 +154,7 @@ impl NoteWriter {
             calendar: None,
             calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
+            imported_from: None, // 录制建档恒 None;导入走 crate::import::create_note
         };
         write_meta_atomic(&dir, &meta)?;
         let file = OpenOptions::new()

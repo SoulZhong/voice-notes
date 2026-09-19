@@ -124,7 +124,7 @@ Let a local agent (Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CL
 
 | Surface | What it is | When to use |
 | --- | --- | --- |
-| **MCP server** | The standard agent tool protocol, 15 tools (notes / knowledge graph / recording status & control / re-transcription) | Preferred, for MCP-capable agents |
+| **MCP server** | The standard agent tool protocol (notes / knowledge graph / recording status & control / re-transcription / audio import) | Preferred, for MCP-capable agents |
 | **Command line (CLI)** | The same query capabilities as commands, with `--json` | Scripts, CI, or as a fallback when an agent has no MCP configured |
 | **Claude Code skill** | Teaches Claude Code when and how to combine the tools above (recap / weekly-summary / search workflows) | A nice-to-have so Claude works out of the box |
 
@@ -162,7 +162,7 @@ Three ways to register (pick one):
    args = ["mcp", "serve"]
    ```
 
-The 15 tools:
+The tools:
 
 | Tool | Purpose | Prerequisite |
 | --- | --- | --- |
@@ -177,9 +177,10 @@ The 15 tools:
 | `get_live_transcript` | Live transcript of the in-progress session | App running |
 | `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | Control recording | App running, **and** "Allow AI to control recording" enabled |
 | `retranscribe_note` | Re-transcribe a completed note from its on-disk audio (overwrites the raw transcript, auto-backup; async start) | App running, **and** "Allow AI to control recording" enabled |
-| `retranscribe_status` | Current re-transcription task (note_id and stage; running=false when idle); includes the last task's terminal outcome (last) | App running |
+| `retranscribe_status` | Current re-transcription task (note_id and stage; running=false when idle); includes the last task's terminal outcome (last); audio import shares this slot for its transcription stage | App running |
+| `import_audio` | Import a local audio file as a note (decode and create the note, then transcribe + identify speakers + AI cleanup in the background, same chain as after a recording stops) | App running, **and** "Allow AI to control recording" enabled |
 
-The seven note and graph tools read local data files directly and work even when the app is closed; recording status, live transcript, the four recording controls, and re-transcription go through an in-app local socket and need the app running.
+The seven note and graph tools read local data files directly and work even when the app is closed; recording status, live transcript, the four recording controls, re-transcription, and audio import go through an in-app local socket and need the app running.
 
 ### Query from the command line (no MCP needed)
 

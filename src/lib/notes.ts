@@ -43,6 +43,8 @@ export type NoteMeta = {
   /** 本场转写实际用的识别引擎("firered"/"sense_voice"/…,云端记 "cloud:厂商")。
       后端 2026-08-14 起每场落盘;更早的笔记没有这个字段。 */
   asr_engine?: string | null;
+  /** 导入笔记的来源文件名(含扩展名);录音产生的笔记没有这个字段。 */
+  imported_from?: string | null;
 };
 
 export type SegmentRecord = {
@@ -386,6 +388,15 @@ export const noteRefining = (id: string) => invoke<boolean>("note_refining", { i
 /** 发起文件重转写(破坏性:覆盖原始逐字稿,后端自动备份)。input: "dual" | "mixed"。 */
 export const retranscribeNote = (id: string, input: "dual" | "mixed", engine?: string) =>
   invoke<void>("retranscribe_note", { id, input, engine: engine ?? null });
+/** 可导入的音频扩展名。与后端 import::SUPPORTED_EXTS 同源(改一边要改两边:
+ *  这里只喂文件选择器的过滤器,真正的入口校验在后端,前端放宽也进不去)。 */
+export const IMPORT_EXTS = ["mp3", "m4a", "m4b", "aac", "wav", "aif", "aiff", "caf", "mp4", "flac"];
+
+/** 导入本地音频文件建笔记。返回新笔记 id;转写在后台继续,进度走 "retranscribe" 事件
+ *  (导入的后半程就是一次离线转写,复用同一套状态与事件,见后端 do_import_audio)。
+ *  解码期间(可能数秒)这个 promise 一直挂着,调用方自行显示忙态。 */
+export const importAudio = (path: string) => invoke<string>("import_audio", { path });
+
 /** 当前重转写任务;空闲 null。挂载时回填(事件只覆盖在页期间)。 */
 export const retranscribeStatus = () =>
   invoke<{ note_id: string; stage: string } | null>("retranscribe_status");

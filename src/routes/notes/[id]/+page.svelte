@@ -2688,6 +2688,13 @@
             {#if note.meta.state === "recording"}
               <span class="state interrupted">{t("notes.state.interrupted")}</span>
             {/if}
+            <!-- 导入来源:这篇的音频不是本机录的。标出来是因为它决定了用户该怎么读
+                 这篇——单轨、没有系统声分离、没有回声消除,说话人全靠声纹分。 -->
+            {#if note.meta.imported_from}
+              <span class="state imported" title={t("notes.imported.title", { file: note.meta.imported_from })}
+                >{t("notes.imported.badge")}</span
+              >
+            {/if}
           </p>
           {#if calPerm !== "unavailable"}
             <p class="meta cal-row">
@@ -4233,6 +4240,16 @@
   .state.interrupted {
     background: var(--warning-line);
     color: var(--warning-ink);
+    font-size: 0.7em;
+    font-weight: 500;
+    border-radius: var(--radius-md);
+    padding: 0.1em 0.45em;
+    margin-left: 0.4em;
+  }
+  /* 导入来源:中性标记(不是警告),只说明出身,同尺寸与中断标同行不打架 */
+  .state.imported {
+    background: var(--surface-press);
+    color: var(--ink-secondary);
     font-size: 0.7em;
     font-weight: 500;
     border-radius: var(--radius-md);

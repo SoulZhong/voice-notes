@@ -94,6 +94,13 @@ pub struct NoteMeta {
     /// 不落盘就无从对证是哪个引擎转的这场。serde default 兼容旧 meta。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asr_engine: Option<String>,
+    /// 导入笔记的来源文件名(含扩展名);录制产生的笔记恒为 None。用途有二:
+    /// ①笔记页头部据此亮「导入」标(hover 出文件名)——这条对用户是要紧的:
+    /// 导入笔记是单轨,没有系统声分离、没有回声消除,说话人全靠声纹分,读这篇的
+    /// 预期与双轨录制不一样;②排障时一眼看出这篇的音频不是本机录的。
+    /// serde default 兼容旧 meta。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<String>,
 }
 
 /// 日历事件快照(P3):落盘即快照——title/attendees 是匹配时刻的副本,不依赖

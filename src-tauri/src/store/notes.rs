@@ -1215,6 +1215,7 @@ fn fallback_meta(dir: &Path) -> NoteMeta {
         calendar: None,
         calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
+            imported_from: None,
     }
 }
 
@@ -1302,6 +1303,7 @@ mod tests {
                 calendar: None,
                 calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
+                imported_from: None,
             })
             .unwrap(),
         )
@@ -1352,6 +1354,7 @@ mod tests {
                 calendar_cleared: false,
                 attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
+                imported_from: None,
             })
             .unwrap(),
         )
@@ -1397,6 +1400,7 @@ mod tests {
                     calendar: None,
                     calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                     asr_engine: None,
+                    imported_from: None,
                 })
                 .unwrap(),
             )
@@ -1435,6 +1439,7 @@ mod tests {
                 calendar: None,
                 calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
+                imported_from: None,
             })
             .unwrap(),
         )
@@ -1467,6 +1472,7 @@ mod tests {
                 calendar: None,
                 calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
+                imported_from: None,
             })
             .unwrap(),
         )
@@ -2245,6 +2251,7 @@ mod tests {
             calendar: None,
             calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
+            imported_from: None,
         };
         write_meta_atomic(&dir, &meta).unwrap();
 
