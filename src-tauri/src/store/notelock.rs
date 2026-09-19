@@ -17,6 +17,15 @@ use std::path::Path;
 
 pub const LOCK_FILE: &str = ".note.lock";
 
+/// meta.json 专用锁。与 `.note.lock` **分开**是刻意的(2026-09-19 用户实报):
+/// `.note.lock` 是 2026-07-13 事故的产物,保护的是 segments.jsonl / speakers.json
+/// 的整表重写;而与会人员、标题、日程这些字段只读写 meta.json,与它没有一个字节
+/// 交集。两者共用一把锁的后果是——一场 38 分钟录音的离线转写(worker 全程持
+/// `.note.lock` 十几分钟)会把"填个与会人员"一并锁死,并报出"该笔记正被占用
+/// (录制或转码中,可能来自另一个应用实例)":三个词全不对,用户也无事可做。
+/// 两种资源两把锁,谁也不挡谁;meta 自己的读-改-写仍靠这把锁跨进程互斥。
+pub const META_LOCK_FILE: &str = ".meta.lock";
+
 pub struct NoteLock {
     _file: File,
 }
@@ -33,6 +42,20 @@ impl NoteLock {
                 .create(true)
                 .write(true)
                 .open(dir.join(LOCK_FILE))
+        })
+    }
+
+    /// meta.json 专用锁的有界重试获取(语义同 [`acquire`],只是换一个锁文件)。
+    /// 锁序纪律:同时要两把锁时**先 `.note.lock` 后 `.meta.lock`**(目前只有
+    /// `finalize_interrupted` 需要两把——它读 segments 算时长、写 meta 置收尾态)。
+    /// 非阻塞 + 有界重试意味着即便顺序写反也只会失败返回,不会真的死锁;写下这条
+    /// 纪律是为了让失败也不发生。
+    pub fn acquire_meta(dir: &Path) -> std::io::Result<Option<NoteLock>> {
+        Self::acquire_opened(|| {
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(dir.join(META_LOCK_FILE))
         })
     }
 
