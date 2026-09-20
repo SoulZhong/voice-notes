@@ -691,9 +691,12 @@
     }
     const idx = entityLocate?.id === entId ? (entityLocate.idx + 1) % spans.length : 0;
     entityLocate = { id: entId, idx };
-    // 先清后加 + 强制回流:只有一处提及的实体连点两次时,目标 span 上的
-    // entity-located-current 还在,不重置的话 CSS 动画不会重新起跑——点了没反应。
-    for (const sp of spans) sp.classList.remove("entity-located", "entity-located-current");
+    // 清的是**整篇**的定位类,不只是本实体那几个:先点 A 再点 B 时,A 的 2.6s 清理
+    // 定时器会被下面的 clearTimeout 取消,只清 B 的话 A 的环会一直挂到正文重渲染。
+    // 顺带也解决"同一实体连点两次动画不重放"——目标 span 上的类被清掉再加回,
+    // 配合下面的强制回流,CSS 动画才会重新起跑。
+    for (const sp of transcriptEl?.querySelectorAll<HTMLElement>(".entity-mention") ?? [])
+      sp.classList.remove("entity-located", "entity-located-current");
     void spans[idx].offsetWidth;
     for (const sp of spans) sp.classList.add("entity-located");
     spans[idx].classList.add("entity-located-current");

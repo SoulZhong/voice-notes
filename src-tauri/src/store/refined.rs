@@ -1200,7 +1200,8 @@ pub fn rename_note_entity(
 }
 
 /// 合并(二期,2026-09-19):把 `loser_id` 并进 `winner_id`,只动本篇 aing.json。
-/// 返回 (败方名, 胜方名, 胜方 kind) 供命令层做全局账本同步。
+/// 返回 (败方名, 胜方名, 胜方 kind, 败方 kind) 供命令层做全局账本同步——两边的 kind
+/// 都要给:人实体不进知识账本这条纪律,败方是人同样成立(见 note_entity_merge)。
 ///
 /// 语义(与删除的区别是**不丢东西**):
 /// - 败方的名字与别名全部转为胜方的别名(归一去重)。正文原文仍是旧写法,靠别名
@@ -1218,9 +1219,9 @@ pub fn merge_note_entities(
     note_id: &str,
     loser_id: &str,
     winner_id: &str,
-) -> anyhow::Result<(String, String, String)> {
+) -> anyhow::Result<(String, String, String, String)> {
     anyhow::ensure!(loser_id != winner_id, "不能把实体合并到它自己");
-    let mut out = (String::new(), String::new(), String::new());
+    let mut out = (String::new(), String::new(), String::new(), String::new());
     update_refined(note_dir, |doc| {
         let loser = doc
             .entities
@@ -1248,17 +1249,19 @@ pub fn merge_note_entities(
             if winner.kind.trim().is_empty() {
                 winner.kind = loser.kind.clone();
             }
-            out = (loser.name.clone(), winner.name.clone(), winner.kind.clone());
+            out = (
+                loser.name.clone(),
+                winner.name.clone(),
+                winner.kind.clone(),
+                loser.kind.clone(),
+            );
         }
 
         doc.entities.retain(|e| e.id != loser_id);
-        for p in doc.paragraphs.iter_mut() {
-            for m in p.mentions.iter_mut() {
-                if m.entity == loser_id {
-                    m.entity = winner_id.to_string();
-                }
-            }
-        }
+        // 提及不在这里逐条改指:下面的 recompute_all_mentions 会整份重算并替换
+        // p.mentions——败方的提及之所以"改挂"到胜方,靠的是败方的名字已经进了胜方的
+        // 别名表,正文原写法照样被认出来。(此处曾有一段手工改指的循环,重算紧随其后,
+        // 写了等于没写;留着会让人以为 id 被保留了,实则全是新算的。)
         for r in doc.relations.iter_mut() {
             if r.subject == loser_id {
                 r.subject = winner_id.to_string();
@@ -1277,8 +1280,9 @@ pub fn merge_note_entities(
             {
                 Some(keep) => {
                     keep.evidence.extend(r.evidence);
-                    keep.subject_mentions.extend(r.subject_mentions);
-                    keep.object_mentions.extend(r.object_mentions);
+                    // 两端提及**不**在这里合并:合并后所有提及 id 都会重算,
+                    // 搬过来的旧 id 立刻失效。统一交给下方 relink_relation_mentions
+                    // 按证据区间重挂。
                     // 两条独立证据指向同一事实 → 取更高的置信度,不做平均:
                     // 平均会让"一条强证据 + 一条弱证据"比单独那条强证据还不可信。
                     keep.confidence = keep.confidence.max(r.confidence);
@@ -1287,12 +1291,62 @@ pub fn merge_note_entities(
             }
         }
         doc.relations = merged;
-        // 证据/提及去重与稳定 id 重算交给 ensure_graph_ids(recompute_all_mentions 内),
-        // 与新增/改名走同一条收口路径,不在这里各自重排一套。
+        // 重算提及(整份替换)。注意:mention_id 把 entity 也哈希进去,所以从败方改挂到
+        // 胜方的每一条提及**都会拿到新 id**——关系端点里存的还是旧 id,不重挂就全是
+        // 悬空引用(图谱治理页与重建出来的 relation_evidence 都解析不到)。
         recompute_all_mentions(note_id, doc);
+        relink_relation_mentions(doc);
         Ok(())
     })?;
     Ok(out)
+}
+
+/// 按证据区间重挂每条关系的两端提及 id。
+///
+/// 口径与 refine::relations::materialize 首次生成时**逐字一致**:某条证据所在段落里,
+/// 与证据区间有重叠、且实体等于关系主/宾的那些提及。实体表一变(合并/改名)提及 id
+/// 就会重算,这里据此把端点重新指到新 id 上,而不是把旧 id 留成悬空引用。
+fn relink_relation_mentions(doc: &mut RefinedDoc) {
+    if doc.relations.is_empty() {
+        return;
+    }
+    // 先按 (段下标) 取出提及快照:下面要同时可变借用 relations 与只读借用 paragraphs。
+    let by_paragraph: Vec<Vec<(String, String, usize, usize)>> = doc
+        .paragraphs
+        .iter()
+        .map(|p| {
+            p.mentions
+                .iter()
+                .map(|m| (m.id.clone(), m.entity.clone(), m.start, m.end))
+                .collect()
+        })
+        .collect();
+    for relation in doc.relations.iter_mut() {
+        let (mut subject, mut object) = (Vec::new(), Vec::new());
+        for evidence in &relation.evidence {
+            let Some(mentions) = by_paragraph.get(evidence.paragraph_index) else {
+                continue;
+            };
+            for (id, entity, start, end) in mentions {
+                // 与 relations::overlaps 同式:半开区间相交。
+                if *start >= evidence.end || evidence.start >= *end {
+                    continue;
+                }
+                if *entity == relation.subject {
+                    subject.push(id.clone());
+                }
+                if *entity == relation.object {
+                    object.push(id.clone());
+                }
+            }
+        }
+        subject.sort();
+        subject.dedup();
+        object.sort();
+        object.dedup();
+        relation.subject_mentions = subject;
+        relation.object_mentions = object;
+    }
 }
 
 /// 删除(仅本篇):实体、其全部提及(live 与 support)、以它为端点的本篇关系一并移除。
@@ -1730,8 +1784,13 @@ mod tests {
         let before_2 = d.paragraphs[0].mentions.iter().filter(|m| m.entity == "ent_2").count();
         assert!(before_1 > 0 && before_2 > 0, "前提:两边都有提及");
 
-        let (loser, winner, kind) = merge_note_entities(&dir, "n1", "ent_2", "ent_1").unwrap();
-        assert_eq!((loser.as_str(), winner.as_str(), kind.as_str()), ("郎工", "郎佳奇", "person"));
+        let (loser, winner, kind, loser_kind) =
+            merge_note_entities(&dir, "n1", "ent_2", "ent_1").unwrap();
+        assert_eq!(
+            (loser.as_str(), winner.as_str(), kind.as_str(), loser_kind.as_str()),
+            ("郎工", "郎佳奇", "person", ""),
+            "败方 kind 也要回给命令层:人实体不进账本这条纪律对败方同样成立"
+        );
 
         let d = load_aing_file(&dir).unwrap().unwrap();
         assert!(d.entities.iter().all(|e| e.id != "ent_2"), "败方出表");
@@ -1752,10 +1811,96 @@ mod tests {
         assert!((r.confidence - 0.9).abs() < 1e-9, "取更高的置信度,不做平均");
 
         // 空 kind 的一方当胜方时继承败方 kind
-        let (_l, _w, k) = merge_note_entities(&dir, "n1", "ent_1", "ent_3").unwrap();
+        let (_l, _w, k, _lk) = merge_note_entities(&dir, "n1", "ent_1", "ent_3").unwrap();
         assert_eq!(k, "org", "胜方有 kind 就保留自己的");
         assert!(merge_note_entities(&dir, "n1", "ent_3", "ent_3").is_err(), "不能自合并");
         assert!(merge_note_entities(&dir, "n1", "ent_9", "ent_3").is_err(), "不存在的实体要报错");
+    }
+
+    /// 合并之后关系两端的提及 id **不得悬空**(2026-09-21 合并前审核):mention_id 把
+    /// entity 一起哈希,所以败方那些提及改挂到胜方后 id 全是新的;关系里存的若还是
+    /// 旧 id,图谱治理页与重建出来的 relation_evidence 都解析不到那条证据。
+    #[test]
+    fn merge_relinks_relation_mentions_to_the_new_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("20260101-000003");
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = "郎工负责灯塔计划";
+        let mut doc = RefinedDoc {
+            llm_failed_paragraphs: vec![],
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "done".into() },
+            discarded_seqs: vec![],
+            entities: vec![
+                Entity { id: "ent_1".into(), kind: "person".into(), name: "郎佳奇".into(), aliases: vec![] },
+                Entity { id: "ent_2".into(), kind: "person".into(), name: "郎工".into(), aliases: vec![] },
+                Entity { id: "ent_3".into(), kind: "project".into(), name: "灯塔计划".into(), aliases: vec![] },
+            ],
+            graph_extraction: None,
+            relations: vec![crate::store::RelationFact {
+                id: "r1".into(),
+                subject: "ent_2".into(), // 败方做主语
+                predicate: crate::store::RelationPredicate { kind: "responsible_for".into(), label: None },
+                object: "ent_3".into(),
+                confidence: 0.9,
+                valid_from: None,
+                valid_to: None,
+                subject_mentions: vec![],
+                object_mentions: vec![],
+                evidence: vec![crate::store::RelationEvidence {
+                    id: "e1".into(),
+                    paragraph_index: 0,
+                    start: 0,
+                    end: text.chars().count(),
+                    quote: text.into(),
+                    source_seqs: vec![],
+                    source_hash: String::new(),
+                }],
+            }],
+            graph_support_mentions: vec![],
+            revision: 0,
+            stale: false,
+            paragraphs: vec![RefinedParagraph {
+                speaker: "S1".into(),
+                name: None,
+                person_id: None,
+                start_ms: 0,
+                end_ms: 5_000,
+                text: text.into(),
+                source_seqs: vec![],
+                mentions: vec![],
+            }],
+        };
+        let ms = crate::refine::compute_mentions(&doc.paragraphs, &doc.entities);
+        for (p, m) in doc.paragraphs.iter_mut().zip(ms) {
+            p.mentions = m;
+        }
+        crate::store::aing_graph::ensure_graph_ids("n1", &mut doc);
+        write_refined_atomic(&dir, &doc).unwrap();
+
+        merge_note_entities(&dir, "n1", "ent_2", "ent_1").unwrap();
+
+        let d = load_aing_file(&dir).unwrap().unwrap();
+        let live: std::collections::BTreeSet<&str> = d.paragraphs[0]
+            .mentions
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        let relation = &d.relations[0];
+        assert_eq!(relation.subject, "ent_1", "主语端点改挂胜方");
+        assert!(!relation.subject_mentions.is_empty(), "主语端点必须重新挂上提及");
+        for id in relation.subject_mentions.iter().chain(&relation.object_mentions) {
+            assert!(
+                live.contains(id.as_str()),
+                "关系端点 {id} 在正文提及里查无此条——悬空引用"
+            );
+        }
     }
 
     /// 别名编辑(二期):加别名 → 正文里那个写法立刻被认出来;删别名 → 按它命中的
