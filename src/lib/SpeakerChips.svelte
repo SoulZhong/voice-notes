@@ -319,6 +319,10 @@
 
 {#if ids.length > 0}
   <div class="chips">
+    <!-- 行首标签(2026-09-20 用户点名):说话人行与实体行此前只靠 chip 形状区分,
+         两行叠在一起仍要想一下哪行是哪行。直接写出来最省事——标签压成弱色小字,
+         不与 chip 争视觉,只回答"这一行是什么"。 -->
+    <span class="row-label">{t("speakers.rowLabel")}</span>
     {#each visibleIds as id (id)}
       <!-- speaker-chip：同徽章色系(粉彩底+ink字),chip 本身就是色块。可编辑时点击
            在下方展开编辑面板(chip 保持原形,不原地变形成输入框)。 -->
@@ -661,6 +665,16 @@
     flex-wrap: wrap;
     gap: 0.5rem;
     margin: 0 0 0.75rem;
+  }
+  /* 行首标签:弱色小字,固定不收缩,永远待在第一行开头。align-self 顶对齐——
+     chip 换行成多行时标签仍贴着首行,不会被 align-items:center 拉到整块的垂直中间。 */
+  .row-label {
+    flex: none;
+    align-self: flex-start;
+    color: var(--ink-faint);
+    font-size: 0.74rem;
+    line-height: 1.9;
+    user-select: none;
   }
   /* speaker-chip：粉彩底(内联 style 按说话人取色) + ink 字 + rounded-full。
      relative:编辑面板以 chip 为锚点向下弹出。 */
