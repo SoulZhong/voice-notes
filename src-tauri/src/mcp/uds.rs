@@ -409,7 +409,7 @@ impl UdsBackend for AppBackend<'_> {
             // 这里提前到「点下去就说清」)。
             if let Some((rid, _)) = app.state::<crate::AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                 if rid == id {
-                    return Err(crate::tr!("该笔记正在重转写中", "This note is being re-transcribed"));
+                    return Err(crate::tr!("该笔记正在重新转文字", "This note is being re-transcribed"));
                 }
             }
             app.state::<crate::lifecycle::LifecycleHandle>()
