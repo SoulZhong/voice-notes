@@ -3126,31 +3126,19 @@
              自动备份为 segments.orig.jsonl),二段确认走 retransConfirm 胶囊。
              来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
              判定可用性并置灰+tooltip 给原因)。 -->
-        {#if retransConfirm}
-          <div class="confirm-capsule">
-            <span class="refine-warn">{t("notes.retrans.warn")}</span>
-            <button class="link danger" onclick={() => startRetranscribe("dual")}>
-              {t("notes.retrans.confirmDual")}
-            </button>
-            <button
-              class="link danger"
-              disabled={mixedReason !== null}
-              title={mixedReason ?? ""}
-              onclick={() => startRetranscribe("mixed")}
-            >
-              {t("notes.retrans.confirmMixed")}
-            </button>
-            <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
-          </div>
-        {:else}
+        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+        <div class="retrans-wrap" onclick={(e) => e.stopPropagation()}>
           <!-- 带文字的「重新分析」入口(2026-09-07 用户点名):此前是纯图标幽灵钮,
                和当年"拆分按钮在但没人找到"同病——重切段/重认人的算法升级后,
                这个入口是存量笔记受益的唯一通道,必须一眼可见。 -->
           <button
             class="retrans-btn"
+            class:open={retransConfirm}
+            aria-haspopup="menu"
+            aria-expanded={retransConfirm}
             disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
             title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
-            onclick={() => (retransConfirm = true)}
+            onclick={() => (retransConfirm = !retransConfirm)}
           >
             <svg class:spin={retranscribing} width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
@@ -3158,7 +3146,31 @@
             </svg>
             {retranscribing ? t("notes.retrans.runningShort") : t("notes.retrans.run")}
           </button>
-        {/if}
+          {#if retransConfirm}
+            <!-- 二段确认改成**锚定浮层**(2026-09-20 用户实报「设计粗糙、布局被改变」):
+                 原先是把按钮整个替换成一条横向胶囊,宽度是按钮的好几倍,一点就把
+                 吸顶操作栏顶变形。浮层挂在按钮下方、absolute 定位,开合不占版面;
+                 形态沿用本页导出菜单(同底色/同圆角/同投影),不另造一套。 -->
+            <div class="retrans-menu" role="menu">
+              <p class="retrans-menu-note">{t("notes.retrans.warn")}</p>
+              <button class="retrans-item" onclick={() => startRetranscribe("dual")}>
+                <span class="retrans-item-main">{t("notes.retrans.confirmDual")}</span>
+                <span class="retrans-item-sub">{t("notes.retrans.dualSub")}</span>
+              </button>
+              <button
+                class="retrans-item"
+                disabled={mixedReason !== null}
+                onclick={() => startRetranscribe("mixed")}
+              >
+                <span class="retrans-item-main">{t("notes.retrans.confirmMixed")}</span>
+                <span class="retrans-item-sub">{mixedReason ?? t("notes.retrans.mixedSub")}</span>
+              </button>
+              <button class="retrans-item quiet" onclick={() => (retransConfirm = false)}>
+                <span class="retrans-item-main">{t("notes.cancel")}</span>
+              </button>
+            </div>
+          {/if}
+        </div>
       </div>
     </div>
 
@@ -4054,21 +4066,78 @@
     flex: 1;
   }
   /* 重新 Aing 二段确认的警示语:warning 色小字,和确认/取消链接排一行 */
-  .refine-warn {
-    color: var(--warning-ink);
-    font-size: 0.8rem;
-  }
   /* 破坏性二段确认的警示胶囊:warning 三件套 token 包裹整组(文案+确认+取消),
      120ms 淡入下移 2px,行内占位不换行不跳版。 */
-  .confirm-capsule {
+  /* 重新分析:按钮 + 锚定浮层。wrap 只负责给浮层一个定位原点,不参与布局尺寸,
+     所以开合不会顶动吸顶操作栏(2026-09-20 用户实报的「布局被改变」正是旧胶囊
+     把按钮整个换成一条横条造成的)。 */
+  .retrans-wrap {
+    position: relative;
     display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.25rem 0.5rem 0.25rem 0.75rem;
-    background: var(--warning-tint);
-    border: 1px solid var(--warning-line);
+  }
+  /* 形态与导出菜单同源(同底、同圆角、同投影、同边框):本页已有一套浮层语言,
+     再造第二套只会让界面更碎。右对齐——按钮在操作栏右侧,左展开会顶出视口。 */
+  .retrans-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 30;
+    width: 17rem;
+    display: flex;
+    flex-direction: column;
+    padding: 4px;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
     border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
     animation: capsule-in 120ms ease;
+  }
+  /* 破坏性说明放在顶部做小字注记,不做成警告色块:它要被读一遍,不该每次打开
+     都像报错一样吓人;真正的危险信号交给下面两项的动作文案本身。 */
+  .retrans-menu-note {
+    margin: 0;
+    padding: 0.5em 0.7em 0.55em;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--ink-secondary);
+    border-bottom: 1px solid var(--hairline);
+  }
+  .retrans-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1em;
+    border: none;
+    background: none;
+    box-shadow: none;
+    text-align: left;
+    padding: 0.45em 0.7em;
+    border-radius: var(--radius-md);
+    color: var(--ink);
+    cursor: pointer;
+    transition: background 120ms ease;
+  }
+  .retrans-item:hover:not(:disabled) {
+    background: var(--surface-soft);
+  }
+  .retrans-item:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .retrans-item-main {
+    font-size: 0.85rem;
+    font-weight: 500;
+  }
+  .retrans-item-sub {
+    font-size: 0.72rem;
+    line-height: 1.45;
+    color: var(--ink-faint);
+  }
+  .retrans-item.quiet .retrans-item-main {
+    font-weight: 400;
+    color: var(--ink-secondary);
+  }
+  .retrans-btn.open {
+    background: var(--surface-soft);
   }
   @keyframes capsule-in {
     from {
@@ -4081,7 +4150,7 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .confirm-capsule {
+    .retrans-menu {
       animation: none;
     }
   }
