@@ -179,6 +179,7 @@ The tools:
 | `retranscribe_note` | Re-transcribe a completed note from its on-disk audio (overwrites the raw transcript, auto-backup; async start) | App running, **and** "Allow AI to control recording" enabled |
 | `retranscribe_status` | Current re-transcription task (note_id and stage; running=false when idle); includes the last task's terminal outcome (last); audio import shares this slot for its transcription stage | App running |
 | `import_audio` | Import a local audio file as a note (decode and create the note, then transcribe + identify speakers + AI cleanup in the background, same chain as after a recording stops) | App running, **and** "Allow AI to control recording" enabled |
+| `refine_status` | A note's Aing (AI cleanup) status from three angles (kernel running set / worker heartbeat / on-disk doc summary), to tell "running / finished / actually stalled" apart; read-only | App running |
 
 The seven note and graph tools read local data files directly and work even when the app is closed; recording status, live transcript, the four recording controls, re-transcription, and audio import go through an in-app local socket and need the app running.
 

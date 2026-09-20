@@ -180,6 +180,7 @@ Windows 请在 “Developer PowerShell for VS 2022” 中执行同样命令；`n
 | `retranscribe_note` | 对已完成笔记发起文件重转写(离线重跑 ASR,覆盖原始逐字稿,自动备份;异步启动) | App 运行中,**且**已开启「允许 AI 控制录制」 |
 | `retranscribe_status` | 当前重转写任务(note_id 与阶段;空闲 running=false);含最近一次任务的终态(last);音频导入的转写阶段同占此槽 | App 运行中 |
 | `import_audio` | 把本地音频文件导入成一篇笔记(解码建档后台转写+认人+AI 整理,与停录后链路一致) | App 运行中,**且**已开启「允许 AI 控制录制」 |
+| `refine_status` | 一篇笔记的 Aing 状态(内核在跑集合 / worker 心跳 / 盘上稿摘要三视角),用于区分「在跑 / 已收工 / 真停摆」;只读 | App 运行中 |
 | `identify_speakers` | 读取最近一次说话人身份推断结果(簇→人物建议、置信档、证据、stale 标志);只读 | 无需 App 运行,笔记须已跑过 identify |
 
 笔记与图谱类七工具直接访问本机数据文件,App 没开也能用;录制状态、实时转写、四项录制控制、重转写与音频导入经 App 内本地 socket,需 App 运行。

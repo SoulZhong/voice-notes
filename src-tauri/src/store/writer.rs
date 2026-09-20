@@ -89,15 +89,22 @@ pub(crate) fn alloc_note_dir(
     let base = now.format("%Y%m%d-%H%M%S").to_string();
     let mut id = base.clone();
     let mut n = 1;
+    // 建目录放在循环**内**并对 AlreadyExists 顺延:`exists()` 与 `create_dir` 之间是
+    // TOCTOU 窗口,同秒两个调用方(如开录与导入、或两个应用实例)都会先看到"不存在"
+    // 再争着建同一个名字,输的那个拿到 AlreadyExists 而整个建档失败。
+    // 注释里写的"先建者占名、后来者顺延"要成立,顺延就必须由**建目录本身**触发,
+    // 而不是由那次提前的存在性检查。
     let dir = loop {
         let d = notes_dir.join(&id);
-        if !d.exists() {
-            break d;
+        match std::fs::create_dir(&d) {
+            Ok(()) => break d,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+                id = format!("{base}-{n}");
+            }
+            Err(e) => return Err(e.into()),
         }
-        n += 1;
-        id = format!("{base}-{n}");
     };
-    std::fs::create_dir(&dir)?;
     Ok((id, dir))
 }
 
@@ -194,13 +201,25 @@ impl NoteWriter {
                 anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),无法开始")
             })?;
 
-        let meta_str = std::fs::read_to_string(dir.join("meta.json"))
-            .map_err(|e| anyhow::anyhow!("读 meta.json 失败: {e}"))?;
-        let mut meta: NoteMeta = serde_json::from_str(&meta_str)
-            .map_err(|e| anyhow::anyhow!("meta.json 解析失败: {e}"))?;
-        meta.state = "recording".into();
-        meta.ended_at = None;
-        write_meta_atomic(&dir, &meta)?;
+        // 续录置位也必须走 meta 专用锁内的重读-合并(与 finalize/set_title 同一条路)。
+        // 裸读-改-写会丢掉并发写入:日历回填(backfill_calendar_matches)没有活动笔记
+        // 守卫,meta 拆锁之后它只拿 `.meta.lock`,与这里的 `.note.lock` 不互斥——
+        // 续录读到回填前的快照、整份写回,刚写进去的日历/参会人就没了。
+        let mut meta: NoteMeta = super::notes::read_meta(&dir)
+            .ok_or_else(|| anyhow::anyhow!("meta.json 缺失或损坏,无法续录"))?;
+        {
+            let _meta_lock = super::notelock::NoteLock::acquire_meta(&dir)
+                .map_err(|e| anyhow::anyhow!("笔记元数据锁不可用: {e}"))?
+                .ok_or_else(|| anyhow::anyhow!("另一处正在修改这篇笔记的信息,请重试"))?;
+            // 锁内重读:上一句的读只为拿到"有没有这篇 meta"的早期判定,真正写回的
+            // 基线必须是锁内这一份。
+            let mut disk = super::notes::read_meta(&dir)
+                .ok_or_else(|| anyhow::anyhow!("meta.json 缺失或损坏,无法续录"))?;
+            disk.state = "recording".into();
+            disk.ended_at = None;
+            write_meta_atomic(&dir, &disk)?;
+            meta = disk;
+        }
 
         let content = std::fs::read_to_string(dir.join("segments.jsonl")).unwrap_or_default();
         let mut next_seq = 0u64;
@@ -1731,8 +1750,10 @@ mod tests {
             .err()
             .expect("meta 损坏应 Err")
             .to_string();
+        // 续录改走 read_meta(Option,缺失与损坏不可区分)之后,文案合并为一句;
+        // 本用例守的仍是「meta 坏了就拒绝续录」,不是守某个具体字串。
         assert!(
-            err.contains("meta.json 解析失败"),
+            err.contains("meta.json 缺失或损坏"),
             "应因 meta 损坏而拒,实际: {err}"
         );
     }

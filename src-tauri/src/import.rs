@@ -255,14 +255,20 @@ pub fn create_note(
     Ok(Imported { note_id, dir, duration_ms })
 }
 
-/// 清理上次崩溃遗留的解码中转件(导入入口每次调用前跑一遍)。中转件可能有数百 MB,
-/// 留着白占盘;它不在任何笔记目录里,删掉不影响任何一篇笔记。
+/// 清理**本进程**上次崩溃遗留的解码中转件(导入入口每次调用前跑一遍)。中转件可能有
+/// 数百 MB,留着白占盘;它不在任何笔记目录里,删掉不影响任何一篇笔记。
+///
+/// 只扫自己 pid 的那些:中转件名里带 pid 正是为了"两个实例同时导入不互相覆盖"
+/// (见 create_note),如果这里无差别删,B 实例的一次导入就会把 A 实例**正在解码**的
+/// 目标文件删掉——A 随后 rename 失败、刚建的笔记目录被整个回滚,报"导入失败"。
+/// 同 pid 的残留一定不是在途的:本函数与解码在同一线程内先后发生,自己不会撞自己。
 pub fn sweep_stale_tmp(notes_dir: &Path) {
+    let mine = format!("{TMP_PREFIX}{}-", std::process::id());
     let Ok(rd) = std::fs::read_dir(notes_dir) else { return };
     for e in rd.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(TMP_PREFIX) && e.path().is_file() {
+        if name.starts_with(&mine) && e.path().is_file() {
             if let Err(err) = std::fs::remove_file(e.path()) {
                 eprintln!("导入: 清理残留中转件失败({name}): {err}");
             }
@@ -449,11 +455,18 @@ mod tests {
     #[test]
     fn sweep_removes_only_import_tmp_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(format!("{TMP_PREFIX}1-2.wav")), b"x").unwrap();
+        let mine = format!("{TMP_PREFIX}{}-2.wav", std::process::id());
+        let others = format!("{TMP_PREFIX}999999-2.wav");
+        std::fs::write(dir.path().join(&mine), b"x").unwrap();
+        std::fs::write(dir.path().join(&others), b"x").unwrap();
         std::fs::write(dir.path().join("voiceprints.json"), b"{}").unwrap();
         std::fs::create_dir(dir.path().join("20260919-101010")).unwrap();
         sweep_stale_tmp(dir.path());
-        assert!(!dir.path().join(format!("{TMP_PREFIX}1-2.wav")).exists());
+        assert!(!dir.path().join(&mine).exists(), "本进程的残留该删");
+        assert!(
+            dir.path().join(&others).exists(),
+            "别的实例的中转件可能正在解码,绝不能删"
+        );
         assert!(dir.path().join("voiceprints.json").exists());
         assert!(dir.path().join("20260919-101010").is_dir());
     }
