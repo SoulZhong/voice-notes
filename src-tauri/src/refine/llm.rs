@@ -299,7 +299,6 @@ fn parse_relation_only_payload(content: &str) -> anyhow::Result<Vec<RawRelation>
 #[derive(Debug)]
 pub enum LlmOutcome {
     Done,
-    /// 文本和实体可用，但至少一块缺少/损坏 relations；只降级关系阶段。
     /// 部分块失败,携带失败块覆盖的**段落下标**(升序去重)——部分重跑只重发这些段,
     /// 已成功的一个 token 不花(2026-08-20 设计)。len() 即旧的失败块计数语义。
     Partial(Vec<usize>),
@@ -1026,7 +1025,7 @@ mod tests {
     /// 但整份 JSON 在 texts **之后**坏掉——正文仍应落到段落上,而不是"保留原文"。
     ///
     /// 这是 9 月以来最大的一类失败:194 次块失败里 123 次的 texts 其实完整躺在响应里。
-    /// 关系判否(交独立关系阶段),所以 outcome 是 DoneWithRelationErrors 而非 Partial。
+    /// 关系本就由独立阶段产出,所以抢救出正文即算这块成功(Done),不是 Partial。
     #[test]
     fn broken_json_after_texts_still_lands_the_revised_paragraphs() {
         // texts 完整,entities 缺冒号 → 整份不可解析
@@ -1508,7 +1507,7 @@ mod tests {
     }
 
     /// 缺 relations 字段是**新契约下的正常形态**(prompt 已明说不要输出它):
-    /// 不再降级成 DoneWithRelationErrors,正文与实体照常,outcome 就是 Done。
+    /// 正文与实体照常,outcome 就是 Done。
     #[test]
     fn a_chunk_without_relations_is_plainly_done() {
         let content = serde_json::json!({
