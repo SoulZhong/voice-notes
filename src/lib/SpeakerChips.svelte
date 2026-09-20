@@ -564,8 +564,10 @@
                   <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                     <path d="M6.5 9.5 4.8 11.2a2.4 2.4 0 0 1-3.4-3.4l1.7-1.7M9.5 6.5l1.7-1.7a2.4 2.4 0 0 1 3.4 3.4l-1.7 1.7M6 10l4-4" />
                   </svg>
-                  {t("speakers.chipUnlinkNamed", { name: label(id) })}
-                  <span class="row-sub">{t("speakers.chipUnlinkSub")}</span>
+                  <span class="row-stack">
+                    <span class="row-main">{t("speakers.chipUnlinkNamed", { name: label(id) })}</span>
+                    <span class="row-note">{t("speakers.chipUnlinkSub")}</span>
+                  </span>
                 </button>
               {/if}
               {#if onDelete && blockedReason}
@@ -972,6 +974,25 @@
     color: var(--ink-faint);
     font-size: 0.72rem;
     flex: none;
+  }
+  /* 说明文字整句时改上下两行:.row 是 flex,把一整句塞进 .row-sub(flex:none 不收缩)
+     会把主文案挤成一列竖排(2026-09-20 用户截图实证——「取消关联「蒋松达」」被压成
+     每行一两个字)。主文案一行、说明另起一行,两边都不用跟对方抢宽度。 */
+  .row-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .row-main {
+    /* 人名可能很长,允许换行,但不再与说明争同一行 */
+    line-height: 1.4;
+  }
+  .row-note {
+    color: var(--ink-faint);
+    font-size: 0.72rem;
+    line-height: 1.4;
   }
   .row-off {
     opacity: 0.45;
