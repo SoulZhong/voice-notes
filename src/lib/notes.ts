@@ -43,6 +43,8 @@ export type NoteMeta = {
   /** 本场转写实际用的识别引擎("firered"/"sense_voice"/…,云端记 "cloud:厂商")。
       后端 2026-08-14 起每场落盘;更早的笔记没有这个字段。 */
   asr_engine?: string | null;
+  /** 导入笔记的来源文件名(含扩展名);录音产生的笔记没有这个字段。 */
+  imported_from?: string | null;
 };
 
 export type SegmentRecord = {
@@ -330,6 +332,14 @@ export const noteEntityDelete = (id: string, entityId: string) =>
 /** 改类型(仅本篇,重建传播)。 */
 export const noteEntitySetKind = (id: string, entityId: string, kind: string) =>
   invoke<void>("note_entity_set_kind", { id, entityId, kind });
+/** 合并(二期):把 entityId 并进 targetId——提及与关系改挂目标、名字转目标别名、
+ *  本条出表;非人实体同步全局治理账本(复用图谱 merge)。 */
+export const noteEntityMerge = (id: string, entityId: string, targetId: string) =>
+  invoke<void>("note_entity_merge", { id, entityId, targetId });
+/** 别名整表替换(仅本篇,随重建汇入全局)。别名决定正文里哪些写法算这个实体,
+ *  后端改完会重算提及:加了立刻高亮,删了对应高亮一并消失。 */
+export const noteEntitySetAliases = (id: string, entityId: string, aliases: string[]) =>
+  invoke<void>("note_entity_set_aliases", { id, entityId, aliases });
 
 /** 给人物档案补邮箱(与会人指认学习回路;幂等)。 */
 export const personAddEmail = (personId: string, email: string) =>
@@ -386,6 +396,15 @@ export const noteRefining = (id: string) => invoke<boolean>("note_refining", { i
 /** 发起文件重转写(破坏性:覆盖原始逐字稿,后端自动备份)。input: "dual" | "mixed"。 */
 export const retranscribeNote = (id: string, input: "dual" | "mixed", engine?: string) =>
   invoke<void>("retranscribe_note", { id, input, engine: engine ?? null });
+/** 可导入的音频扩展名。与后端 import::SUPPORTED_EXTS 同源(改一边要改两边:
+ *  这里只喂文件选择器的过滤器,真正的入口校验在后端,前端放宽也进不去)。 */
+export const IMPORT_EXTS = ["mp3", "m4a", "m4b", "aac", "wav", "aif", "aiff", "caf", "mp4", "flac"];
+
+/** 导入本地音频文件建笔记。返回新笔记 id;转写在后台继续,进度走 "retranscribe" 事件
+ *  (导入的后半程就是一次离线转写,复用同一套状态与事件,见后端 do_import_audio)。
+ *  解码期间(可能数秒)这个 promise 一直挂着,调用方自行显示忙态。 */
+export const importAudio = (path: string) => invoke<string>("import_audio", { path });
+
 /** 当前重转写任务;空闲 null。挂载时回填(事件只覆盖在页期间)。 */
 export const retranscribeStatus = () =>
   invoke<{ note_id: string; stage: string } | null>("retranscribe_status");

@@ -319,6 +319,10 @@
 
 {#if ids.length > 0}
   <div class="chips">
+    <!-- 行首标签(2026-09-20 用户点名):说话人行与实体行此前只靠 chip 形状区分,
+         两行叠在一起仍要想一下哪行是哪行。直接写出来最省事——标签压成弱色小字,
+         不与 chip 争视觉,只回答"这一行是什么"。 -->
+    <span class="row-label">{t("speakers.rowLabel")}</span>
     {#each visibleIds as id (id)}
       <!-- speaker-chip：同徽章色系(粉彩底+ink字),chip 本身就是色块。可编辑时点击
            在下方展开编辑面板(chip 保持原形,不原地变形成输入框)。 -->
@@ -552,11 +556,18 @@
                 {t("speakers.chipMe")}
               </button>
               {#if onUnlink && speakers[id]?.person_id}
+                <!-- 取消关联:文案里点名当前关联的是谁(2026-09-20 用户点名)。
+                     原文案「取消关联人物」不说是哪一个——而用到这一行的场景恰恰是
+                     "它关错人了",用户需要先确认关的是谁才敢按。副标题说明这一下
+                     不删段落、不造新人物,正是"关错了但又不想新建人物"该走的路。 -->
                 <button class="row" onclick={() => commitUnlink(id)}>
                   <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                     <path d="M6.5 9.5 4.8 11.2a2.4 2.4 0 0 1-3.4-3.4l1.7-1.7M9.5 6.5l1.7-1.7a2.4 2.4 0 0 1 3.4 3.4l-1.7 1.7M6 10l4-4" />
                   </svg>
-                  {t("speakers.chipUnlink")}
+                  <span class="row-stack">
+                    <span class="row-main">{t("speakers.chipUnlinkNamed", { name: label(id) })}</span>
+                    <span class="row-note">{t("speakers.chipUnlinkSub")}</span>
+                  </span>
                 </button>
               {/if}
               {#if onDelete && blockedReason}
@@ -656,6 +667,16 @@
     flex-wrap: wrap;
     gap: 0.5rem;
     margin: 0 0 0.75rem;
+  }
+  /* 行首标签:弱色小字,固定不收缩,永远待在第一行开头。align-self 顶对齐——
+     chip 换行成多行时标签仍贴着首行,不会被 align-items:center 拉到整块的垂直中间。 */
+  .row-label {
+    flex: none;
+    align-self: flex-start;
+    color: var(--ink-faint);
+    font-size: 0.74rem;
+    line-height: 1.9;
+    user-select: none;
   }
   /* speaker-chip：粉彩底(内联 style 按说话人取色) + ink 字 + rounded-full。
      relative:编辑面板以 chip 为锚点向下弹出。 */
@@ -953,6 +974,25 @@
     color: var(--ink-faint);
     font-size: 0.72rem;
     flex: none;
+  }
+  /* 说明文字整句时改上下两行:.row 是 flex,把一整句塞进 .row-sub(flex:none 不收缩)
+     会把主文案挤成一列竖排(2026-09-20 用户截图实证——「取消关联「蒋松达」」被压成
+     每行一两个字)。主文案一行、说明另起一行,两边都不用跟对方抢宽度。 */
+  .row-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .row-main {
+    /* 人名可能很长,允许换行,但不再与说明争同一行 */
+    line-height: 1.4;
+  }
+  .row-note {
+    color: var(--ink-faint);
+    font-size: 0.72rem;
+    line-height: 1.4;
   }
   .row-off {
     opacity: 0.45;

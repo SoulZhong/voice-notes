@@ -36,6 +36,57 @@ fn write_lock(dir: &Path) -> anyhow::Result<super::notelock::NoteLock> {
         })
 }
 
+/// meta.json 专用的跨进程写锁(见 notelock::META_LOCK_FILE 的注释:为什么它不能
+/// 与 `.note.lock` 共用)。文案刻意与 write_lock 不同——能撞上这把锁的只有另一处
+/// **meta 编辑**(毫秒级),不是录制也不是转码,说成那样只会把人引到错的地方去查。
+fn meta_lock(dir: &Path) -> anyhow::Result<super::notelock::NoteLock> {
+    super::notelock::NoteLock::acquire_meta(dir)
+        .map_err(|e| anyhow::anyhow!("笔记元数据锁不可用: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("另一处正在修改这篇笔记的信息,请重试"))
+}
+
+/// meta.json 读-改-写的**唯一**入口:在 meta 专用锁内重读盘上最新 meta、交给 `f`
+/// 修改、原子落盘。`f` 返回 false 表示放弃写入(条件写入的调用方用它在锁内复查,
+/// 例如 Aing 自动拟题要在锁内确认标题仍是默认样式)。返回是否真的落盘了。
+///
+/// **锁内重读**这件事本身是约束的一部分:调用方在锁外读到的 meta 快照可能已经过期
+/// (Aing 跑几十分钟,用户中途改了名),按快照整份写回会把并发编辑整个冲掉。
+///
+/// meta 损坏/缺失时回落 `fallback_meta`——与改名/与会人员等既有编辑口径一致:
+/// 一篇 meta 坏掉的笔记仍应该能被改名救回来。次要字段的写入(如 asr_engine)
+/// 不该走这条回落,见 [`update_meta_strict`]。
+pub(crate) fn update_meta(
+    dir: &Path,
+    f: impl FnOnce(&mut NoteMeta) -> bool,
+) -> anyhow::Result<bool> {
+    let _guard = edit_guard();
+    let _flock = meta_lock(dir)?;
+    let mut meta = read_meta(dir).unwrap_or_else(|| fallback_meta(dir));
+    if !f(&mut meta) {
+        return Ok(false);
+    }
+    write_meta_atomic(dir, &meta)?;
+    Ok(true)
+}
+
+/// 同 [`update_meta`],但盘上 meta 不可解析时直接报错,不回落"损坏占位"。
+/// 给次要字段的写入用(asr_engine):为了记一行"这场是哪个引擎转的",不值得把一份
+/// 尚可人工抢救的损坏 meta 覆盖成占位。
+pub(crate) fn update_meta_strict(
+    dir: &Path,
+    f: impl FnOnce(&mut NoteMeta) -> bool,
+) -> anyhow::Result<bool> {
+    let _guard = edit_guard();
+    let _flock = meta_lock(dir)?;
+    let mut meta = read_meta(dir)
+        .ok_or_else(|| anyhow::anyhow!("meta.json 缺失或损坏,拒绝覆盖: {}", dir.display()))?;
+    if !f(&mut meta) {
+        return Ok(false);
+    }
+    write_meta_atomic(dir, &meta)?;
+    Ok(true)
+}
+
 /// load 结果记忆化。详情页切换会议会反复对同一 id 调 load(切走再切回、编辑后
 /// refresh),而 load 每次都全量重解析 segments.jsonl + join 整个声纹库——长会议
 /// (数千段)或声纹多时,这是切换卡顿的主因之一。
@@ -223,12 +274,12 @@ impl NoteStore {
     }
 
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
-        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
-        let _flock = write_lock(&dir)?;
-        let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
-        meta.title = title.to_string();
-        write_meta_atomic(&dir, &meta)
+        update_meta(&dir, |meta| {
+            meta.title = title.to_string();
+            true
+        })?;
+        Ok(())
     }
 
     /// 手动与会人员名单整表替换(2026-09-16):每项先按中英文逗号/分号/顿号再拆
@@ -236,35 +287,35 @@ impl NoteStore {
     /// 也让存量坏条目在下次编辑时自愈),再 trim、去空、按序去重,上限 50 人
     /// (再多是名单粘贴错了)。与 rename 同一锁纪律。
     pub fn set_attendees(&self, id: &str, names: &[String]) -> anyhow::Result<()> {
-        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
-        let _flock = write_lock(&dir)?;
-        let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
-        let mut seen = std::collections::BTreeSet::new();
-        meta.attendees = names
-            .iter()
-            .flat_map(|n| n.split(['，', ',', '；', ';', '、']))
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty() && seen.insert(n.clone()))
-            .take(50)
-            .collect();
-        write_meta_atomic(&dir, &meta)
+        update_meta(&dir, |meta| {
+            let mut seen = std::collections::BTreeSet::new();
+            meta.attendees = names
+                .iter()
+                .flat_map(|n| n.split(['，', ',', '；', ';', '、']))
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty() && seen.insert(n.clone()))
+                .take(50)
+                .collect();
+            true
+        })?;
+        Ok(())
     }
 
     /// 本篇隐藏的日历参会人整表替换(键=邮箱或名字,小写归一去重,上限 100)。
     pub fn set_attendees_removed(&self, id: &str, keys: &[String]) -> anyhow::Result<()> {
-        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
-        let _flock = write_lock(&dir)?;
-        let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
-        let mut seen = std::collections::BTreeSet::new();
-        meta.attendees_removed = keys
-            .iter()
-            .map(|k| k.trim().to_lowercase())
-            .filter(|k| !k.is_empty() && seen.insert(k.clone()))
-            .take(100)
-            .collect();
-        write_meta_atomic(&dir, &meta)
+        update_meta(&dir, |meta| {
+            let mut seen = std::collections::BTreeSet::new();
+            meta.attendees_removed = keys
+                .iter()
+                .map(|k| k.trim().to_lowercase())
+                .filter(|k| !k.is_empty() && seen.insert(k.clone()))
+                .take(100)
+                .collect();
+            true
+        })?;
+        Ok(())
     }
 
     /// 仅当**盘上当前标题**仍是默认样式才改名(Aing 自动标题专用),返回是否写入。
@@ -272,16 +323,14 @@ impl NoteStore {
     /// ——Aing 跑几十分钟,用户中途手动改名后,按快照判定会把手动名覆盖掉
     /// (2026-09-05 用户点名:手动标题优先级最高,AI 永不覆盖)。
     pub fn rename_if_default(&self, id: &str, title: &str) -> anyhow::Result<bool> {
-        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
-        let _flock = write_lock(&dir)?;
-        let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
-        if !super::writer::is_default_title(&meta.title) {
-            return Ok(false);
-        }
-        meta.title = title.to_string();
-        write_meta_atomic(&dir, &meta)?;
-        Ok(true)
+        update_meta(&dir, |meta| {
+            if !super::writer::is_default_title(&meta.title) {
+                return false;
+            }
+            meta.title = title.to_string();
+            true
+        })
     }
 
     /// 日历字段的唯一写入口(P3):与 rename 同一锁纪律(EDIT_LOCK + 笔记 flock)
@@ -293,15 +342,8 @@ impl NoteStore {
         id: &str,
         f: impl FnOnce(&mut NoteMeta) -> bool,
     ) -> anyhow::Result<bool> {
-        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
-        let _flock = write_lock(&dir)?;
-        let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
-        if !f(&mut meta) {
-            return Ok(false);
-        }
-        write_meta_atomic(&dir, &meta)?;
-        Ok(true)
+        update_meta(&dir, f)
     }
 
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
@@ -325,24 +367,26 @@ impl NoteStore {
     /// 幂等:非 recording 态返回 Ok(false) 不动盘。锁纪律与 rename/delete 相同
     /// (EDIT_LOCK + 笔记 flock);「无活动会话」由命令壳把关——store 层看不见会话。
     pub fn finalize_interrupted(&self, id: &str) -> anyhow::Result<bool> {
-        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
+        // 两把锁都要,顺序 `.note.lock` → `.meta.lock`(全库锁序纪律,见
+        // notelock::acquire_meta):收尾要读 segments.jsonl 算真实结束时刻(前者保护),
+        // 又要写 meta 的 state/ended_at(后者保护)。这是目前唯一同时需要两把锁的路径。
         let _flock = write_lock(&dir)?;
-        let Some(mut meta) = read_meta(&dir) else {
-            anyhow::bail!("meta.json 缺失或损坏,无法收尾");
-        };
-        if meta.state != "recording" {
-            return Ok(false); // 已完成/其它态:幂等,不动
-        }
-        let ended = chrono::DateTime::parse_from_rfc3339(&meta.started_at)
-            .ok()
-            .zip(max_end_ms(&dir.join("segments.jsonl")))
-            .map(|(start, ms)| (start + chrono::Duration::milliseconds(ms as i64)).to_rfc3339())
-            .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
-        meta.ended_at = Some(ended);
-        meta.state = "complete".into();
-        write_meta_atomic(&dir, &meta)?;
-        Ok(true)
+        // 残局笔记的 meta 必须是好的才敢收尾:回落占位 meta 等于把一篇中断录音的
+        // 开始时刻也一起编掉,ended_at 就无从算起——故走 strict。
+        update_meta_strict(&dir, |meta| {
+            if meta.state != "recording" {
+                return false; // 已完成/其它态:幂等,不动
+            }
+            let ended = chrono::DateTime::parse_from_rfc3339(&meta.started_at)
+                .ok()
+                .zip(max_end_ms(&dir.join("segments.jsonl")))
+                .map(|(start, ms)| (start + chrono::Duration::milliseconds(ms as i64)).to_rfc3339())
+                .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
+            meta.ended_at = Some(ended);
+            meta.state = "complete".into();
+            true
+        })
     }
 
     /// 改说话人显示名：读表（缺失则视为空表新建）→ 设 name → 原子写 speakers.json。
@@ -391,10 +435,23 @@ impl NoteStore {
         write_speakers_atomic(&dir, &speakers)
     }
 
-    /// 解除说话人与声纹库人物的关联:只清 person_id,表项与段落归属一概不动。
+    /// 解除说话人与声纹库人物的关联:清 person_id,表项与段落归属一概不动。
     ///
-    /// 清完 person_id 之后 name 必然还是空串(assign_speaker_person 关联时就把本地名
-    /// 清了),于是显示回落到「新说话人 N」——这正是"取消关联"该有的样子。
+    /// **同时清掉"就是那个人名字"的本地名**(2026-09-20 用户实报:取消关联后卡片还
+    /// 挂着原来那个人的姓名)。原注释断言"关联时就把本地名清了,所以清完必然回落
+    /// 「新说话人 N」"——这条不变式只有 assign_speaker_person 那一条路成立;
+    /// assign_speaker_person_if(一键拆分收尾)与 set_speaker_hints 的 prior_person
+    /// 回填都只写 person_id、不动 name,于是盘上真实存在 name=「仲维建」+
+    /// person_id=P14 这种表项,取消关联之后名字照样显示。
+    ///
+    /// 判据刻意收窄到"本地名 == 库里那个人的现名":那种名字本就是**那个人的**名字,
+    /// 用户说"它不是那个人"时理应随之消失;而本地名与库名不同(用户给本篇这个簇起的
+    /// 自己的标签)与关联无关,清掉等于替用户丢掉他亲手打的字。读不到声纹库一律不清
+    /// (缺失/损坏时宁可留着名字,也不猜)。
+    ///
+    /// hint_person 指向刚解除的这个人时一并清:否则取消关联的下一刻,chip 上又浮出
+    /// 「建议:仲维建」——把用户刚否掉的结论原样再劝一遍。
+    ///
     /// **不复用 delete_speaker**:那个会连表项一起删、把名下段落全退回未标注,
     /// 而用户要的只是断开与库人物的绑定,段落该归谁还归谁。
     pub fn clear_speaker_person(&self, id: &str, speaker_id: &str) -> anyhow::Result<()> {
@@ -405,11 +462,31 @@ impl NoteStore {
         let meta = speakers
             .get_mut(speaker_id)
             .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
-        if meta.person_id.is_none() {
+        let Some(person_id) = meta.person_id.clone() else {
             return Ok(()); // 本就没关联,幂等返回
-        }
+        };
+        let person_name = self.person_display_name(&person_id);
         meta.person_id = None;
+        if let Some(pname) = person_name.as_deref() {
+            if !meta.name.is_empty() && meta.name.trim() == pname.trim() {
+                meta.name = String::new();
+            }
+            if meta.hint_person.as_deref() == Some(person_id.as_str()) {
+                meta.hint_person = None;
+            }
+        }
         write_speakers_atomic(&dir, &speakers)
+    }
+
+    /// 库里某人的现名(经 redirects 归一)。读不到库/查无此人 → None。
+    /// 与 join_person_names 同一条加载路径(VoiceprintStore 挂在 notes_dir 上一级),
+    /// 口径不分叉:那边用它做展示兜底,这边用它判定"本地名是不是就是这个人的名字"。
+    fn person_display_name(&self, person_id: &str) -> Option<String> {
+        let root = self.notes_dir.parent()?;
+        let vp = super::VoiceprintStore::new(root.to_path_buf()).load();
+        let resolved = super::VoiceprintStore::resolve(&vp, person_id)?;
+        let name = vp.people.get(resolved)?.name.clone();
+        (!name.is_empty()).then_some(name)
     }
 
     /// 一键拆分的恢复原状(不拆/撤销共用):多人标记复位,人物关联按打标前快照
@@ -1194,7 +1271,7 @@ fn join_person_names(notes_dir: &Path, speakers: &mut BTreeMap<String, SpeakerMe
     }
 }
 
-fn read_meta(dir: &Path) -> Option<NoteMeta> {
+pub(super) fn read_meta(dir: &Path) -> Option<NoteMeta> {
     let s = fs::read_to_string(dir.join("meta.json")).ok()?;
     serde_json::from_str(&s).ok()
 }
@@ -1215,6 +1292,7 @@ fn fallback_meta(dir: &Path) -> NoteMeta {
         calendar: None,
         calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
+            imported_from: None,
     }
 }
 
@@ -1302,6 +1380,7 @@ mod tests {
                 calendar: None,
                 calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
+                imported_from: None,
             })
             .unwrap(),
         )
@@ -1352,6 +1431,7 @@ mod tests {
                 calendar_cleared: false,
                 attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
+                imported_from: None,
             })
             .unwrap(),
         )
@@ -1397,6 +1477,7 @@ mod tests {
                     calendar: None,
                     calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                     asr_engine: None,
+                    imported_from: None,
                 })
                 .unwrap(),
             )
@@ -1435,6 +1516,7 @@ mod tests {
                 calendar: None,
                 calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
+                imported_from: None,
             })
             .unwrap(),
         )
@@ -1467,6 +1549,7 @@ mod tests {
                 calendar: None,
                 calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
                 asr_engine: None,
+                imported_from: None,
             })
             .unwrap(),
         )
@@ -1853,6 +1936,60 @@ mod tests {
         assert_eq!(n.speakers["S1"].name, "", "本地名仍为空 → 显示回落到「新说话人 N」");
         assert_eq!(n.segments[0].speaker.as_deref(), Some("S1"), "段落归属一律不动");
         assert_eq!(n.segments[1].speaker.as_deref(), Some("S3"), "他人不受影响");
+    }
+
+    /// 2026-09-20 用户实报:取消关联之后,卡片上还挂着原来那个人的姓名。
+    ///
+    /// 根因是一条只对 assign_speaker_person 成立的不变式被当成了全局成立:
+    /// assign_speaker_person_if(一键拆分收尾)只写 person_id、不动 name,盘上因此
+    /// 真实存在 `name=「王虎」+ person_id=P7` 这种表项(用户库里就有),取消关联
+    /// 只清 person_id,名字照样显示。
+    ///
+    /// 本用例同时钉住**收窄后的判据**:本地名等于库里那个人的现名才清(那名字本就
+    /// 是"那个人的"),本地名是用户给本篇起的别的标签则留着——清掉等于替用户丢掉
+    /// 他亲手打的字。
+    #[test]
+    fn clear_speaker_person_drops_the_name_that_came_from_that_person() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 声纹库挂在 notes_dir 的上一级(与 join_person_names 同一条路径),
+        // 所以笔记根要落在 tmp/notes 下,库文件落 tmp/voiceprints.json。
+        let notes = tmp.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(
+            tmp.path().join("voiceprints.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "next_person": 8,
+                "people": { "P7": { "name": "王虎", "total_ms": 0, "last_seen": "" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = NoteStore::new(notes.clone());
+
+        // ① 本地名 == 库现名(一键拆分那条路造出来的形态)→ 取消关联应一并清掉
+        let id = make_spk_note(&notes, &[("甲", Some("S1"))], &["S1"]);
+        store.rename_speaker(&id, "S1", "王虎").unwrap();
+        store.assign_speaker_person_if(&id, "S1", "P7").unwrap();
+        let n = store.load(&id).unwrap();
+        assert_eq!(n.speakers["S1"].name, "王虎", "前提:本地名与库名同字");
+        assert_eq!(n.speakers["S1"].person_id.as_deref(), Some("P7"));
+
+        store.clear_speaker_person(&id, "S1").unwrap();
+        let n = store.load(&id).unwrap();
+        assert_eq!(n.speakers["S1"].person_id, None, "关联断开");
+        assert_eq!(n.speakers["S1"].name, "", "那个人的名字必须随关联一起消失(回落「新说话人 N」)");
+        assert!(n.speakers.contains_key("S1"), "表项仍在");
+        assert_eq!(n.segments[0].speaker.as_deref(), Some("S1"), "段落归属不动");
+
+        // ② 本地名是用户自己的标签(与库名不同)→ 留着,不替用户丢字
+        let id2 = make_spk_note(&notes, &[("乙", Some("S1"))], &["S1"]);
+        store.rename_speaker(&id2, "S1", "左边那位").unwrap();
+        store.assign_speaker_person_if(&id2, "S1", "P7").unwrap();
+        store.clear_speaker_person(&id2, "S1").unwrap();
+        let n2 = store.load(&id2).unwrap();
+        assert_eq!(n2.speakers["S1"].person_id, None);
+        assert_eq!(n2.speakers["S1"].name, "左边那位", "与库名不同的本地标签与关联无关,不该被清");
     }
 
     /// 样本↔会议同步的 CAS:期望值命中才改派/解除;被改成别人则拒绝不覆盖;幂等。
@@ -2245,6 +2382,7 @@ mod tests {
             calendar: None,
             calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
+            imported_from: None,
         };
         write_meta_atomic(&dir, &meta).unwrap();
 
@@ -2398,5 +2536,102 @@ mod tests {
             .unwrap();
         let n = store.load(&id).unwrap();
         assert!(n.segments.iter().all(|s| s.speaker.as_deref() == Some("S2")));
+    }
+
+    /// 2026-09-19 用户实报:导入一篇 38 分钟录音后,转写 worker 全程持 `.note.lock`
+    /// 十几分钟,想趁等的时候把与会人员填上却被拒——"该笔记正被占用(录制或转码中,
+    /// 可能来自另一个应用实例)",三个词全不对,人也无事可做。根因是 meta 与 segments
+    /// 共用了一把目录级锁,而它们没有一个字节交集。
+    ///
+    /// 本用例锁死分锁后的两条语义:①`.note.lock` 被持有时,纯 meta 编辑照常成功;
+    /// ②segments 级编辑**仍然**被它挡住——2026-07-13「双实例整表重写丢 35 分钟
+    /// 转写」那道防线一寸都不能跟着拆掉。
+    #[test]
+    fn meta_edits_are_not_blocked_by_the_segments_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let id = make_note(tmp.path(), &["一", "二"], true);
+        let dir = tmp.path().join(&id);
+
+        // 模拟离线转写 worker:全程持 `.note.lock`(run_retranscribe_once 就是这么干的)。
+        let held = crate::store::notelock::NoteLock::try_exclusive(&dir)
+            .unwrap()
+            .expect("段落锁此刻应可获取");
+
+        // ── 纯 meta 编辑:五条路径都应照常成功 ──
+        store.set_attendees(&id, &["张三,李四".into()]).unwrap();
+        store.rename(&id, "季度评审").unwrap();
+        store.set_attendees_removed(&id, &["A@b.com".into()]).unwrap();
+        assert!(store
+            .update_calendar(&id, |m| {
+                m.calendar_cleared = true;
+                true
+            })
+            .unwrap());
+        crate::store::set_note_asr_engine(&dir, "firered").unwrap();
+
+        let m = read_meta(&dir).expect("meta 应可读");
+        assert_eq!(m.attendees, vec!["张三".to_string(), "李四".to_string()]);
+        assert_eq!(m.title, "季度评审");
+        assert_eq!(m.attendees_removed, vec!["a@b.com".to_string()]);
+        assert!(m.calendar_cleared);
+        assert_eq!(m.asr_engine.as_deref(), Some("firered"));
+
+        // ── 段落级编辑:必须仍被挡住 ──
+        assert!(
+            store.edit_segment_text(&id, 0, "一", "改").is_err(),
+            "segments 编辑必须仍被 .note.lock 挡住"
+        );
+        assert!(store.delete(&id).is_err(), "删整篇必须仍被 .note.lock 挡住");
+
+        // 释放后段落编辑恢复——反证上面的拒绝确实来自这把锁,而非别的原因。
+        drop(held);
+        store.edit_segment_text(&id, 0, "一", "改").unwrap();
+    }
+
+    /// meta 编辑之间仍要跨进程互斥:两处并发各自整份写 meta 会互相丢字段,所以
+    /// `.meta.lock` 被别人持着时读-改-写必须**失败**,而不是蒙头覆盖。
+    #[test]
+    fn meta_edits_exclude_each_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let id = make_note(tmp.path(), &["一"], true);
+        let dir = tmp.path().join(&id);
+
+        let held = crate::store::notelock::NoteLock::acquire_meta(&dir)
+            .unwrap()
+            .expect("meta 锁此刻应可获取");
+        assert!(
+            store.set_attendees(&id, &["张三".into()]).is_err(),
+            "meta 锁被占时必须拒绝,不得并发整份写"
+        );
+        drop(held);
+        store.set_attendees(&id, &["张三".into()]).unwrap();
+        assert_eq!(read_meta(&dir).unwrap().attendees, vec!["张三".to_string()]);
+    }
+
+    /// 次要字段写入不得把一份尚可抢救的损坏 meta 覆盖成占位(strict 口径)。
+    /// 改名等主编辑仍保留"占位兜底"——一篇 meta 坏掉的笔记应该还能被改名救回来。
+    #[test]
+    fn asr_engine_write_refuses_broken_meta_but_rename_still_heals() {
+        /// 半截 JSON:serde 解不出,read_meta 返回 None。
+        const BROKEN_META: &str = "{ \"id\": \"半个\"";
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let id = make_note(tmp.path(), &["一"], true);
+        let dir = tmp.path().join(&id);
+        std::fs::write(dir.join("meta.json"), BROKEN_META).unwrap();
+
+        assert!(
+            crate::store::set_note_asr_engine(&dir, "firered").is_err(),
+            "meta 损坏时不该为了记一行引擎名就把它覆盖掉"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("meta.json")).unwrap(),
+            BROKEN_META,
+            "拒绝时盘上必须一字未动"
+        );
+        store.rename(&id, "救回来").unwrap();
+        assert_eq!(read_meta(&dir).unwrap().title, "救回来");
     }
 }

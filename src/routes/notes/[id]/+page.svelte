@@ -65,6 +65,8 @@
     noteEntityRename,
     noteEntityDelete,
     noteEntitySetKind,
+    noteEntityMerge,
+    noteEntitySetAliases,
     personAddEmail,
     setNoteAttendeesRemoved,
     type CutRange,
@@ -652,6 +654,28 @@
     await noteEntitySetKind(id, entityId, kind);
     await reloadRefinedForEntities();
   }
+  /** 合并(二期):本篇立即合,全局治理账本由后端同步。合完正文提及会改指胜方,
+      所以要整份重载修订稿(与增/删/改名同一条闸门)。 */
+  async function entityMerge(entityId: string, targetId: string) {
+    await noteEntityMerge(id, entityId, targetId);
+    // 定位态可能还指着刚被并掉的那个实体:清掉,免得下次点 chip 找一个不存在的 id。
+    entityLocate = null;
+    await reloadRefinedForEntities();
+  }
+  /** 别名整表替换:改完提及会变(加了多认出、删了少认出),整份重载修订稿。 */
+  async function entitySetAliases(entityId: string, aliases: string[]) {
+    await noteEntitySetAliases(id, entityId, aliases);
+    await reloadRefinedForEntities();
+  }
+  /** 实体 → 图谱/人物页链接(解析不到全局 id 的返回 null,浮层不出这个入口)。
+      与正文悬浮浮层的 gotoEntity 同一份 entityLinks,口径不分叉。 */
+  function entityGraphHref(eid: string): string | null {
+    const link = entityLinks[eid];
+    if (!link) return null;
+    return link.is_person
+      ? "/speakers/" + link.global_id
+      : "/graph?e=" + encodeURIComponent(link.global_id);
+  }
   /** 点实体定位正文提及:滚到第一处并高亮全部,再点同一实体跳下一处。
       实体只存在于修订稿,原始稿视图先切过去(段落异步渲染,重试一拍)。 */
   let entityLocate: { id: string; idx: number } | null = null;
@@ -667,6 +691,10 @@
     }
     const idx = entityLocate?.id === entId ? (entityLocate.idx + 1) % spans.length : 0;
     entityLocate = { id: entId, idx };
+    // 先清后加 + 强制回流:只有一处提及的实体连点两次时,目标 span 上的
+    // entity-located-current 还在,不重置的话 CSS 动画不会重新起跑——点了没反应。
+    for (const sp of spans) sp.classList.remove("entity-located", "entity-located-current");
+    void spans[idx].offsetWidth;
     for (const sp of spans) sp.classList.add("entity-located");
     spans[idx].classList.add("entity-located-current");
     spans[idx].scrollIntoView({ block: "center", behavior: "smooth" });
@@ -2688,6 +2716,13 @@
             {#if note.meta.state === "recording"}
               <span class="state interrupted">{t("notes.state.interrupted")}</span>
             {/if}
+            <!-- 导入来源:这篇的音频不是本机录的。标出来是因为它决定了用户该怎么读
+                 这篇——单轨、没有系统声分离、没有回声消除,说话人全靠声纹分。 -->
+            {#if note.meta.imported_from}
+              <span class="state imported" title={t("notes.imported.title", { file: note.meta.imported_from })}
+                >{t("notes.imported.badge")}</span
+              >
+            {/if}
           </p>
           {#if calPerm !== "unavailable"}
             <p class="meta cal-row">
@@ -3003,6 +3038,9 @@
           onRename={entityRename}
           onDelete={entityDelete}
           onSetKind={entitySetKind}
+          onMerge={entityMerge}
+          onSetAliases={entitySetAliases}
+          graphHref={entityGraphHref}
         />
       {/if}
 
@@ -3058,7 +3096,7 @@
             onclick={rerunRefine}
             title={aiState === "running" ? t("notes.refine.running") : aiState === "complete" ? t("notes.refine.completeHint") : aiState === "failed" ? t("notes.refine.failedHint") : t("notes.refine.run")}
           >
-            <svg class="wand" viewBox="0 0 22 22" width="22" height="22" aria-hidden="true">
+            <svg class="wand" viewBox="0 0 22 22" width="18" height="18" aria-hidden="true">
               <path
                 class="wand-stick"
                 d="M3.5 18.5 11.5 10.5"
@@ -3081,46 +3119,58 @@
                 d="M10 15.4 10.3 16.2 11.1 16.5 10.3 16.8 10 17.6 9.7 16.8 8.9 16.5 9.7 16.2Z"
               />
             </svg>
-            <AiStateLabel state={aiState} />
+            <AiStateLabel state={aiState} label={t("notes.refine.label")} />
           </button>
 
         <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
              自动备份为 segments.orig.jsonl),二段确认走 retransConfirm 胶囊。
              来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
              判定可用性并置灰+tooltip 给原因)。 -->
-        {#if retransConfirm}
-          <div class="confirm-capsule">
-            <span class="refine-warn">{t("notes.retrans.warn")}</span>
-            <button class="link danger" onclick={() => startRetranscribe("dual")}>
-              {t("notes.retrans.confirmDual")}
-            </button>
-            <button
-              class="link danger"
-              disabled={mixedReason !== null}
-              title={mixedReason ?? ""}
-              onclick={() => startRetranscribe("mixed")}
-            >
-              {t("notes.retrans.confirmMixed")}
-            </button>
-            <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
-          </div>
-        {:else}
+        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+        <div class="retrans-wrap" onclick={(e) => e.stopPropagation()}>
           <!-- 带文字的「重新分析」入口(2026-09-07 用户点名):此前是纯图标幽灵钮,
                和当年"拆分按钮在但没人找到"同病——重切段/重认人的算法升级后,
                这个入口是存量笔记受益的唯一通道,必须一眼可见。 -->
           <button
             class="retrans-btn"
+            class:open={retransConfirm}
+            aria-haspopup="menu"
+            aria-expanded={retransConfirm}
             disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
             title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
-            onclick={() => (retransConfirm = true)}
+            onclick={() => (retransConfirm = !retransConfirm)}
           >
-            <svg class:spin={retranscribing} width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <svg class:spin={retranscribing} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
               <path d="M13.4 1.8v2.8h-2.8" />
             </svg>
             {retranscribing ? t("notes.retrans.runningShort") : t("notes.retrans.run")}
           </button>
-        {/if}
+          {#if retransConfirm}
+            <!-- 二段确认改成**锚定浮层**(2026-09-20 用户实报「设计粗糙、布局被改变」):
+                 原先是把按钮整个替换成一条横向胶囊,宽度是按钮的好几倍,一点就把
+                 吸顶操作栏顶变形。浮层挂在按钮下方、absolute 定位,开合不占版面;
+                 形态沿用本页导出菜单(同底色/同圆角/同投影),不另造一套。 -->
+            <div class="retrans-menu" role="menu">
+              <p class="retrans-menu-note">{t("notes.retrans.warn")}</p>
+              <button class="retrans-item" onclick={() => startRetranscribe("dual")}>
+                <span class="retrans-item-main">{t("notes.retrans.confirmDual")}</span>
+                <span class="retrans-item-sub">{t("notes.retrans.dualSub")}</span>
+              </button>
+              <button
+                class="retrans-item"
+                disabled={mixedReason !== null}
+                onclick={() => startRetranscribe("mixed")}
+              >
+                <span class="retrans-item-main">{t("notes.retrans.confirmMixed")}</span>
+                <span class="retrans-item-sub">{mixedReason ?? t("notes.retrans.mixedSub")}</span>
+              </button>
+              <button class="retrans-item quiet" onclick={() => (retransConfirm = false)}>
+                <span class="retrans-item-main">{t("notes.cancel")}</span>
+              </button>
+            </div>
+          {/if}
+        </div>
       </div>
     </div>
 
@@ -3619,35 +3669,6 @@
   @media (prefers-reduced-motion: reduce) {
     .ghost svg.spin { animation: none; }
   }
-  /* 「重新分析」:带文字的胶囊(与剪辑行按钮同族),不再是纯图标幽灵钮——
-     它是算法升级后存量笔记受益的唯一通道,必须可发现 */
-  .retrans-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4em;
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink-secondary);
-    border-radius: var(--radius-full);
-    padding: 0.3em 0.8em;
-    font-size: 0.78rem;
-    cursor: pointer;
-    white-space: nowrap;
-    transition:
-      background 120ms ease,
-      color 120ms ease;
-  }
-  .retrans-btn:hover:not(:disabled) {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .retrans-btn:active:not(:disabled) {
-    transform: translateY(0.5px);
-  }
-  .retrans-btn:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
   .ghost {
     display: inline-flex;
     align-items: center;
@@ -3794,14 +3815,37 @@
   .transcript :global(.md-seg.playing) {
     background: var(--accent-tint);
   }
-  /* 实体定位:点实体 chip 后全部提及浮 accent 底,当前一处加描边(2.6s 消散) */
+  /* 实体定位:点实体 chip 后全部提及套同色虚线环,当前一处实线环 + 脉冲一下(2.6s 消散)。
+     环用实体自己的色(--ent-ink)而不是 accent:正文里的提及本就按类型着色了,
+     定位态再换成统一的 accent 就等于把"这是哪一类"这条信息在最需要看清的时刻抹掉。 */
   .transcript :global(.entity-mention.entity-located) {
-    background: var(--accent-tint);
-    border-radius: var(--radius-sm);
+    outline: 1px dashed var(--ent-ink, var(--accent));
+    outline-offset: 2px;
   }
   .transcript :global(.entity-mention.entity-located-current) {
-    outline: 1.5px solid var(--accent);
-    outline-offset: 1px;
+    outline: 2px solid var(--ent-ink, var(--accent));
+    outline-offset: 2px;
+    animation: entity-pulse 620ms ease-out;
+  }
+  /* 定位命中的那一下:同色光晕从字身扩散开再散尽。只跑一次,结束回落原状——
+     正文里几十处提及常驻动画会晃眼,动效只用来回答"我刚点的那个跳到哪了"。
+     用 box-shadow 而不是 transform:见上方 .entity-mention 里不改 display 的理由。 */
+  @keyframes entity-pulse {
+    0% {
+      box-shadow: 0 0 0 0 var(--ent-ink, var(--accent));
+    }
+    55% {
+      box-shadow: 0 0 0 7px transparent;
+    }
+    100% {
+      box-shadow: 0 0 0 0 transparent;
+    }
+  }
+  /* prefers-reduced-motion:系统要求减弱动效时不做缩放/光晕,只留实线环定位。 */
+  @media (prefers-reduced-motion: reduce) {
+    .transcript :global(.entity-mention.entity-located-current) {
+      animation: none;
+    }
   }
   /* 圈选游标联动:拖动游标时离它最近的段 accent-tint 底 + 切线交代边界方向——
      开始游标的线在文字上方(从这里起导出)、结束游标在下方(到这里为止)。
@@ -3845,19 +3889,39 @@
     outline: 2px solid var(--accent);
     border-radius: var(--radius-sm);
   }
-  /* 实体提及高亮:正文单色,静态无底(不染正文),hover 才浮 accent-tint 底 + accent 字。
+  /* 实体提及高亮:常驻一层极淡的 accent-tint-soft 底(2026-09-19 用户点名改)。
+     此前是「静态无底,hover 才显形」——顾虑是别把正文染花,但代价太大:一篇 83 处
+     提及在页面上完全看不出来,人以为实体识别没生效(实际 offset 全都精准命中),
+     只能靠顶部实体行的「定位」按钮一处处跳。常驻底色让"哪些词被认出来了"一眼可见。
+     浓度必须停在 soft 这一档:再浓就和 hover / 实体定位 / 当前播放段那一档
+     (accent-tint)撞车,那三层信息就没法靠深浅区分了(见 app.css 的令牌注释)。
      :global 原因同上——原始稿(.md-seg 内)与修订稿(NodeView 的 .md-para 内)共用同一套
      class,两者都是 PM 命令式创建的 DOM,没有 Svelte scope hash。 */
   .transcript :global(.entity-mention) {
+    /* 颜色取自实体自己的类型色(行内 --ent-tint / --ent-ink,见 $lib/entityKind),
+       与头顶那枚 chip 逐字同色——"正文这个词"和"行里那枚 chip"是同一个东西,
+       这件事全靠同色传达。查不到类型时回落中性灰,不至于没色可上。 */
+    background: var(--ent-tint, var(--tint-gray));
+    color: var(--ent-ink, var(--tint-gray-ink));
+    font-size: 1.08em;
+    font-weight: 500;
     border-radius: var(--radius-sm);
+    /* 横向撑开一点,底色块不贴着字;负外边距抵掉,密排正文的字距不被推开。
+       纵向只给 0.05em:行高 1.7 的中文稿里再多就会和上下行的底色块糊在一起。 */
+    padding: 0.05em 0.15em;
+    margin: 0 -0.05em;
+    /* 刻意**不**改 display:修订稿是 contenteditable,行内元素换成 inline-block
+       会带来光标落点与选区的怪癖(编辑体验 > 一点缩放动效)。因此定位脉冲只用
+       box-shadow(行内元素上生效),不用 transform(行内非替换元素上不作用)。 */
     cursor: default;
     transition:
       background 120ms ease,
-      color 120ms ease;
+      color 120ms ease,
+      box-shadow 120ms ease;
   }
+  /* hover:同色相加一圈光环,而不是换色——换色会和"定位命中"那一档撞车。 */
   .transcript :global(.entity-mention:hover) {
-    background: var(--accent-tint);
-    color: var(--accent);
+    box-shadow: 0 0 0 2px var(--ent-tint, var(--tint-gray));
   }
   /* 可导航的实体提及(能解析到全局 id):区别于纯 tooltip 态,给出可点信号 */
   .transcript :global(.entity-mention.linkable) {
@@ -3973,21 +4037,78 @@
     flex: 1;
   }
   /* 重新 Aing 二段确认的警示语:warning 色小字,和确认/取消链接排一行 */
-  .refine-warn {
-    color: var(--warning-ink);
-    font-size: 0.8rem;
-  }
   /* 破坏性二段确认的警示胶囊:warning 三件套 token 包裹整组(文案+确认+取消),
      120ms 淡入下移 2px,行内占位不换行不跳版。 */
-  .confirm-capsule {
+  /* 重新分析:按钮 + 锚定浮层。wrap 只负责给浮层一个定位原点,不参与布局尺寸,
+     所以开合不会顶动吸顶操作栏(2026-09-20 用户实报的「布局被改变」正是旧胶囊
+     把按钮整个换成一条横条造成的)。 */
+  .retrans-wrap {
+    position: relative;
     display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.25rem 0.5rem 0.25rem 0.75rem;
-    background: var(--warning-tint);
-    border: 1px solid var(--warning-line);
+  }
+  /* 形态与导出菜单同源(同底、同圆角、同投影、同边框):本页已有一套浮层语言,
+     再造第二套只会让界面更碎。右对齐——按钮在操作栏右侧,左展开会顶出视口。 */
+  .retrans-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 30;
+    width: 17rem;
+    display: flex;
+    flex-direction: column;
+    padding: 4px;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
     border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
     animation: capsule-in 120ms ease;
+  }
+  /* 破坏性说明放在顶部做小字注记,不做成警告色块:它要被读一遍,不该每次打开
+     都像报错一样吓人;真正的危险信号交给下面两项的动作文案本身。 */
+  .retrans-menu-note {
+    margin: 0;
+    padding: 0.5em 0.7em 0.55em;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--ink-secondary);
+    border-bottom: 1px solid var(--hairline);
+  }
+  .retrans-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1em;
+    border: none;
+    background: none;
+    box-shadow: none;
+    text-align: left;
+    padding: 0.45em 0.7em;
+    border-radius: var(--radius-md);
+    color: var(--ink);
+    cursor: pointer;
+    transition: background 120ms ease;
+  }
+  .retrans-item:hover:not(:disabled) {
+    background: var(--surface-soft);
+  }
+  .retrans-item:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .retrans-item-main {
+    font-size: 0.85rem;
+    font-weight: 500;
+  }
+  .retrans-item-sub {
+    font-size: 0.72rem;
+    line-height: 1.45;
+    color: var(--ink-faint);
+  }
+  .retrans-item.quiet .retrans-item-main {
+    font-weight: 400;
+    color: var(--ink-secondary);
+  }
+  .retrans-btn.open {
+    background: var(--surface-soft);
   }
   @keyframes capsule-in {
     from {
@@ -4000,7 +4121,7 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .confirm-capsule {
+    .retrans-menu {
       animation: none;
     }
   }
@@ -4008,10 +4129,62 @@
      idle 已是彩色魔杖;hover 星火向外迸射、金星芒放大旋转带光晕;施法(casting)时魔杖大幅挥动 +
      金星芒 360° 旋转脉动发光 + 三色星火依次飞出闪烁。用户要「彩色/更大/动效夸张」——放开 DESIGN 的克制,
      但仍克制在一颗按钮内;respect prefers-reduced-motion。 */
-  .reaing {
+  /* 工具条动作对:AI 与「重新转文字」是两个同级动作,必须同形同高。走 DESIGN.md 的
+     button-secondary(透明底 + 1px hairline-strong + radius-md + ink 字,hover
+     surface-soft,无阴影)。
+     2026-09-20 用户实报「缺乏质感」,查下来是两条具体的破绽:
+     ① `.reaing` 一条盒模型样式都没有——那圈边框是**浏览器默认按钮外观**,和旁边
+        手写的胶囊并排,圆角、高度、字重全不是一路;
+     ② `.retrans-btn` 用了 radius-full,而本仓「药丸仅主按钮与录制点」(DESIGN.md
+        §圆角),次级动作用药丸会和录制键抢同一个视觉身份。
+     不把两颗合成 segmented:那形态表示「多选一」,而这俩是彼此独立的动作。 */
+  .reaing,
+  .retrans-btn {
     display: inline-flex;
     align-items: center;
-    gap: 0.5em;
+    justify-content: center;
+    gap: 0.45em;
+    /* 同高写死:并排两颗差 1px 都看得出来,靠各自 padding 凑必然对不齐。
+       魔杖 18px:22px 在这个盒子里只剩 5px 上下留白,且与文字(12.8px)比到 1.7:1,
+       读起来是"一个图标配了行小字"。18px 仍明显比常规图标大、彩色与动效照旧,
+       但不再撑破这一行的节奏(用户「更大/夸张」的诉求由颜色与施法动效承担)。 */
+    height: 2.05rem;
+    padding: 0 0.7em;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--ink);
+    font-size: 0.8rem;
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background 120ms ease,
+      border-color 120ms ease,
+      color 120ms ease;
+  }
+  .reaing:hover:not(:disabled),
+  .retrans-btn:hover:not(:disabled) {
+    background: var(--surface-soft);
+    border-color: var(--hairline-strong);
+  }
+  /* 键盘焦点环:accent 在本仓只表达链接/焦点/选中(DESIGN.md §色),这两颗此前
+     完全没有焦点样式——键盘走到哪儿看不见。 */
+  .reaing:focus-visible,
+  .retrans-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .reaing:disabled,
+  .retrans-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  /* AI 整理按钮的宽度按最宽那个状态钉死:文案会在「AI 整理」⇄「Aing」⇄ 带状态点
+     之间切换,不钉的话每次状态一变,它右边的「重新转文字」就跟着横跳一下。 */
+  .reaing {
+    min-width: 6.4rem;
     --wand-gold: #f6b02e;
     --wand-violet: #a678ff;
     --wand-cyan: #46bcff;
@@ -4233,6 +4406,16 @@
   .state.interrupted {
     background: var(--warning-line);
     color: var(--warning-ink);
+    font-size: 0.7em;
+    font-weight: 500;
+    border-radius: var(--radius-md);
+    padding: 0.1em 0.45em;
+    margin-left: 0.4em;
+  }
+  /* 导入来源:中性标记(不是警告),只说明出身,同尺寸与中断标同行不打架 */
+  .state.imported {
+    background: var(--surface-press);
+    color: var(--ink-secondary);
     font-size: 0.7em;
     font-weight: 500;
     border-radius: var(--radius-md);

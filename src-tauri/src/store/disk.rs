@@ -143,6 +143,7 @@ mod tests {
             calendar: None,
             calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
+            imported_from: None,
         };
         std::fs::write(note_dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
     }

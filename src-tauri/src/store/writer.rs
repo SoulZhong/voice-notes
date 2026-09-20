@@ -77,9 +77,33 @@ pub fn is_default_title(t: &str) -> bool {
     false
 }
 
+/// 分配一个新笔记目录:id = 本地时间 `YYYYmmdd-HHMMSS`(同秒冲突加 `-2`/`-3` 后缀),
+/// 建出目录并返回 `(id, dir)`。录制建档(`create`)与导入建档(`crate::import`)共用
+/// 同一份 id 规则——两边各写一份必然漂移,而同秒发起的"开录"与"导入"正是要靠这条
+/// 唯一性(先建目录者占名,后来者顺延)才不会撞进同一个目录。
+pub(crate) fn alloc_note_dir(
+    notes_dir: &Path,
+    now: &DateTime<Local>,
+) -> anyhow::Result<(String, PathBuf)> {
+    std::fs::create_dir_all(notes_dir)?;
+    let base = now.format("%Y%m%d-%H%M%S").to_string();
+    let mut id = base.clone();
+    let mut n = 1;
+    let dir = loop {
+        let d = notes_dir.join(&id);
+        if !d.exists() {
+            break d;
+        }
+        n += 1;
+        id = format!("{base}-{n}");
+    };
+    std::fs::create_dir(&dir)?;
+    Ok((id, dir))
+}
+
 /// 同日重名去重:「周二晚上的会议」已存在 → 「周二晚上的会议 2」。只扫同日(id 前缀
 /// 同 YYYYmmdd)兄弟目录的 meta 标题,一天内笔记数量级小,线性扫可忽略。
-fn unique_default_title(notes_dir: &Path, now: &DateTime<Local>) -> String {
+pub(crate) fn unique_default_title(notes_dir: &Path, now: &DateTime<Local>) -> String {
     let base = default_title(now);
     let day = now.format("%Y%m%d").to_string();
     let mut taken: Vec<String> = Vec::new();
@@ -112,19 +136,7 @@ impl NoteWriter {
     /// 在 notes_dir 下建会议文件夹（id = 本地时间 YYYYmmdd-HHMMSS，同秒冲突加 -2/-3 后缀），
     /// 写入 state=recording 的 meta，打开 segments.jsonl。
     pub fn create(notes_dir: &Path, now: DateTime<Local>) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(notes_dir)?;
-        let base = now.format("%Y%m%d-%H%M%S").to_string();
-        let mut id = base.clone();
-        let mut n = 1;
-        let dir = loop {
-            let d = notes_dir.join(&id);
-            if !d.exists() {
-                break d;
-            }
-            n += 1;
-            id = format!("{base}-{n}");
-        };
-        std::fs::create_dir(&dir)?;
+        let (id, dir) = alloc_note_dir(notes_dir, &now)?;
         // 目录已定、segments 句柄未开:此处取锁(有界重试吸收瞬时竞争,见 NoteLock::acquire),
         // 全部重试仍拿不到说明另一实例正占着本笔记。
         let lock = super::notelock::NoteLock::acquire(&dir)
@@ -142,6 +154,7 @@ impl NoteWriter {
             calendar: None,
             calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
+            imported_from: None, // 录制建档恒 None;导入走 crate::import::create_note
         };
         write_meta_atomic(&dir, &meta)?;
         let file = OpenOptions::new()
@@ -346,9 +359,33 @@ impl NoteWriter {
                 eprintln!("finalize: speakers.json 落盘失败（不阻塞收尾）: {e}");
             }
         }
-        self.meta.ended_at = Some(now.to_rfc3339());
-        self.meta.state = "complete".into();
-        write_meta_atomic(&self.dir, &self.meta)
+        self.write_meta_merged(|meta| {
+            meta.ended_at = Some(now.to_rfc3339());
+            meta.state = "complete".into();
+        })
+    }
+
+    /// 录制期改 meta 的唯一通道:在 **meta 专用锁**内重读盘上最新 meta,只覆盖 writer
+    /// 自己负责的字段(由 `f` 指定),原子落盘,再同步回内存副本。
+    ///
+    /// 为什么不再整份写 `self.meta`(2026-09-19):meta 专用锁把「与会人员 / 日程」
+    /// 这类纯字段编辑从 `.note.lock` 里解放出来之后,它们在录制期间**可能**与本
+    /// writer 并发发生——命令层的活动笔记守卫只挡住了与会人员与改名,日历回填
+    /// (backfill_calendar_matches)没挡,此前全靠 writer 持着 `.note.lock` 才撞不上。
+    /// 整份写内存副本会把这些并发编辑悄悄冲掉(set_title 的老注释「改盘会被 finalize
+    /// 的内存 meta 覆盖」记的就是这个坑);重读-合并-落盘让 writer 只对自己的字段负责。
+    ///
+    /// 盘上 meta 读不出来时回落内存副本:录制中途 meta 被外部删掉/写坏,收尾仍要
+    /// 落一份完整的 meta,这比连 state=complete 都写不进去要好。
+    fn write_meta_merged(&mut self, f: impl FnOnce(&mut NoteMeta)) -> anyhow::Result<()> {
+        let _flock = super::notelock::NoteLock::acquire_meta(&self.dir)
+            .map_err(|e| anyhow::anyhow!("笔记元数据锁不可用: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("另一处正在修改这篇笔记的信息,请重试"))?;
+        let mut meta = super::notes::read_meta(&self.dir).unwrap_or_else(|| self.meta.clone());
+        f(&mut meta);
+        write_meta_atomic(&self.dir, &meta)?;
+        self.meta = meta;
+        Ok(())
     }
 
     /// 从内存说话人表原子落盘 speakers.json（复用 write_speakers_atomic）。
@@ -361,14 +398,12 @@ impl NoteWriter {
     /// 的内存 meta 覆盖),MCP start_recording(title) 由 UDS handler 经 writer 走
     /// 这里——内存与磁盘同步更新,finalize 自然保留。
     pub fn set_title(&mut self, title: &str) -> anyhow::Result<()> {
-        self.meta.title = title.to_string();
-        write_meta_atomic(&self.dir, &self.meta)
+        self.write_meta_merged(|meta| meta.title = title.to_string())
     }
 
     /// 记录本场实际使用的识别引擎(每场覆盖;语义见 NoteMeta::asr_engine)。
     pub fn set_asr_engine(&mut self, engine: &str) -> anyhow::Result<()> {
-        self.meta.asr_engine = Some(engine.to_string());
-        write_meta_atomic(&self.dir, &self.meta)
+        self.write_meta_merged(|meta| meta.asr_engine = Some(engine.to_string()))
     }
 
     /// 合入 worker 结束时的质心快照(DiarEvent::Snapshot)：只 merge 质心/count/person 进
@@ -1878,5 +1913,63 @@ mod tests {
         assert!(crate::store::notelock::NoteLock::try_exclusive(&note_dir)
             .unwrap()
             .is_some());
+    }
+
+    /// 录制收尾不得冲掉录制期间**别处**写进 meta 的字段。
+    ///
+    /// 背景(2026-09-19):meta 拆出 `.meta.lock` 之后,与会人员/日程这类编辑不再被
+    /// writer 手里的 `.note.lock` 挡在门外——日历回填(backfill_calendar_matches)
+    /// 本来就没有活动笔记守卫,此前纯靠那把锁撞不上。finalize 若还整份写内存副本,
+    /// 这些并发编辑会在收尾那一刻被静默抹掉(set_title 的老注释「改盘会被 finalize
+    /// 的内存 meta 覆盖」记的正是这个坑)。现在 finalize 重读-合并-落盘。
+    #[test]
+    fn finalize_preserves_meta_fields_written_during_recording() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let note_dir = tmp.path().join(w.note_id());
+        w.append_final("mic", "一句", 0, 900, None, None).unwrap();
+
+        // 录制进行中,别处改了 meta(模拟日历回填 / 与会人员编辑)。
+        // 它拿的是 `.meta.lock`,与 writer 手里的 `.note.lock` 不冲突——这一步能成功
+        // 本身就是修复的一半。
+        crate::store::notes::update_meta(&note_dir, |m| {
+            m.attendees = vec!["张三".into()];
+            m.calendar_cleared = true;
+            true
+        })
+        .expect("录制期间的纯 meta 编辑应可写入");
+
+        w.finalize(now()).unwrap();
+
+        let m = crate::store::notes::read_meta(&note_dir).expect("meta 应可读");
+        assert_eq!(m.state, "complete", "writer 仍要负责自己的字段");
+        assert!(m.ended_at.is_some());
+        assert_eq!(m.attendees, vec!["张三".to_string()], "并发写入的与会人员不得被收尾冲掉");
+        assert!(m.calendar_cleared, "并发写入的日历标记不得被收尾冲掉");
+    }
+
+    /// 录制中改标题(MCP start_recording(title) 走的那条路)同样走合并写:
+    /// 只覆盖 title,别处并发写进去的字段原样留住,内存副本也同步到最新。
+    #[test]
+    fn set_title_merges_instead_of_clobbering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let note_dir = tmp.path().join(w.note_id());
+        crate::store::notes::update_meta(&note_dir, |m| {
+            m.attendees = vec!["李四".into()];
+            true
+        })
+        .unwrap();
+
+        w.set_title("评审会").unwrap();
+
+        let m = crate::store::notes::read_meta(&note_dir).unwrap();
+        assert_eq!(m.title, "评审会");
+        assert_eq!(m.attendees, vec!["李四".to_string()], "改标题不得顺手抹掉与会人员");
+        // 内存副本也已同步:紧接着的 finalize 不会拿着旧副本回写。
+        w.finalize(now()).unwrap();
+        let m2 = crate::store::notes::read_meta(&note_dir).unwrap();
+        assert_eq!(m2.title, "评审会");
+        assert_eq!(m2.attendees, vec!["李四".to_string()]);
     }
 }

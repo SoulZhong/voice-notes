@@ -192,6 +192,7 @@ mod calendar_common_tests {
             calendar: None,
             calendar_cleared: false, attendees: vec![], attendees_removed: vec![],
             asr_engine: None,
+            imported_from: None,
         };
         let seg = crate::store::SegmentRecord {
             seq: 0,

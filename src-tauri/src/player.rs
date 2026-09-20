@@ -7,7 +7,7 @@
 //!
 //! 结构:
 //! - 音轨 WAV(16k 单声道 s16、标准 44 头)mmap 进回调,随机访问零拷贝,seek=改游标;
-//!   m4a 先经 afconvert 解码到应用缓存目录(decode_m4a_to_standard_wav),缓存跨会话
+//!   m4a 先经 afconvert 解码到应用缓存目录(decode_to_standard_wav),缓存跨会话
 //!   复用、启动时清理过期(见 clean_playback_cache)。
 //! - 单输出流 = 单一采样时钟:游标以 16k 源域采样计,双轨对齐按构造成立(与录音侧
 //!   「文件内毫秒 + offset_ms == 时间轴毫秒」同一哲学);设备采样率差异由游标按
@@ -706,7 +706,7 @@ pub async fn player_load(
             if !fresh {
                 let (src2, cache2) = (src.clone(), cache.clone());
                 tauri::async_runtime::spawn_blocking(move || {
-                    crate::store::transcode::decode_m4a_to_standard_wav(&src2, &cache2)
+                    crate::store::transcode::decode_to_standard_wav(&src2, &cache2)
                 })
                 .await
                 .map_err(|e| crate::tr!("解码任务失败: {e}", "Decode task failed: {e}"))?
@@ -1286,7 +1286,7 @@ mod tests {
     }
 
     /// 离线复现真实播放器混音,供排查"叠放两遍/门控错位"类回放 bug。
-    /// 解码走生产同款 `decode_m4a_to_standard_wav`(44 头 canonical),门控走真 build_gate,
+    /// 解码走生产同款 `decode_to_standard_wav`(44 头 canonical),门控走真 build_gate,
     /// 采样/插值/门控全部经真 `mix_frames`,48k 设备率(与真机同 step=1/3)。
     /// 输出 48k 单声道 WAV,可直接试听或做自相关看有没有被叠出回声。
     /// env: VN_MIX_NOTE=笔记目录  VN_MIX_OUT=输出wav  VN_MIX_START_MS(默0) VN_MIX_DUR_MS(默600000)
@@ -1309,7 +1309,7 @@ mod tests {
                 return std::fs::read(&wav).unwrap();
             }
             let dest = tmp.path().join(format!("{src}.wav"));
-            crate::store::transcode::decode_m4a_to_standard_wav(&m4a, &dest).unwrap();
+            crate::store::transcode::decode_to_standard_wav(&m4a, &dest).unwrap();
             std::fs::read(&dest).unwrap()
         };
 

@@ -284,6 +284,12 @@ struct NoteIdArg {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct ImportParams {
+    /// 本地音频文件的**绝对路径**(不做 shell 展开,~ 不会被解释)
+    path: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct RetranscribeParams {
     /// 目标笔记 id
     note_id: String,
@@ -487,9 +493,19 @@ impl VnMcp {
         .await)
     }
 
-    #[tool(description = "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。需要应用运行。")]
+    #[tool(description = "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。需要应用运行。音频导入的转写阶段也占这个槽、也在这里查得到。")]
     async fn retranscribe_status(&self) -> Result<CallToolResult, McpError> {
         Ok(bridge_call("retranscribe_status", serde_json::json!({})).await)
+    }
+
+    #[tool(
+        description = "把一个本地音频文件导入成一篇笔记:解码成标准音轨建档(同步,返回新笔记 id),随后在后台转写+认人+AI 整理,与停录后的链路完全一致。支持 mp3/m4a/aac/wav/aiff/caf/mp4/flac(非 macOS 只支持 wav)。转写进度用 retranscribe_status 轮询(导入的转写阶段与重转写共用同一个全局槽,同一时刻只跑一个)。需要应用运行 + 用户开启「允许 AI 控制录制」。"
+    )]
+    async fn import_audio(
+        &self,
+        Parameters(ImportParams { path }): Parameters<ImportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("import", serde_json::json!({ "path": path })).await)
     }
 
     #[tool(
@@ -513,7 +529,7 @@ impl ServerHandler for VnMcp {
     }
 }
 
-/// `/ai` 页展示用的静态能力清单:MCP 十五工具 + CLI 命令一行用法。与上方 `#[tool]`
+/// `/ai` 页展示用的静态能力清单:MCP 工具 + CLI 命令一行用法。与上方 `#[tool]`
 /// 定义相邻放置,便于人工同步;`catalog_matches_tool_router` 测试做防漂移守卫。
 /// gate:`none` 随时可用,`app` 需 App 运行,`control` 还需用户开启「允许 AI 控制录制」。
 pub fn catalog() -> serde_json::Value {
@@ -552,7 +568,12 @@ pub fn catalog() -> serde_json::Value {
             "对一篇已完成的笔记发起文件重转写:离线重读盘上音轨重新跑 ASR,覆盖原始逐字稿(自动备份,说话人尽量保留)。异步启动即返回。",
             "control",
         ),
-        ("retranscribe_status", "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。", "app"),
+        ("retranscribe_status", "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。音频导入的转写阶段同占此槽。", "app"),
+        (
+            "import_audio",
+            "把一个本地音频文件导入成一篇笔记:解码建档后在后台转写+认人+AI 整理,与停录后的链路一致。mp3/m4a/aac/wav/aiff/caf/mp4/flac(非 macOS 只支持 wav)。",
+            "control",
+        ),
         ("refine_status", "查询一篇笔记的 Aing 状态(在跑/心跳/盘上稿三视角),区分在跑/收工/停摆。", "app"),
         (
             "identify_speakers",
@@ -611,13 +632,14 @@ mod catalog_tests {
         );
         assert_eq!(
             cat_names.len(),
-            17,
-            "11 个既有工具 + get_aing_context/apply_aing_graph + retranscribe_note/retranscribe_status + identify_speakers + refine_status"
+            18,
+            "11 个既有工具 + get_aing_context/apply_aing_graph + retranscribe_note/retranscribe_status + identify_speakers + refine_status + import_audio"
         );
         assert!(cat_names.contains("get_aing_context"));
         assert!(cat_names.contains("apply_aing_graph"));
         assert!(cat_names.contains("retranscribe_note"));
         assert!(cat_names.contains("retranscribe_status"));
+        assert!(cat_names.contains("import_audio"));
     }
 
     #[test]

@@ -34,6 +34,11 @@
   --accent: light-dark(#0f7fd1, #57c1ff);
   --accent-pressed: light-dark(#0c6ab0, #3fa9e8);
   --accent-tint: light-dark(rgba(15, 127, 209, 0.1), rgba(87, 193, 255, 0.15));
+  /* accent-tint 的更浅一档:给「常驻在正文里、数量多」的标记用(实体提及底色)。
+     必须比 accent-tint 浅——正文里同时存在三档同色系底,浓淡就是它们的区别:
+     常驻实体(soft) < hover / 实体定位 / 当前播放段(tint) < 当前定位项(tint + 描边)。
+     三档取同一个色相,深浅拉开;谁跟谁调成一样,对应的那层信息就消失了。 */
+  --accent-tint-soft: light-dark(rgba(15, 127, 209, 0.05), rgba(87, 193, 255, 0.08));
   --on-accent: light-dark(#ffffff, #07080a);
 
   /* 主按钮药丸:亮色黑底白字(暗色白底黑字的极性翻转) */
