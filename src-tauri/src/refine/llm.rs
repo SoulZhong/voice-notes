@@ -128,7 +128,7 @@ impl super::backfill::RelationExecutor for HttpRelationExecutor {
         note_id: &str,
         doc: &crate::store::RefinedDoc,
     ) -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
-        let raw = extract_relations(&self.cfg, doc)?;
+        let raw = extract_relations(&self.cfg, doc, None)?;
         super::relations::materialize(note_id, doc, raw).map_err(|issues| {
             anyhow::anyhow!(
                 "图谱校验失败:{}",
@@ -221,6 +221,9 @@ impl super::identify::IdentifyExecutor for HttpIdentifyExecutor {
 pub fn extract_relations(
     cfg: &LlmConfig,
     doc: &crate::store::RefinedDoc,
+    // 2026-09-20 补埋点:这条调用此前完全不落 ai_logs——它的成本、耗时、失败原因
+    // 在日志上一个字都没有,而关系从分块摘出来之后它就是关系唯一的产出口。
+    log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<Vec<RawRelation>> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let paragraphs = doc
@@ -249,12 +252,38 @@ pub fn extract_relations(
     apply_thinking_off(&cfg.base_url, &mut body);
     // 关系抽取与分块精修同属长请求(要读完整篇段落再吐结构化关系),用同一档超时,
     // 瞬时失败也同样重试一次(Codex P2:漏了这条路径,一次抖动就白丢整篇关系)。
-    let response = post_long_with_retry(cfg, &url, &body.to_string())?;
-    let envelope: Value = serde_json::from_str(&response)?;
-    let content = envelope["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("响应缺 choices[0].message.content"))?;
-    parse_relation_only_payload(content)
+    let started = std::time::Instant::now();
+    let payload = body.to_string();
+    let outcome = post_long_with_retry(cfg, &url, &payload).and_then(|response| {
+        let envelope: Value = serde_json::from_str(&response)?;
+        let content = envelope["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("响应缺 choices[0].message.content"))?;
+        // 原始响应与解析结果一起交出去:解析失败时日志里也要留下**原始正文**,
+        // 否则 finish_reason 之类的证据随错误一起蒸发(与 do_call_chunk 同一条教训)。
+        parse_relation_only_payload(content).map(|relations| (relations, response))
+    });
+    if let Some(ctx) = log {
+        let (response, status, error) = match &outcome {
+            Ok((_, raw)) => (Value::String(raw.clone()), "ok", None),
+            Err(e) => (Value::Null, "error", Some(e.to_string())),
+        };
+        crate::ailog::record(
+            ctx,
+            crate::ailog::Draft {
+                kind: "refine_relations",
+                provider: "openai".into(),
+                model: Some(cfg.model.clone()),
+                endpoint: Some(url.clone()),
+                request: body.clone(),
+                response,
+                status,
+                error,
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    }
+    outcome.map(|(relations, _)| relations)
 }
 
 #[derive(serde::Deserialize)]
@@ -271,17 +300,10 @@ fn parse_relation_only_payload(content: &str) -> anyhow::Result<Vec<RawRelation>
 pub enum LlmOutcome {
     Done,
     /// 文本和实体可用，但至少一块缺少/损坏 relations；只降级关系阶段。
-    DoneWithRelationErrors,
     /// 部分块失败,携带失败块覆盖的**段落下标**(升序去重)——部分重跑只重发这些段,
     /// 已成功的一个 token 不花(2026-08-20 设计)。len() 即旧的失败块计数语义。
     Partial(Vec<usize>),
     Failed,
-}
-
-impl LlmOutcome {
-    pub(crate) fn relations_complete(&self) -> bool {
-        matches!(self, Self::Done)
-    }
 }
 
 /// 大模型每块吐出的原始实体(未去重、未分配 id)。解析层(refine/mod.rs)再规范化。
@@ -458,7 +480,7 @@ fn call_chunk(
     glossary: &Value,
     paragraphs: &[ChunkPara],
     log: Option<&crate::ailog::Ctx>,
-) -> Result<(Value, Vec<String>, Vec<RawEntity>, Vec<RawRelation>, bool), ChunkErr> {
+) -> Result<(Value, Vec<String>, Vec<RawEntity>), ChunkErr> {
     let numbered = format_chunk_paragraphs(paragraphs);
     let user = prompts::refine_user(glossary, &numbered);
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
@@ -488,7 +510,7 @@ fn call_chunk(
         // 否则 finish_reason 证据随 null 一起蒸发(2026-08-27 审计教训)。
         if let Some(ctx) = log {
             let (response, status, error) = match &r {
-                Ok((raw_ok, _, _, _, _, _)) => (Value::String(raw_ok.clone()), "ok", None),
+                Ok((raw_ok, _, _, _)) => (Value::String(raw_ok.clone()), "ok", None),
                 Err(e) => (
                     raw.take().map(Value::String).unwrap_or(Value::Null),
                     "error",
@@ -516,9 +538,7 @@ fn call_chunk(
         std::thread::sleep(std::time::Duration::from_secs(RETRY_BACKOFF_S[attempt]));
         attempt += 1;
     };
-    result.map(|(_, glossary, texts, ents, relations, relations_valid)| {
-        (glossary, texts, ents, relations, relations_valid)
-    })
+    result.map(|(_, glossary, texts, ents)| (glossary, texts, ents))
 }
 
 /// 从**整份不可解析**的响应正文里,按括号配对抠出 `"texts"` 那个数组。
@@ -618,17 +638,7 @@ fn do_call_chunk(
     // 此前错误路径记 null,把 finish_reason 证据全销毁了,"传输截断"与"token
     // 截断"从日志上无法区分(2026-08-27 审计,issue #175)。
     raw_out: &mut Option<String>,
-) -> Result<
-    (
-        String,
-        Value,
-        Vec<String>,
-        Vec<RawEntity>,
-        Vec<RawRelation>,
-        bool,
-    ),
-    ChunkErr,
-> {
+) -> Result<(String, Value, Vec<String>, Vec<RawEntity>), ChunkErr> {
     let resp_text = crate::netproxy::agent_for(&url).post(url)
         .timeout(std::time::Duration::from_secs(CHUNK_TIMEOUT_S))
         .set("authorization", &format!("Bearer {}", cfg.api_key))
@@ -670,9 +680,8 @@ fn do_call_chunk(
                         "refine llm: 整份 JSON 不可解析,已抢救 texts({} 段);本块不取术语表与实体,关系交独立阶段: {e}",
                         texts.len()
                     );
-                    // relations_valid=false 把关系交给独立关系阶段(既有机制),
                     // 术语表给空对象:坏 JSON 里抠出来的术语表不可信,也没必要冒险前传。
-                    return Ok((resp_text, json!({}), texts, Vec::new(), Vec::new(), false));
+                    return Ok((resp_text, json!({}), texts, Vec::new()));
                 }
                 None => return Err(content_err(e.into())),
             }
@@ -691,27 +700,11 @@ fn do_call_chunk(
         )));
     }
     let entities = parse_raw_entities(&parsed["entities"]);
-    let (relations, relations_valid) = match parsed.get("relations") {
-        Some(value) => match serde_json::from_value::<Vec<RawRelation>>(value.clone()) {
-            Ok(relations) => (relations, true),
-            Err(error) => {
-                eprintln!("refine llm: relations 解析失败: {error}");
-                (Vec::new(), false)
-            }
-        },
-        None => {
-            eprintln!("refine llm: 响应缺 relations 数组");
-            (Vec::new(), false)
-        }
-    };
-    Ok((
-        resp_text,
-        parsed["glossary"].clone(),
-        texts_out,
-        entities,
-        relations,
-        relations_valid,
-    ))
+    // 关系不再从分块响应里取(2026-09-20):它曾占 32% 的输出 token,是撞 token 上限的
+    // 主因,而 relations_complete() 要求**每一块**都完美才采信——盘上实测 121 篇 failed、
+    // 0 篇 done,等于每块都在为一个从未成功过的字段付费。改由整篇独立抽一次,
+    // 见 refine::mod 里 extract_relations 的调用点。
+    Ok((resp_text, parsed["glossary"].clone(), texts_out, entities))
 }
 
 /// 为整场笔记生成主题标题(Aing 完成后调用,替换未被用户改过的默认标题)。
@@ -804,10 +797,10 @@ pub fn polish(
     // ② 界面进度(「精修中 3/8 · 约剩 4 分」)——avg_ms 是已完成块的平均耗时,
     //   done<1 时为 0,ETA 由前端乘剩余块数(2026-08-20 设计)。
     progress: &dyn Fn(usize, usize, u64),
-) -> (LlmOutcome, Vec<RawEntity>, Vec<RawRelation>) {
+) -> (LlmOutcome, Vec<RawEntity>) {
     let chunks = chunk_indices(paragraphs);
     if chunks.is_empty() {
-        return (LlmOutcome::Done, Vec::new(), Vec::new());
+        return (LlmOutcome::Done, Vec::new());
     }
     // 队列而非定长循环:输出截断(Truncated)的块**对半拆开压回队首**,各半独立成败。
     // 拆块是截断的唯一正解——重试同一块只会在同一 token 上限处再断;len==1 拆无可拆,
@@ -822,8 +815,6 @@ pub fn polish(
     let mut failed_paras: Vec<usize> = Vec::new();
     let mut network_failed = 0usize;
     let mut all_entities: Vec<RawEntity> = Vec::new();
-    let mut all_relations: Vec<RawRelation> = Vec::new();
-    let mut relation_failed = false;
     while let Some(chunk) = queue.pop_front() {
         progress(done, total, if done > 0 { spent_ms / done as u64 } else { 0 });
         let t0 = std::time::Instant::now();
@@ -839,7 +830,7 @@ pub fn polish(
             })
             .collect();
         match call_chunk(cfg, &glossary, &inputs, log) {
-            Ok((g, outs, ents, relations, relations_valid)) => {
+            Ok((g, outs, ents)) => {
                 if let Value::Object(map) = g {
                     if let Value::Object(acc) = &mut glossary {
                         // 逐条过卫生门再累积(见 glossary_entry_sane):术语表是**逐块
@@ -860,11 +851,6 @@ pub fn polish(
                     }
                 }
                 all_entities.extend(ents);
-                if relations_valid {
-                    all_relations.extend(relations);
-                } else {
-                    relation_failed = true;
-                }
             }
             Err(ChunkErr::Truncated(e)) if chunk.len() > 1 => {
                 // 拆块不计 done(这块还没完),两半各成一块;耗时照记(真实花了)。
@@ -887,7 +873,6 @@ pub fn polish(
                 }
                 eprintln!("refine llm: 块失败保留原文: {e}");
                 failed_paras.extend(chunk.iter().copied());
-                relation_failed = true;
             }
         }
         spent_ms += t0.elapsed().as_millis() as u64;
@@ -901,16 +886,14 @@ pub fn polish(
         // network_failed 对比的是块数,改用"有失败段"的布尔即可。
         !failed_paras.is_empty()
     };
-    let outcome = if !failed && relation_failed {
-        LlmOutcome::DoneWithRelationErrors
-    } else if !failed {
+    let outcome = if !failed {
         LlmOutcome::Done
     } else if network_failed == total {
         LlmOutcome::Failed
     } else {
         LlmOutcome::Partial(failed_paras)
     };
-    (outcome, all_entities, all_relations)
+    (outcome, all_entities)
 }
 
 #[cfg(test)]
@@ -1052,12 +1035,12 @@ mod tests {
         let base = mock_server(vec![body]);
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("原文一"), para("原文二")];
-        let (outcome, ents, _rel) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, ents) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert_eq!(ps[0].text, "修订一", "抢救出来的正文要真的落到段落上");
         assert_eq!(ps[1].text, "修订二");
         assert!(
-            matches!(outcome, LlmOutcome::DoneWithRelationErrors),
-            "正文成功、关系判否 → 交独立关系阶段,不是 Partial: {outcome:?}"
+            matches!(outcome, LlmOutcome::Done),
+            "抢救出正文即算这块成功(关系本就由独立阶段产出),不是 Partial: {outcome:?}"
         );
         assert!(ents.is_empty(), "坏 JSON 里的实体不取(不可信)");
     }
@@ -1070,7 +1053,7 @@ mod tests {
         let base = mock_server(vec![body]);
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("原文一"), para("原文二")];
-        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, _e) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert_eq!(ps[0].text, "原文一", "半截 texts 不许硬凑");
         assert!(matches!(outcome, LlmOutcome::Partial(v) if v.len() == 2));
     }
@@ -1094,7 +1077,7 @@ mod tests {
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("原一。"), para("原二。")];
         // 强制两段同块:正文远短于 CHUNK_CHARS,chunk_indices 天然会并成一块。
-        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, _e) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(matches!(outcome, LlmOutcome::Done), "拆块后两半都成功,整体应 Done: {outcome:?}");
         assert_eq!(ps[0].text, "修一。");
         assert_eq!(ps[1].text, "修二。");
@@ -1122,7 +1105,7 @@ mod tests {
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para(&long), para("原二。"), para("原三。")];
         let calls = std::sync::Mutex::new(Vec::<(usize, usize)>::new());
-        let (outcome, _e, _r) =
+        let (outcome, _e) =
             polish(&cfg, &mut ps, &Default::default(), None, &|d, t, _| {
                 calls.lock().unwrap().push((d, t));
             });
@@ -1146,7 +1129,7 @@ mod tests {
         let base = mock_server(vec![truncated]);
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("原文。")];
-        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, _e) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(
             matches!(outcome, LlmOutcome::Partial(_)),
             "单段截断=内容失败保原文,非网络失败: {outcome:?}"
@@ -1239,7 +1222,7 @@ mod tests {
             api_key: "k".into(),
         };
         let mut ps = vec![para("我们肯计要做。")];
-        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, _ents) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(matches!(outcome, LlmOutcome::Done));
         assert_eq!(ps[0].text, "我们肯定要做。");
     }
@@ -1269,7 +1252,7 @@ mod tests {
             api_key: "k".into(),
         };
         let mut ps = vec![para("我们肯计要做。")];
-        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, _e) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(matches!(outcome, LlmOutcome::Done), "重试成功后应是完整成功");
         assert_eq!(ps[0].text, "我们肯定要做。");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2, "应当重试了一次");
@@ -1286,7 +1269,7 @@ mod tests {
             api_key: "k".into(),
         };
         let mut ps = vec![para("原文")];
-        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, _e) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(matches!(outcome, LlmOutcome::Failed), "全块网络失败即整体失败");
         assert_eq!(ps[0].text, "原文");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "4xx 不得重试");
@@ -1304,7 +1287,7 @@ mod tests {
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para(&long_a), para(&long_b)];
         let calls = std::cell::RefCell::new(Vec::<(usize, usize)>::new());
-        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|d, t, _| calls.borrow_mut().push((d, t)));
+        let (outcome, _e) = polish(&cfg, &mut ps, &Default::default(), None, &|d, t, _| calls.borrow_mut().push((d, t)));
         match outcome {
             LlmOutcome::Partial(v) => assert_eq!(v, vec![1], "失败下标应指向块 2 的段"),
             other => panic!("应为 Partial,得到 {other:?}"),
@@ -1328,7 +1311,7 @@ mod tests {
             api_key: "k".into(),
         };
         let mut ps = vec![para("原文")];
-        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, _e) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(matches!(outcome, LlmOutcome::Partial(v) if v.len() == 1));
         assert_eq!(ps[0].text, "原文");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "内容类错误不得重试");
@@ -1356,7 +1339,7 @@ mod tests {
             api_key: "k".into(),
         };
         let mut ps = vec![para("原文一")];
-        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, _ents) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(matches!(outcome, LlmOutcome::Partial(v) if v.len() == 1));
         assert_eq!(ps[0].text, "原文一", "长度不符必须保留原文");
     }
@@ -1379,12 +1362,11 @@ mod tests {
             };
             let mut ps = vec![para("原文")];
 
-            let (outcome, entities, relations) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+            let (outcome, entities) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
 
             assert!(matches!(outcome, LlmOutcome::Partial(v) if v.len() == 1));
             assert_eq!(ps[0].text, "原文", "坏块必须完整保留原文");
             assert!(entities.is_empty(), "坏块实体不得混入整篇结果");
-            assert!(relations.is_empty(), "坏块关系不得被视为完整结果");
         }
     }
 
@@ -1396,7 +1378,7 @@ mod tests {
             api_key: "k".into(),
         };
         let mut ps = vec![para("原文")];
-        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, _ents) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(matches!(outcome, LlmOutcome::Failed));
         assert_eq!(ps[0].text, "原文");
     }
@@ -1416,7 +1398,7 @@ mod tests {
             api_key: "SECRET-KEY".into(),
         };
         let mut ps = vec![para("原文。")];
-        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, &Default::default(), Some(&ctx), &|_, _, _| {});
+        let (outcome, _ents) = polish(&cfg, &mut ps, &Default::default(), Some(&ctx), &|_, _, _| {});
         assert!(matches!(outcome, LlmOutcome::Done));
         // 连不上的一轮:同样要留痕
         let cfg_bad = LlmConfig {
@@ -1425,7 +1407,7 @@ mod tests {
             api_key: "k".into(),
         };
         let mut ps2 = vec![para("原文。")];
-        let (outcome2, _ents2, _relations2) = polish(&cfg_bad, &mut ps2, &Default::default(), Some(&ctx), &|_, _, _| {});
+        let (outcome2, _ents2) = polish(&cfg_bad, &mut ps2, &Default::default(), Some(&ctx), &|_, _, _| {});
         assert!(matches!(outcome2, LlmOutcome::Failed));
         let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
         // 4 = 成功块 1 条 + 失败块 3 条:传输层失败按退避表重试(RETRY_BACKOFF_S 两级,
@@ -1468,7 +1450,7 @@ mod tests {
             api_key: "k".into(),
         };
         let mut ps = vec![para("灯塔计划下周启动")];
-        let (outcome, ents, _relations) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, ents) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(matches!(outcome, LlmOutcome::Done));
         assert_eq!(ps[0].text, "灯塔计划下周启动");
         assert_eq!(ents.len(), 1);
@@ -1487,7 +1469,7 @@ mod tests {
             api_key: "k".into(),
         };
         let mut ps = vec![para("你好")];
-        let (outcome, ents, _relations) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, ents) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
         assert!(
             matches!(outcome, LlmOutcome::Done),
             "缺 entities 不影响 texts 成败"
@@ -1495,8 +1477,13 @@ mod tests {
         assert!(ents.is_empty());
     }
 
+    /// 2026-09-20 起分块请求不再要 relations(它占 32% 输出 token、是撞上限的主因,
+    /// 而旧判据「每块都完美才采信」让它盘上 121 篇 failed / 0 篇 done)。
+    ///
+    /// 本用例守的是**忽略**这条契约:模型出于习惯(或旧缓存 prompt)仍吐 relations 时,
+    /// 不解析、不报错、不影响正文与实体,outcome 照常 Done。关系改由整篇独立阶段产出。
     #[test]
-    fn parses_relations_with_absolute_unicode_scalar_offsets() {
+    fn relations_field_in_a_chunk_response_is_ignored() {
         let content = serde_json::json!({
             "glossary": {},
             "texts": ["🙂张三负责灯塔计划"],
@@ -1504,104 +1491,42 @@ mod tests {
                 {"name": "张三", "kind": "person", "aliases": []},
                 {"name": "灯塔计划", "kind": "project", "aliases": []}
             ],
-            "relations": [{
-                "subject": "张三",
-                "predicate": {"type": "responsible_for", "label": null},
-                "object": "灯塔计划",
-                "confidence": 0.92,
-                "valid_from": null,
-                "valid_to": null,
-                "evidence": [{
-                    "paragraph_index": 0,
-                    "start": 1,
-                    "end": 9,
-                    "quote": "张三负责灯塔计划"
-                }]
-            }]
+            // 残留的关系字段(甚至是结构不合法的)都不该再影响任何东西
+            "relations": {"这不是": "数组"}
         })
         .to_string();
-        let body = serde_json::json!({
-            "choices": [{"message": {"content": content}}]
-        })
-        .to_string();
+        let body = serde_json::json!({ "choices": [{"message": {"content": content}}] }).to_string();
         let base = mock_server(vec![body]);
-        let cfg = LlmConfig {
-            base_url: base,
-            model: "m".into(),
-            api_key: "k".into(),
-        };
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("🙂张三负则灯塔计划")];
 
-        let (outcome, ents, relations) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, ents) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
 
-        assert!(matches!(outcome, LlmOutcome::Done));
-        assert_eq!(ps[0].text, "🙂张三负责灯塔计划");
-        assert_eq!(ents.len(), 2);
-        assert_eq!(relations.len(), 1);
-        assert_eq!(relations[0].predicate.kind, "responsible_for");
-        assert_eq!(relations[0].evidence[0].paragraph_index, 0);
-        assert_eq!(
-            (relations[0].evidence[0].start, relations[0].evidence[0].end),
-            (1, 9)
-        );
-        assert_eq!(relations[0].evidence[0].quote, "张三负责灯塔计划");
+        assert!(matches!(outcome, LlmOutcome::Done), "关系字段不再参与成败判定");
+        assert_eq!(ps[0].text, "🙂张三负责灯塔计划", "正文照常采纳");
+        assert_eq!(ents.len(), 2, "实体照常采纳");
     }
 
+    /// 缺 relations 字段是**新契约下的正常形态**(prompt 已明说不要输出它):
+    /// 不再降级成 DoneWithRelationErrors,正文与实体照常,outcome 就是 Done。
     #[test]
-    fn missing_relations_is_graph_only_failure() {
+    fn a_chunk_without_relations_is_plainly_done() {
         let content = serde_json::json!({
             "glossary": {},
             "texts": ["修订文本"],
             "entities": [{"name": "修订", "kind": "term", "aliases": []}]
         })
         .to_string();
-        let body = serde_json::json!({
-            "choices": [{"message": {"content": content}}]
-        })
-        .to_string();
+        let body = serde_json::json!({ "choices": [{"message": {"content": content}}] }).to_string();
         let base = mock_server(vec![body]);
-        let cfg = LlmConfig {
-            base_url: base,
-            model: "m".into(),
-            api_key: "k".into(),
-        };
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("原始文本")];
 
-        let (outcome, ents, relations) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        let (outcome, ents) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
 
-        assert!(matches!(outcome, LlmOutcome::DoneWithRelationErrors));
-        assert_eq!(ps[0].text, "修订文本", "关系字段缺失不能回滚文本");
-        assert_eq!(ents.len(), 1, "关系字段缺失不能回滚实体解析");
-        assert!(relations.is_empty());
-    }
-
-    #[test]
-    fn malformed_relations_is_graph_only_failure_but_explicit_empty_is_success() {
-        let malformed = serde_json::json!({
-            "choices": [{"message": {"content": serde_json::json!({
-                "glossary": {}, "texts": ["修订一"], "entities": [], "relations": {}
-            }).to_string()}}]
-        })
-        .to_string();
-        let empty = chat_body(&["修订二"], "{}");
-        let base = mock_server(vec![malformed, empty]);
-        let cfg = LlmConfig {
-            base_url: base,
-            model: "m".into(),
-            api_key: "k".into(),
-        };
-        let mut first = vec![para("原文一")];
-        let mut second = vec![para("原文二")];
-
-        let (bad, _, bad_relations) = polish(&cfg, &mut first, &Default::default(), None, &|_, _, _| {});
-        let (good, _, empty_relations) = polish(&cfg, &mut second, &Default::default(), None, &|_, _, _| {});
-
-        assert!(matches!(bad, LlmOutcome::DoneWithRelationErrors));
-        assert_eq!(first[0].text, "修订一");
-        assert!(bad_relations.is_empty());
-        assert!(matches!(good, LlmOutcome::Done));
-        assert_eq!(second[0].text, "修订二");
-        assert!(empty_relations.is_empty());
+        assert!(matches!(outcome, LlmOutcome::Done));
+        assert_eq!(ps[0].text, "修订文本");
+        assert_eq!(ents.len(), 1);
     }
 
     #[test]
@@ -1691,11 +1616,8 @@ mod tests {
             para_with("R1", Some("张伟"), "甲"),
             para_with("R2", None, "乙"),
         ];
-        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
-        assert!(matches!(
-            outcome,
-            LlmOutcome::Done | LlmOutcome::DoneWithRelationErrors
-        ));
+        let (outcome, _ents) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        assert!(matches!(outcome, LlmOutcome::Done));
         let req = captured.lock().unwrap().join("");
         assert!(
             req.contains("speaker=张伟"),

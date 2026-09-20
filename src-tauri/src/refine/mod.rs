@@ -576,10 +576,9 @@ pub fn run_llm(
     *doc = latest;
     let fallback_graph = GraphFallbackSnapshot::capture(doc);
 
-    let (text_outcome, raw_entities, raw_relations) = llm::polish(cfg, &mut doc.paragraphs, labels, log, progress);
-    let relations_complete = text_outcome.relations_complete();
+    let (text_outcome, raw_entities) = llm::polish(cfg, &mut doc.paragraphs, labels, log, progress);
     let state = match &text_outcome {
-        llm::LlmOutcome::Done | llm::LlmOutcome::DoneWithRelationErrors => "done",
+        llm::LlmOutcome::Done => "done",
         llm::LlmOutcome::Partial(_) => "partial",
         llm::LlmOutcome::Failed => "failed",
     };
@@ -597,6 +596,30 @@ pub fn run_llm(
     // materialize 会引用 mention id；必须先写回当前内存 doc，而不是只依赖 writer
     // 对 clone 的落盘修复，否则调用者内存态与 reload 后状态不一致。
     crate::store::ensure_graph_ids(note_id, doc);
+
+    // ── 关系:整篇独立抽一次(2026-09-20 起从分块请求里摘出)──
+    //
+    // 为什么改:关系此前挂在每一块的响应里,占 32% 的输出 token,是撞 token 上限的主因;
+    // 而采信判据是「每一块都完美」(旧 relations_complete),块失败率约四成的现实下等于
+    // 不可能成立——盘上实测 121 篇 failed、0 篇 done。每块都在为一个从未成功过的字段
+    // 付费。摘出来之后:分块输出短了(截断少了),关系自己成败自负,一块失败不再连坐整篇。
+    //
+    // **必须在取笔记锁之前发**:这是一次可能几十秒的网络调用,持锁期间发等于把这篇
+    // 笔记锁死那么久(与 crate::import 那条"meta 与 segments 两把锁"是同一类教训)。
+    //
+    // 全篇文本都没精修成(Failed)时不发:拿一篇原样的逐字稿去抽关系,花钱买噪声。
+    let raw_relations = if matches!(text_outcome, llm::LlmOutcome::Failed) {
+        eprintln!("refine relations: 正文全失败,跳过关系抽取");
+        None
+    } else {
+        match llm::extract_relations(cfg, doc, log) {
+            Ok(relations) => Some(relations),
+            Err(error) => {
+                eprintln!("refine relations: 整篇抽取失败: {error}");
+                None
+            }
+        }
+    };
 
     let note_lock = match crate::store::notelock::NoteLock::acquire(note_dir) {
         Ok(Some(lock)) => lock,
@@ -626,7 +649,7 @@ pub fn run_llm(
 
     // CAS 成功后在锁内完成 materialize + 整份提交。成功替换关系和 extraction；任意
     // parse/materialize/validator 失败只恢复同一原始整份基线里的旧图谱字段。
-    if relations_complete {
+    if let Some(raw_relations) = raw_relations {
         match relations::materialize(note_id, doc, raw_relations) {
             Ok(graph) => {
                 let source_hash = crate::store::source_hash(&doc.paragraphs);
@@ -1228,6 +1251,35 @@ mod tests {
         (format!("http://{addr}"), requested_rx, release_tx)
     }
 
+    /// 新契约(2026-09-20):一次 run_llm 打两通——分块精修一次、整篇关系一次。
+    /// 老用例把正文/实体/关系写在同一份 content 里,这里按新分工拆开:关系字段
+    /// 摘出来单独成一条 `{"relations":[...]}` 响应,没有就给显式空数组。
+    fn one_run(content: serde_json::Value) -> Vec<Option<String>> {
+        let mut chunk = content;
+        let relations = chunk
+            .as_object_mut()
+            .and_then(|m| m.remove("relations"))
+            .unwrap_or_else(|| serde_json::json!([]));
+        vec![
+            Some(chat_response(chunk)),
+            Some(chat_response(serde_json::json!({ "relations": relations }))),
+        ]
+    }
+
+    /// 关系阶段失败的 mock 响应:HTTP 200 但正文不符合 `{"relations":[...]}` 契约。
+    /// 用**内容错误**而不是断连,是为了只消耗一条序列项——断连会触发
+    /// post_long_with_retry 的那次重试,把下一条响应一起吃掉。
+    fn relations_failed_response() -> Option<String> {
+        Some(chat_response(serde_json::json!({ "relations": "不是数组" })))
+    }
+
+    /// 一次 run_llm,且关系阶段失败。老用例里「分块响应缺 relations 字段」表达的就是
+    /// 这个意思;新契约下缺字段是正常形态(prompt 明说不要输出),"关系拿不到"改由
+    /// 关系阶段自己失败来表达。
+    fn one_run_relations_failed(content: serde_json::Value) -> Vec<Option<String>> {
+        vec![Some(chat_response(content)), relations_failed_response()]
+    }
+
     fn chat_response(content: serde_json::Value) -> String {
         serde_json::json!({
             "choices": [{"message": {"content": content.to_string()}}]
@@ -1807,7 +1859,7 @@ mod tests {
         let mut doc = doc_with(&["🙂张三负则灯塔计划"]);
         doc.paragraphs[0].source_seqs = vec![42, 41];
         store::write_refined_atomic(dir.path(), &doc).unwrap();
-        let base = mock_server(chat_response(relation_content("张三负责灯塔计划", true)));
+        let base = sequence_server(one_run(relation_content("张三负责灯塔计划", true)));
         let cfg = llm::LlmConfig {
             base_url: base,
             model: "model-v1".into(),
@@ -2101,10 +2153,13 @@ mod tests {
             ]
         });
         let cfg = llm::LlmConfig {
-            base_url: sequence_server(vec![
-                Some(chat_response(changed)),
-                Some(chat_response(restored)),
-            ]),
+            base_url: sequence_server(
+                [
+                    one_run_relations_failed(changed),
+                    one_run_relations_failed(restored),
+                ]
+                .concat(),
+            ),
             model: "model-v2".into(),
             api_key: "k".into(),
         };
@@ -2190,11 +2245,14 @@ mod tests {
             ],
             "relations": []
         });
-        let base_url = sequence_server(vec![
-            Some(chat_response(missing)),
-            Some(chat_response(missing_again)),
-            Some(chat_response(explicit_empty)),
-        ]);
+        let base_url = sequence_server(
+            [
+                one_run_relations_failed(missing),
+                one_run_relations_failed(missing_again),
+                one_run(explicit_empty),
+            ]
+            .concat(),
+        );
         let cfg = llm::LlmConfig {
             base_url,
             model: "model-v2".into(),
@@ -2271,6 +2329,59 @@ mod tests {
         );
     }
 
+    /// 关系改成整篇独立一次之后的两条成本纪律(2026-09-20):
+    ///
+    /// ① 正文全失败时**不发**关系请求——拿一篇原样的逐字稿去抽关系是花钱买噪声;
+    /// ② 这通调用要落 ai_logs(kind=refine_relations)。它此前完全不可观测,而现在它是
+    ///    关系唯一的产出口,成本与失败原因必须在日志里看得见。
+    #[test]
+    fn relation_stage_is_skipped_when_all_text_failed_and_is_logged_otherwise() {
+        // ① 全部分块都断连 → 正文 Failed → 关系请求根本不该发出去
+        let root = tempfile::tempdir().unwrap();
+        let dir = note_dir(root.path(), "rel-skip");
+        let mut doc = doc_with(&["原文"]);
+        store::write_refined_atomic(&dir, &doc).unwrap();
+        let ctx = crate::ailog::Ctx { data_root: root.path().to_path_buf(), note_id: "rel-skip".into() };
+        let cfg = llm::LlmConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        run_llm(&dir, &mut doc, &cfg, "m", &Default::default(), Some(&ctx), &|_, _, _| {}).unwrap();
+        assert_eq!(doc.stages.llm, "failed");
+        assert_eq!(doc.stages.relations, "failed");
+        let logged = crate::ailog::query(root.path(), &crate::ailog::Filter::default());
+        let kinds: Vec<&str> = logged["entries"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|r| r["kind"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !kinds.contains(&"refine_relations"),
+            "正文全失败时不得发起关系请求,实得 {kinds:?}"
+        );
+
+        // ② 正常路径:关系那通要落日志,kind=refine_relations
+        let root2 = tempfile::tempdir().unwrap();
+        let dir2 = note_dir(root2.path(), "rel-log");
+        let mut doc2 = doc_with(&["🙂张三负则灯塔计划"]);
+        store::write_refined_atomic(&dir2, &doc2).unwrap();
+        let ctx2 = crate::ailog::Ctx { data_root: root2.path().to_path_buf(), note_id: "rel-log".into() };
+        let cfg2 = llm::LlmConfig {
+            base_url: sequence_server(one_run(relation_content("张三负责灯塔计划", true))),
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        run_llm(&dir2, &mut doc2, &cfg2, "m", &Default::default(), Some(&ctx2), &|_, _, _| {}).unwrap();
+        assert_eq!(doc2.stages.relations, "done");
+        let logged2 = crate::ailog::query(root2.path(), &crate::ailog::Filter::default());
+        let rel: Vec<_> = logged2["entries"]
+            .as_array()
+            .map(|a| a.iter().filter(|r| r["kind"] == "refine_relations").collect())
+            .unwrap_or_default();
+        assert_eq!(rel.len(), 1, "整篇关系调用应恰好记一条日志");
+        assert_eq!(rel[0]["status"], "ok");
+    }
+
     #[test]
     fn multi_chunk_valid_relation_then_explicit_empty_keeps_the_valid_fact() {
         let dir = tempfile::tempdir().unwrap();
@@ -2302,10 +2413,20 @@ mod tests {
         let second = serde_json::json!({
             "glossary": {}, "texts": [second_text], "entities": [], "relations": []
         });
+        // 两块正文 + 一次整篇关系(新契约):关系不再挂在分块响应里,第一块那条
+        // 有效关系改由最后这通独立调用产出,materialize 的结果应当一模一样。
+        let mut first_chunk = first;
+        let relations = first_chunk
+            .as_object_mut()
+            .and_then(|m| m.remove("relations"))
+            .unwrap();
+        let mut second_chunk = second;
+        second_chunk.as_object_mut().map(|m| m.remove("relations"));
         let cfg = llm::LlmConfig {
             base_url: sequence_server(vec![
-                Some(chat_response(first)),
-                Some(chat_response(second)),
+                Some(chat_response(first_chunk)),
+                Some(chat_response(second_chunk)),
+                Some(chat_response(serde_json::json!({ "relations": relations }))),
             ]),
             model: "model-multi".into(),
             api_key: "k".into(),

@@ -30,8 +30,8 @@ pub const REFINE_SYSTEM: &str = r#"你是会议逐字稿精修助手。对输入
 4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。
 此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名,并抽取有原文证据的语义关系。关系 predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at,或 custom;custom 必须提供非空 label。每条关系给出 0 到 1 的 confidence。valid_from/valid_to 可为 null；非 null 时必须是带时区的 RFC3339 时间戳，且两者同时存在时 valid_from 必须严格早于 valid_to（不允许零长度区间）。evidence.paragraph_index 必须使用输入中标注的全文绝对段落下标,绝不能改成块内下标;start/end 是该修订后段落的 Unicode scalar(char)半开区间,不是 UTF-8 字节偏移;quote 必须逐字符精确等于该区间。
 每段前的 speaker= 标注是该段说话人(人名或簇号),仅供理解上下文:用于人名/称呼错字判断与实体归一(如称呼「小王」后由 speaker=王某 的段应答,可确认「王」字写法)。禁止据此改写句式、把代词替换成人名、或把 speaker 标注/说话人名写进 texts;texts 只输出修订后的正文。
-输出 JSON:{"glossary":{"错误写法":"统一写法"},"texts":["段落1修订文","段落2修订文"],"entities":[{"name":"规范名","kind":"person|org|project|term|decision|task|place|date","aliases":["别名"]}],"relations":[{"subject":"张三","predicate":{"type":"responsible_for","label":null},"object":"灯塔计划","confidence":0.92,"valid_from":null,"valid_to":null,"evidence":[{"paragraph_index":0,"start":0,"end":8,"quote":"张三负责灯塔计划"}]}]}。
-texts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。relations 必须存在,没有关系时给显式空数组。"#;
+输出 JSON:{"glossary":{"错误写法":"统一写法"},"texts":["段落1修订文","段落2修订文"],"entities":[{"name":"规范名","kind":"person|org|project|term|decision|task|place|date","aliases":["别名"]}]}。
+texts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项;只收实体类的错写→正写,一条就是一个词,不要把多个词连成一条。entities 没有可给空数组,aliases 可省略。不要输出 relations 字段。"#;
 
 /// 只补关系(正文与实体已定稿)。用于精修已完成、仅图谱需要重建的回填路径。
 pub const RELATION_ONLY_SYSTEM: &str = r#"你是会议语义关系抽取器。正文和实体已经定稿，禁止改写、补写或删除任何段落与实体。只根据给定 paragraphs 和 entities 抽取有逐字证据的 relations。subject/object 必须使用 entities 中的规范 name 或 alias；predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at 或 custom，custom 必须带非空 label；confidence 必须在 0 到 1；valid_from/valid_to 为 null 或带时区 RFC3339，且 from 严格早于 to。evidence.paragraph_index 是全文绝对下标；start/end 是 Unicode scalar 半开区间；quote 必须逐字符等于该区间。只输出 JSON 对象 {"relations":[...]}；没有可靠关系时输出 {"relations":[]}。"#;
