@@ -1,7 +1,13 @@
 <script lang="ts">
   import { t } from "$lib/i18n/index.svelte";
 
-  let { state }: { state: "idle" | "running" | "complete" | "failed" } = $props();
+  /** 按钮上显示的动作名。默认 "AI" 保持组件可复用;笔记页传「AI 整理」——
+      按钮该说它**做什么**,光写 "AI" 和「重新分析」是同一个词不达意的毛病。
+      running 态例外,仍是会跳的 "Aing"(本仓的招牌动效,用户点名保留)。 */
+  let { state, label = "AI" }: {
+    state: "idle" | "running" | "complete" | "failed";
+    label?: string;
+  } = $props();
 </script>
 
 <span class="ai-state" class:running={state === "running"} aria-label={state === "idle" ? t("record.ai.idle") : state === "running" ? t("record.ai.running") : state === "complete" ? t("record.ai.complete") : t("record.ai.failed")}>
@@ -10,11 +16,11 @@
       <span class="letter" style={`--i:${i}`}>{letter}</span>
     {/each}
   {:else if state === "complete"}
-    <span>AI</span><span class="dot done" aria-hidden="true"></span>
+    <span>{label}</span><span class="dot done" aria-hidden="true"></span>
   {:else if state === "failed"}
-    <span>AI</span><span class="dot failed" aria-hidden="true"></span>
+    <span>{label}</span><span class="dot failed" aria-hidden="true"></span>
   {:else}
-    <span>AI</span>
+    <span>{label}</span>
   {/if}
 </span>
 
