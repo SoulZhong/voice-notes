@@ -3143,7 +3143,7 @@
             title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
             onclick={() => (retransConfirm = !retransConfirm)}
           >
-            <svg class:spin={retranscribing} width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <svg class:spin={retranscribing} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
               <path d="M13.4 1.8v2.8h-2.8" />
             </svg>
@@ -3672,35 +3672,6 @@
   @media (prefers-reduced-motion: reduce) {
     .ghost svg.spin { animation: none; }
   }
-  /* 「重新分析」:带文字的胶囊(与剪辑行按钮同族),不再是纯图标幽灵钮——
-     它是算法升级后存量笔记受益的唯一通道,必须可发现 */
-  .retrans-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4em;
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink-secondary);
-    border-radius: var(--radius-full);
-    padding: 0.3em 0.8em;
-    font-size: 0.78rem;
-    cursor: pointer;
-    white-space: nowrap;
-    transition:
-      background 120ms ease,
-      color 120ms ease;
-  }
-  .retrans-btn:hover:not(:disabled) {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .retrans-btn:active:not(:disabled) {
-    transform: translateY(0.5px);
-  }
-  .retrans-btn:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
   .ghost {
     display: inline-flex;
     align-items: center;
@@ -4161,10 +4132,57 @@
      idle 已是彩色魔杖;hover 星火向外迸射、金星芒放大旋转带光晕;施法(casting)时魔杖大幅挥动 +
      金星芒 360° 旋转脉动发光 + 三色星火依次飞出闪烁。用户要「彩色/更大/动效夸张」——放开 DESIGN 的克制,
      但仍克制在一颗按钮内;respect prefers-reduced-motion。 */
-  .reaing {
+  /* 工具条动作对:AI 与「重新转文字」是两个同级动作,必须同形同高。走 DESIGN.md 的
+     button-secondary(透明底 + 1px hairline-strong + radius-md + ink 字,hover
+     surface-soft,无阴影)。
+     2026-09-20 用户实报「缺乏质感」,查下来是两条具体的破绽:
+     ① `.reaing` 一条盒模型样式都没有——那圈边框是**浏览器默认按钮外观**,和旁边
+        手写的胶囊并排,圆角、高度、字重全不是一路;
+     ② `.retrans-btn` 用了 radius-full,而本仓「药丸仅主按钮与录制点」(DESIGN.md
+        §圆角),次级动作用药丸会和录制键抢同一个视觉身份。
+     不把两颗合成 segmented:那形态表示「多选一」,而这俩是彼此独立的动作。 */
+  .reaing,
+  .retrans-btn {
     display: inline-flex;
     align-items: center;
-    gap: 0.5em;
+    justify-content: center;
+    gap: 0.45em;
+    /* 同高写死:并排两颗差 1px 都看得出来,靠各自 padding 凑必然对不齐。
+       2.05rem 是容下 22px 魔杖(用户点名要大)后仍留出呼吸的最小值。 */
+    height: 2.05rem;
+    padding: 0 0.7em;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--ink);
+    font-size: 0.8rem;
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background 120ms ease,
+      border-color 120ms ease,
+      color 120ms ease;
+  }
+  .reaing:hover:not(:disabled),
+  .retrans-btn:hover:not(:disabled) {
+    background: var(--surface-soft);
+    border-color: var(--hairline-strong);
+  }
+  /* 键盘焦点环:accent 在本仓只表达链接/焦点/选中(DESIGN.md §色),这两颗此前
+     完全没有焦点样式——键盘走到哪儿看不见。 */
+  .reaing:focus-visible,
+  .retrans-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .reaing:disabled,
+  .retrans-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .reaing {
     --wand-gold: #f6b02e;
     --wand-violet: #a678ff;
     --wand-cyan: #46bcff;
