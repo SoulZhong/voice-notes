@@ -8914,9 +8914,12 @@ fn note_entity_merge(
     // 事后再查 kg id 必然查不到(mention 已改指胜方)。
     let loser_kg = kg_id_for_note_entity(&app, &id, &entity_id);
     let winner_kg = kg_id_for_note_entity(&app, &id, &target_id);
-    let (_loser_name, _winner_name, kind) =
+    let (_loser_name, _winner_name, winner_kind, loser_kind) =
         store::merge_note_entities(&dir, &id, &entity_id, &target_id).map_err(|e| e.to_string())?;
-    if kind != "person" {
+    // 两边都不是人才进全局账本。只看胜方是不够的:模型把人误标成 term/project 很常见,
+    // 若败方是 person 而胜方是 term,照样会把这个人的 kg 节点并进别的节点——正是
+    // 上面那条"往知识账本里写人的合并会和声纹侧归并打架"要禁的情况。
+    if winner_kind != "person" && loser_kind != "person" {
         match (loser_kg, winner_kg) {
             (Some(src), Some(dst)) if src != dst => {
                 if let Ok(root) = data_root(&app) {
