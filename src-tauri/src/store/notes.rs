@@ -467,13 +467,18 @@ impl NoteStore {
         };
         let person_name = self.person_display_name(&person_id);
         meta.person_id = None;
+        // 名字要不要清,取决于"它是不是那个人的名字",所以必须查库。
         if let Some(pname) = person_name.as_deref() {
             if !meta.name.is_empty() && meta.name.trim() == pname.trim() {
                 meta.name = String::new();
             }
-            if meta.hint_person.as_deref() == Some(person_id.as_str()) {
-                meta.hint_person = None;
-            }
+        }
+        // 声纹建议清不清,只看 id 相不相等,**不依赖查库**——这一句此前嵌在上面的
+        // `if let Some(pname)` 里,于是库读不出名字时(未命名的自动人物是常态、
+        // 被合并重定向走、voiceprints.json 读失败)建议就留着,取消关联的下一刻
+        // chip 上又浮出「建议:某某」,把用户刚否掉的结论原样再劝一遍。
+        if meta.hint_person.as_deref() == Some(person_id.as_str()) {
+            meta.hint_person = None;
         }
         write_speakers_atomic(&dir, &speakers)
     }
@@ -1990,6 +1995,43 @@ mod tests {
         let n2 = store.load(&id2).unwrap();
         assert_eq!(n2.speakers["S1"].person_id, None);
         assert_eq!(n2.speakers["S1"].name, "左边那位", "与库名不同的本地标签与关联无关,不该被清");
+    }
+
+    /// 合并前审核(低):声纹建议的清除**不该**依赖"库里查得到名字"。未命名的自动
+    /// 人物是常态(新说话人 130 这种),库读不出名字时若把建议留着,取消关联的下一刻
+    /// chip 上又浮出「建议:此人」——把用户刚否掉的结论原样再劝一遍。
+    #[test]
+    fn clear_speaker_person_drops_the_hint_even_for_an_unnamed_person() {
+        let tmp = tempfile::tempdir().unwrap();
+        let notes = tmp.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        // P7 存在但**没有名字**(自动建档、尚未命名)
+        std::fs::write(
+            tmp.path().join("voiceprints.json"),
+            serde_json::json!({
+                "schema_version": 1, "next_person": 8,
+                "people": { "P7": { "name": "", "total_ms": 0, "last_seen": "" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = NoteStore::new(notes.clone());
+        let id = make_spk_note(&notes, &[("甲", Some("S1"))], &["S1"]);
+        store.assign_speaker_person_if(&id, "S1", "P7").unwrap();
+        store.set_speaker_hints(&id, &[("S1".to_string(), "P7".to_string())]).unwrap();
+        assert_eq!(
+            store.load(&id).unwrap().speakers["S1"].hint_person.as_deref(),
+            Some("P7"),
+            "前提:建议指向即将被解除的那个人"
+        );
+
+        store.clear_speaker_person(&id, "S1").unwrap();
+        let n = store.load(&id).unwrap();
+        assert_eq!(n.speakers["S1"].person_id, None);
+        assert_eq!(
+            n.speakers["S1"].hint_person, None,
+            "刚否掉的人不得立刻又被建议一遍(哪怕库里他还没名字)"
+        );
     }
 
     /// 样本↔会议同步的 CAS:期望值命中才改派/解除;被改成别人则拒绝不覆盖;幂等。
