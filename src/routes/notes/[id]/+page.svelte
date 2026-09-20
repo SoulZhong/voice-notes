@@ -3096,7 +3096,7 @@
             onclick={rerunRefine}
             title={aiState === "running" ? t("notes.refine.running") : aiState === "complete" ? t("notes.refine.completeHint") : aiState === "failed" ? t("notes.refine.failedHint") : t("notes.refine.run")}
           >
-            <svg class="wand" viewBox="0 0 22 22" width="22" height="22" aria-hidden="true">
+            <svg class="wand" viewBox="0 0 22 22" width="18" height="18" aria-hidden="true">
               <path
                 class="wand-stick"
                 d="M3.5 18.5 11.5 10.5"
@@ -3119,7 +3119,7 @@
                 d="M10 15.4 10.3 16.2 11.1 16.5 10.3 16.8 10 17.6 9.7 16.8 8.9 16.5 9.7 16.2Z"
               />
             </svg>
-            <AiStateLabel state={aiState} />
+            <AiStateLabel state={aiState} label={t("notes.refine.label")} />
           </button>
 
         <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
@@ -4145,7 +4145,9 @@
     justify-content: center;
     gap: 0.45em;
     /* 同高写死:并排两颗差 1px 都看得出来,靠各自 padding 凑必然对不齐。
-       2.05rem 是容下 22px 魔杖(用户点名要大)后仍留出呼吸的最小值。 */
+       魔杖 18px:22px 在这个盒子里只剩 5px 上下留白,且与文字(12.8px)比到 1.7:1,
+       读起来是"一个图标配了行小字"。18px 仍明显比常规图标大、彩色与动效照旧,
+       但不再撑破这一行的节奏(用户「更大/夸张」的诉求由颜色与施法动效承担)。 */
     height: 2.05rem;
     padding: 0 0.7em;
     border: 1px solid var(--hairline-strong);
@@ -4179,7 +4181,10 @@
     opacity: 0.5;
     cursor: default;
   }
+  /* AI 整理按钮的宽度按最宽那个状态钉死:文案会在「AI 整理」⇄「Aing」⇄ 带状态点
+     之间切换,不钉的话每次状态一变,它右边的「重新转文字」就跟着横跳一下。 */
   .reaing {
+    min-width: 6.4rem;
     --wand-gold: #f6b02e;
     --wand-violet: #a678ff;
     --wand-cyan: #46bcff;
