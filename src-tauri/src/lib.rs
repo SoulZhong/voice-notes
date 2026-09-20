@@ -3394,7 +3394,7 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
                     store::VoiceprintStore::new(data_root(&app).map_err(anyhow::Error::msg)?).load();
                 speaker_prompt_labels(&note.speakers, &vp_now)
             };
-            let (outcome, _ents, _rels) = refine::llm::polish(
+            let (outcome, _ents) = refine::llm::polish(
                 &cfg,
                 &mut subset,
                 &prompt_labels,
