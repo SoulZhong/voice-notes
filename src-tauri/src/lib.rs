@@ -1723,7 +1723,7 @@ fn spawn_session(
         drop(g);
         drop(r);
         return Err(tr!(
-            "重转写进行中,完成后再录制",
+            "正在重新转文字,完成后再录制",
             "A re-transcription is in progress; please record after it finishes"
         ));
     }
@@ -2775,7 +2775,7 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
     // 置位之间的加载窗口。
     if state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         return Err(tr!(
-            "重转写进行中,完成后再录制",
+            "正在重新转文字,完成后再录制",
             "A re-transcription is in progress; please record after it finishes"
         ));
     }
@@ -2846,7 +2846,7 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
     // UX——权威判定(Dekker 写后读)在 spawn_session 内、running 置 true 之后。
     if state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         return Err(tr!(
-            "重转写进行中,完成后再录制",
+            "正在重新转文字,完成后再录制",
             "A re-transcription is in progress; please record after it finishes"
         ));
     }
@@ -3303,7 +3303,7 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         if rid == id {
-            return Err(tr!("该笔记正在重转写中", "This note is being re-transcribed"));
+            return Err(tr!("该笔记正在重新转文字", "This note is being re-transcribed"));
         }
     }
     let lc = app.state::<lifecycle::LifecycleHandle>().inner().clone();
@@ -3468,7 +3468,7 @@ fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
     // 因锁失败——这里提前拒绝只是把错误从「跑完才失败」提到「点下去就说清」。
     if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         if rid == id {
-            return Err(tr!("该笔记正在重转写中", "This note is being re-transcribed"));
+            return Err(tr!("该笔记正在重新转文字", "This note is being re-transcribed"));
         }
     }
     app.state::<lifecycle::LifecycleHandle>()
@@ -3537,7 +3537,7 @@ pub(crate) fn do_retranscribe(
         }
     }
     if input != "dual" && input != "mixed" {
-        return Err(tr!("未知重转写来源: {input}", "Unknown retranscribe input: {input}", input = input));
+        return Err(tr!("未知的音频来源: {input}", "Unknown retranscribe input: {input}", input = input));
     }
     let state: tauri::State<AppState> = app.state();
     // Fix 1(codex 第二轮):download_running 兼作迁移/下载互斥位,与 do_start_recording
@@ -3561,7 +3561,7 @@ pub(crate) fn do_retranscribe(
     // running→session_slot(全库锁序纪律,见 do_stop_teardown 注释)成 ABBA 环。
     let session_active = state.session.lock().unwrap().is_some();
     if recording_blocks_retranscribe(&state.running, session_active) {
-        return Err(tr!("录制中不能重转写,请先停止录制", "Cannot re-transcribe while recording"));
+        return Err(tr!("录制中不能重新转文字,请先停止录制", "Cannot re-transcribe while recording"));
     }
     if app.state::<lifecycle::LifecycleHandle>().is_refining(id) {
         return Err(tr!("该笔记正在 Aing 中", "This note is being refined"));
@@ -3570,7 +3570,7 @@ pub(crate) fn do_retranscribe(
     let note = store::NoteStore::new(notes_dir(app).map_err(|e| e.to_string())?)
         .load(id).map_err(|e| e.to_string())?;
     if note.meta.state != "complete" {
-        return Err(tr!("笔记未完成,不能重转写", "Only completed notes can be re-transcribed"));
+        return Err(tr!("笔记未完成,不能重新转文字", "Only completed notes can be re-transcribed"));
     }
     // 转码互斥:转码 worker 会把该目录的 wav 编码后删除,若此刻正 pending/in-flight,
     // 与重转写离线读盘并发有踩踏窗口。不能用 cancel_and_wait 顶替这条检查:那会把
@@ -3594,7 +3594,7 @@ pub(crate) fn do_retranscribe(
         let mut slot = state.retranscribing.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((running, _)) = slot.as_ref() {
             return Err(tr!(
-                "已有重转写任务在进行({running}),请等它完成",
+                "已有转文字任务在进行({running}),请等它完成",
                 "A re-transcription task is already running ({running})", running = running
             ));
         }
@@ -3610,7 +3610,7 @@ pub(crate) fn do_retranscribe(
     let session_active = state.session.lock().unwrap().is_some();
     if recording_blocks_retranscribe(&state.running, session_active) {
         *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        return Err(tr!("录制中不能重转写,请先停止录制", "Cannot re-transcribe while recording"));
+        return Err(tr!("录制中不能重新转文字,请先停止录制", "Cannot re-transcribe while recording"));
     }
     // Fix 1B(迁移侧同款写后读):占槽之后复查 download_running。迁移是
     // write(download_running)→read(槽),本侧是 write(槽)→read(download_running),
@@ -4002,7 +4002,7 @@ pub(crate) fn do_regenerate_mixed(app: &AppHandle, id: &str) -> Result<(), Strin
         return Err(tr!("该笔记正在 Aing 中,稍后再试", "This note is being refined by AI; try again later"));
     }
     if retranscribe_blocks_recording(&state.retranscribing) {
-        return Err(tr!("重转写进行中,稍后再试", "Re-transcription in progress; try again later"));
+        return Err(tr!("正在重新转文字,稍后再试", "Re-transcription in progress; try again later"));
     }
     let dir = notes_dir(app).map_err(|e| e.to_string())?.join(id);
     let meta = store::audio::load_audio_meta(&dir);
@@ -4038,7 +4038,7 @@ pub(crate) fn do_regenerate_mixed(app: &AppHandle, id: &str) -> Result<(), Strin
         || app.state::<lifecycle::LifecycleHandle>().is_refining(id)
     {
         *state.mixed_regen.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        return Err(tr!("状态刚发生变化(录制/迁移/重转写),稍后再试", "State just changed (recording/migration/re-transcription); try again later"));
+        return Err(tr!("状态刚发生变化(录制/迁移/转文字),稍后再试", "State just changed (recording/migration/re-transcription); try again later"));
     }
     spawn_mixed_regen(app.clone(), id.to_string());
     Ok(())
