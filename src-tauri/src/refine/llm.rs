@@ -521,6 +521,60 @@ fn call_chunk(
     })
 }
 
+/// 从**整份不可解析**的响应正文里,按括号配对抠出 `"texts"` 那个数组。
+///
+/// 为什么值得抢救(2026-09-20 实测 1293 条 refine_chunk 日志):prompt 规定的字段顺序是
+/// glossary → texts → entities → relations,而 texts 排在前面、relations 带逐字引语
+/// 最占 token。于是"正文已经写完整、后面的字段把 JSON 写坏了"是**主要失败形态**——
+/// 9 月以来 194 次块失败里,有 123 次(63%)的 texts 数组其实完整躺在响应里,却被
+/// 「整份 JSON 解析失败 → 保留原文」一起丢掉了。
+///
+/// 只认完整闭合的数组:扫到配对的 `]` 才交给 serde 解析,没配对上就返回 None
+/// (半截数组宁可不要——补全等于替模型编内容)。字符串内的括号与转义照规则跳过。
+fn salvage_texts(content: &str) -> Option<Vec<String>> {
+    let key = content.find("\"texts\"")?;
+    let start = key + content[key..].find('[')?;
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    for (off, ch) in content[start..].char_indices() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_str => esc = true,
+            '"' => in_str = !in_str,
+            '[' if !in_str => depth += 1,
+            ']' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return serde_json::from_str(&content[start..start + off + 1]).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 术语表一条的合理性。键与值都该是"词",不是句子,更不是模型打转吐出来的长串。
+///
+/// 2026-09-20 实测:一次退化输出把上百个词首尾相连成一个 200+ 字的键
+/// (`"PPI指标广告的产序核心的这个付费的PPI的广告指标KPI核行算制核算制…"`),
+/// 整份 JSON 就坏在它后面缺冒号。更要命的是术语表**逐块前传**——这条坏项会被累进
+/// glossary 并随后续每一块的 prompt 发出去,一块退化能顺着把整场都带坏。
+/// 长度判据挡住的正是这种:真实归一项("腾定"→"腾讯")没有超过十几个字的。
+fn glossary_entry_sane(key: &str, value: &Value) -> bool {
+    let Some(v) = value.as_str() else { return false };
+    let (kc, vc) = (key.chars().count(), v.chars().count());
+    kc > 0 && vc > 0 && kc <= GLOSSARY_TERM_MAX_CHARS && vc <= GLOSSARY_TERM_MAX_CHARS
+}
+
+/// 单条术语的字数上限(键与值各自)。超过即判退化,见 glossary_entry_sane。
+const GLOSSARY_TERM_MAX_CHARS: usize = 24;
+/// 累计术语表条数上限。术语表随块数线性增长且每块都要随 prompt 发出去,
+/// 不设上限时长会议后半程的 prompt 会被它撑大,反过来更容易撞 token 上限。
+const GLOSSARY_MAX_ENTRIES: usize = 200;
+
 /// 宽松解析实体数组:非数组 → 空;逐项跳过缺 name 的;kind 缺省 "term";aliases 缺省空。
 /// 绝不返回错误——实体是增值层,坏数据只当没有,不拖垮 texts。
 fn parse_raw_entities(v: &Value) -> Vec<RawEntity> {
@@ -601,7 +655,29 @@ fn do_call_chunk(
     let content = resp["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| content_err(anyhow::anyhow!("响应缺 choices[0].message.content")))?;
-    let parsed: Value = serde_json::from_str(content).map_err(|e| content_err(e.into()))?;
+    let parsed: Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(e) => {
+            // 多段块被 token 上限掐断时不在这里抢救:交 run_llm 拆块重试,两半能把
+            // 术语表/实体/关系一并救回来,比在这里只保住半份结果好。单段块拆无可拆,
+            // 与"模型自认为写完了但 JSON 坏了"一样走抢救。
+            if truncated && expect_len > 1 {
+                return Err(ChunkErr::Truncated(e.into()));
+            }
+            match salvage_texts(content).filter(|t| t.len() == expect_len) {
+                Some(texts) => {
+                    eprintln!(
+                        "refine llm: 整份 JSON 不可解析,已抢救 texts({} 段);本块不取术语表与实体,关系交独立阶段: {e}",
+                        texts.len()
+                    );
+                    // relations_valid=false 把关系交给独立关系阶段(既有机制),
+                    // 术语表给空对象:坏 JSON 里抠出来的术语表不可信,也没必要冒险前传。
+                    return Ok((resp_text, json!({}), texts, Vec::new(), Vec::new(), false));
+                }
+                None => return Err(content_err(e.into())),
+            }
+        }
+    };
     let texts_value = parsed
         .get("texts")
         .ok_or_else(|| content_err(anyhow::anyhow!("响应缺 texts 数组")))?;
@@ -766,7 +842,16 @@ pub fn polish(
             Ok((g, outs, ents, relations, relations_valid)) => {
                 if let Value::Object(map) = g {
                     if let Value::Object(acc) = &mut glossary {
-                        acc.extend(map);
+                        // 逐条过卫生门再累积(见 glossary_entry_sane):术语表是**逐块
+                        // 前传**的,一条退化长串进来就会随后续每一块的 prompt 发出去。
+                        for (k, v) in map {
+                            if acc.len() >= GLOSSARY_MAX_ENTRIES {
+                                break;
+                            }
+                            if glossary_entry_sane(&k, &v) {
+                                acc.insert(k, v);
+                            }
+                        }
                     }
                 }
                 for (&i, t) in chunk.iter().zip(outs) {
@@ -952,6 +1037,42 @@ mod tests {
         })
         .to_string();
         serde_json::json!({ "choices": [{ "message": { "content": content } }] }).to_string()
+    }
+
+    /// 端到端抢救(2026-09-20):模型自认为写完(finish_reason 缺省即非 length),
+    /// 但整份 JSON 在 texts **之后**坏掉——正文仍应落到段落上,而不是"保留原文"。
+    ///
+    /// 这是 9 月以来最大的一类失败:194 次块失败里 123 次的 texts 其实完整躺在响应里。
+    /// 关系判否(交独立关系阶段),所以 outcome 是 DoneWithRelationErrors 而非 Partial。
+    #[test]
+    fn broken_json_after_texts_still_lands_the_revised_paragraphs() {
+        // texts 完整,entities 缺冒号 → 整份不可解析
+        let content = r#"{"glossary":{},"texts":["修订一","修订二"],"entities":[{"name" "张三"}]}"#;
+        let body = serde_json::json!({ "choices": [{ "message": { "content": content } }] }).to_string();
+        let base = mock_server(vec![body]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let mut ps = vec![para("原文一"), para("原文二")];
+        let (outcome, ents, _rel) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        assert_eq!(ps[0].text, "修订一", "抢救出来的正文要真的落到段落上");
+        assert_eq!(ps[1].text, "修订二");
+        assert!(
+            matches!(outcome, LlmOutcome::DoneWithRelationErrors),
+            "正文成功、关系判否 → 交独立关系阶段,不是 Partial: {outcome:?}"
+        );
+        assert!(ents.is_empty(), "坏 JSON 里的实体不取(不可信)");
+    }
+
+    /// 抢救**不能**掩盖真正的失败:texts 自己就没写完时仍旧保留原文。
+    #[test]
+    fn salvage_does_not_cover_up_an_unfinished_texts_array() {
+        let content = r#"{"glossary":{},"texts":["修订一","修订"#;
+        let body = serde_json::json!({ "choices": [{ "message": { "content": content } }] }).to_string();
+        let base = mock_server(vec![body]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let mut ps = vec![para("原文一"), para("原文二")];
+        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        assert_eq!(ps[0].text, "原文一", "半截 texts 不许硬凑");
+        assert!(matches!(outcome, LlmOutcome::Partial(v) if v.len() == 2));
     }
 
     /// 截断→拆块(issue #175):finish_reason=="length" 的块对半拆开重试,两半各自
@@ -1581,6 +1702,56 @@ mod tests {
             "有名字的段必须带人名标签: {req}"
         );
         assert!(req.contains("speaker=R2"), "无名字的段用 R 号兜底");
+    }
+
+    /// 抢救判据(2026-09-20,依 1293 条真实日志定): 整份 JSON 坏掉时,只要 texts
+    /// 数组自身完整闭合就捞出来。三种真实坏法各来一条——后续字段缺冒号(术语表
+    /// 退化)、被 token 上限从关系数组中间掐断、字符串里混进裸控制字符。
+    #[test]
+    fn salvage_texts_recovers_a_closed_array_from_broken_json() {
+        // ① texts 写完了,坏在后面的 entities 上(缺冒号)
+        let broken = r#"{"glossary":{},"texts":["第一段","第二段"],"entities":[{"name" "张三"}]}"#;
+        assert!(serde_json::from_str::<Value>(broken).is_err(), "前提:整份不可解析");
+        assert_eq!(
+            salvage_texts(broken).unwrap(),
+            vec!["第一段".to_string(), "第二段".to_string()]
+        );
+
+        // ② 被 token 上限从 relations 中间掐断(结尾就是半句)
+        let cut = r#"{"texts":["甲","乙","丙"],"relations":[{"subject":"张三","evid"#;
+        assert_eq!(salvage_texts(cut).unwrap().len(), 3);
+
+        // ③ 正文里带方括号与转义引号,不能把数组边界认错
+        let tricky = r#"{"texts":["他说[注]\"好\"","第二段"],"entities":["#;
+        assert_eq!(
+            salvage_texts(tricky).unwrap(),
+            vec!["他说[注]\"好\"".to_string(), "第二段".to_string()]
+        );
+    }
+
+    /// texts 自己没写完就断了 → 不抢救。补全等于替模型编内容,宁可保留原文。
+    #[test]
+    fn salvage_texts_refuses_an_unclosed_array() {
+        assert_eq!(salvage_texts(r#"{"texts":["第一段","第二"#), None);
+        assert_eq!(salvage_texts(r#"{"glossary":{"甲":"乙"}}"#), None, "根本没有 texts");
+        // 数组闭合了但里面不是纯字符串 → 交给 serde 判否,不硬塞
+        assert_eq!(salvage_texts(r#"{"texts":["甲",{"b":1}],"#), None);
+    }
+
+    /// 术语表卫生门:真实归一项放行,模型打转吐出来的长串拒之门外。
+    /// 这条门守的不是本块——是**后续每一块**:术语表逐块前传,坏项进来会一路带坏。
+    #[test]
+    fn glossary_entry_sane_rejects_degenerate_runs() {
+        assert!(glossary_entry_sane("腾定", &Value::String("腾讯".into())));
+        assert!(glossary_entry_sane("PPI", &Value::String("PPI 指标".into())));
+        // 2026-09-20 实测的那条退化键(上百个词连成一串)
+        let babble = "PPI指标广告的产序核心的这个付费的PPI的广告指标KPI核行算制核算制行运营运营成运营";
+        assert!(!glossary_entry_sane(babble, &Value::String("腾讯".into())));
+        assert!(!glossary_entry_sane("腾定", &Value::String(babble.into())));
+        // 非字符串值 / 空串一律不收
+        assert!(!glossary_entry_sane("腾定", &Value::Null));
+        assert!(!glossary_entry_sane("", &Value::String("腾讯".into())));
+        assert!(!glossary_entry_sane("腾定", &Value::String("".into())));
     }
 }
 
