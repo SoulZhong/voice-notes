@@ -152,6 +152,8 @@
 
 {#if visible.length > 0 || editable}
   <div class="ent-row">
+    <!-- 行首标签:与说话人行同款(见 SpeakerChips 的 .row-label 注释)。 -->
+    <span class="ent-row-label">{t("notes.entities.rowLabel")}</span>
     {#each visible as e (e.id)}
       {@const k = kindOf(e.kind)}
       <span class="ent-chip" style="background: {k?.tint}; color: {k?.ink}">
@@ -317,6 +319,16 @@
     flex-wrap: wrap;
     gap: 0.35rem;
     margin: 0.5rem 0 0;
+  }
+  /* 行首标签:与说话人行同款弱色小字(理由见 SpeakerChips 的 .row-label)。
+     实体行经常换行成两三行,align-self 顶对齐让标签始终贴着第一行。 */
+  .ent-row-label {
+    flex: none;
+    align-self: flex-start;
+    color: var(--ink-faint);
+    font-size: 0.74rem;
+    line-height: 1.85;
+    user-select: none;
   }
   /* 实体 chip 与说话人 chip 此前同为「圆药丸 + 淡底」,一眼分不清哪行是人哪行是词
      (2026-09-20 用户实报)。两处区分:①名字前加 # 标记;②方角标签形 vs 说话人的
