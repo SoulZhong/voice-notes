@@ -17,6 +17,7 @@ pub mod settings;
 mod shortcuts;
 pub mod store;
 mod i18n;
+mod import; // 本地音频文件导入建笔记(2026-09-19)
 mod player;
 mod player_align;
 mod player_gate;
@@ -3650,7 +3651,7 @@ pub(crate) fn do_retranscribe(
         *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return Err(tr!("该笔记正在 Aing 中", "This note is being refined"));
     }
-    spawn_retranscribe(app.clone(), id.to_string(), input == "mixed", engine);
+    spawn_retranscribe(app.clone(), id.to_string(), input == "mixed", engine, false);
     Ok(())
 }
 
@@ -3734,7 +3735,18 @@ fn run_retranscribe_once(
     Ok(out)
 }
 
-fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool, engine: Option<String>) {
+/// `refine_after`:转写成功提交后是否自动接 Aing(`spawn_refine`,含转码移交/日历/
+/// identify/拟题整条会后链路)。手动重转写传 false——那是用户对一篇已经跑完 Aing 的
+/// 笔记做的修复动作,要不要重跑 Aing 由用户自己按「重新分析」决定;音频导入传 true
+/// ——刚建出来的笔记还什么都没有,停录后那条链路本该一模一样地跑一遍(与
+/// lifecycle::actor 的 DoFinalize 分支同款调用,见那里的注释)。
+fn spawn_retranscribe(
+    app: tauri::AppHandle,
+    note_id: String,
+    mixed: bool,
+    engine: Option<String>,
+    refine_after: bool,
+) {
     let slot = app.state::<AppState>().retranscribing.clone();
     let last = app.state::<AppState>().retranscribe_last.clone();
     // language_filter:与实时链路(0) 一次性读设置同款途径同源同快照——不读到并发写入的
@@ -3773,6 +3785,7 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool, engin
             // 手动路径宽容(strict=false):失败段落占位,用户看 summary 自行决定。
             run_retranscribe_once(&app, &note_id, mixed, language_filter, false, engine.clone(), &mut progress)
         }));
+        let committed = matches!(body, Ok(Ok(_)));
         match body {
             Ok(Ok(summary)) => {
                 eprintln!("重转写完成({note_id}): {summary:?}");
@@ -3794,6 +3807,13 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool, engin
         // 或异常路径漏清。poison 只可能因锁内 panic 产生,槽是纯数据,中毒后继续清槽
         // 好过永久卡死。
         *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Aing 必须在清槽**之后**发起:spawn_refine 的占槽后互查
+        // (retranscribing_blocks_refine)读的正是这把槽,槽没清它会判定"同一篇
+        // 正被重转写"而整篇让路——导入笔记就再也等不到日历/identify/拟题了。
+        // 只在真正提交了新稿时发起:失败路径盘上一字未动,没有新内容可精修。
+        if refine_after && committed {
+            spawn_refine(app.clone(), note_id.clone(), true);
+        }
     });
 }
 
@@ -3826,6 +3846,133 @@ fn mixed_input_status(app: AppHandle, id: String) -> Result<Option<String>, Stri
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
     Ok(retranscribe::input::mixed_untrusted(&store::audio::load_audio_meta(&dir)))
+}
+
+/// 导入本地音频文件建笔记(2026-09-19,spec: docs/superpowers/specs/2026-09-19-audio-import-design.md)。
+/// 返回新笔记 id;转写在后台继续,进度走既有的 "retranscribe" 事件。
+///
+/// # 为什么复用 `retranscribing` 槽而不是新开一把
+///
+/// 导入的后半程**就是**一次离线转写(同一套 VAD/ASR/声纹 ORT 管线),它与录制、
+/// 重转写、补生成互斥的理由逐条相同。新开一把槽意味着要在 spawn_session /
+/// do_regenerate_mixed / spawn_refine 三处再接一轮 Dekker 写后读并各自重做一遍
+/// 互斥证明——那是本仓最容易接错的地方(见那几处的 Fix 1A/1B/2 注释)。复用现槽,
+/// 这些互斥关系一条不落地自动成立;而且笔记页照既有逻辑显示"这篇正在分析中",
+/// 说的也正是实情。代价只有一条:`retranscribe_last` 会记下导入任务的终态,
+/// MCP/UDS 的 retranscribe_status 轮询方会看到它——那同样是一次转写的终态,不算失真。
+///
+/// # 守卫顺序
+///
+/// 照抄 do_retranscribe 的纪律(只读快拒在前、占槽在后、占槽后 Dekker 复查)。
+/// 三处差异各有理由:①不查 Aing——笔记还不存在,没有同篇可冲突;②不查笔记 state
+/// ——笔记由本函数亲手建出,state 必为 complete;③不查转码 busy——新目录此刻不可能
+/// 在任何转码队列里。
+pub(crate) fn do_import_audio(app: &AppHandle, path: &str) -> Result<String, String> {
+    let src = std::path::PathBuf::from(path);
+    let ext = import::ext_of(&src).unwrap_or_default();
+    if !import::is_supported(&src) {
+        return Err(tr!(
+            "不支持的音频格式(支持 {list})",
+            "Unsupported audio format (supported: {list})",
+            list = import::SUPPORTED_EXTS.join(" / ")
+        ));
+    }
+    if !import::platform_supports(&ext) {
+        return Err(tr!(
+            "当前平台只能导入 WAV 文件,其余格式依赖 macOS 的音频转换工具",
+            "This platform can only import WAV files; other formats need macOS audio tools"
+        ));
+    }
+    if !src.is_file() {
+        return Err(tr!("文件不存在: {path}", "File not found: {path}", path = path));
+    }
+    let state: tauri::State<AppState> = app.state();
+    // 以下三条只读快拒与 do_retranscribe 同款同文案(理由见那边注释);权威判定在占槽后。
+    if state.download_running.load(Ordering::SeqCst) {
+        return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later"));
+    }
+    // session 读独立成句:锁序纪律同 do_retranscribe(ABBA 环,见那边注释)。
+    let session_active = state.session.lock().unwrap().is_some();
+    if recording_blocks_retranscribe(&state.running, session_active) {
+        return Err(tr!("录制中不能导入音频,请先停止录制", "Cannot import audio while recording"));
+    }
+    if mixed_regen_busy(&state.mixed_regen) {
+        return Err(tr!("正在补生成成品轨,稍后再试", "Mixed-track regeneration in progress; try again later"));
+    }
+    {
+        let mut slot = state.retranscribing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((running, _)) = slot.as_ref() {
+            return Err(tr!(
+                "已有转写任务在进行({running}),请等它完成",
+                "A transcription task is already running ({running})",
+                running = running
+            ));
+        }
+        // 占槽。笔记还没建,note_id 先留空串:本槽的两个消费者(retranscribe_status
+        // 的前端按 note_id 过滤、retranscribing_blocks_refine 按 note_id 匹配)都匹配
+        // 不上空串,恰好表达"资源已占、还没有对应笔记"。建档成功后立刻改写成真 id。
+        *slot = Some((String::new(), "import".into()));
+    }
+    // 占槽后的 Dekker 写后读(逐条理由见 do_retranscribe 的 Fix 1A/1B 注释):本侧是
+    // 写(槽)→读(对方),对侧是写(自己)→读(槽),顺序矛盾使双穿不可能发生。
+    let release = || {
+        *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    };
+    let session_active = state.session.lock().unwrap().is_some();
+    if recording_blocks_retranscribe(&state.running, session_active) {
+        release();
+        return Err(tr!("录制中不能导入音频,请先停止录制", "Cannot import audio while recording"));
+    }
+    if state.download_running.load(Ordering::SeqCst) {
+        release();
+        return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later"));
+    }
+    if mixed_regen_busy(&state.mixed_regen) {
+        release();
+        return Err(tr!("正在补生成成品轨,稍后再试", "Mixed-track regeneration in progress; try again later"));
+    }
+
+    let notes = match notes_dir(app) {
+        Ok(d) => d,
+        Err(e) => {
+            release();
+            return Err(e.to_string());
+        }
+    };
+    // 上次崩在解码中途的中转件可能有数百 MB,顺手清掉(不碰任何笔记目录)。
+    import::sweep_stale_tmp(&notes);
+    let out = match import::create_note(&notes, &src, chrono::Local::now()) {
+        Ok(o) => o,
+        Err(e) => {
+            release();
+            return Err(tr!("导入失败: {e}", "Import failed: {e}", e = e));
+        }
+    };
+    eprintln!(
+        "导入建档完成({}): 来源 {} 时长 {}ms",
+        out.note_id,
+        src.display(),
+        out.duration_ms
+    );
+    // 槽改写成真 id:此刻起笔记页查 retranscribe_status 能认出"这篇正在分析",
+    // spawn_refine 的占槽互查也能正确让路。
+    *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((out.note_id.clone(), "decode".into()));
+    // mixed=false:导入轨落在 mic 上,走 DualTrackInput(system 缺席时单轨合法)。
+    // engine=None:按用户设置决策,与录制/重转写同一口径。refine_after=true:
+    // 新笔记要跑完整条会后链路(转码移交/日历/identify/拟题),等同停录后的那一遍。
+    spawn_retranscribe(app.clone(), out.note_id.clone(), false, None, true);
+    Ok(out.note_id)
+}
+
+/// 导入本地音频文件建笔记。解码要跑几秒(afconvert 子进程 + 数百 MB 落盘),丢阻塞
+/// 线程池,不占住 Tauri 的 IPC 执行路径——同步命令在 Windows 上会表现为 WebView
+/// 整个停止重绘(同 stop_recording 的理由)。
+#[tauri::command]
+async fn import_audio(app: AppHandle, path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || do_import_audio(&app, &path))
+        .await
+        .map_err(|e| tr!("导入后台任务异常: {e}", "Import background task failed: {e}", e = e))?
 }
 
 /// 离线补生成成品轨的守卫与启动(二期,spec §离线补生成)。守卫链照抄
@@ -11369,6 +11516,7 @@ pub fn run() {
             mixed_regen_status,
             mixed_playback_info,
             retranscribe_status,
+            import_audio,
             mixed_input_status,
             save_refined,
             preview_relation_backfill,
@@ -11564,6 +11712,7 @@ mod attendees_prior_tests {
             calendar_cleared: false,
             attendees: manual.iter().map(|s| s.to_string()).collect(), attendees_removed: vec![],
             asr_engine: None,
+            imported_from: None,
         }
     }
 

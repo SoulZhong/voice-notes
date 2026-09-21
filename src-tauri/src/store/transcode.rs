@@ -316,17 +316,21 @@ fn decode_one(
     Ok(())
 }
 
-/// m4a 解码为**标准 44 头** WAV 到任意目标路径(原生播放器的解码缓存用)。
-/// afconvert 产物是胖头(40 字节 fmt + FLLR 填充),mmap 按 `44+2i` 直接索引会错位,
-/// 必须解析 RIFF 取纯 data 后用标准头重写——与 decode_one 的续录路径同一策略。
-/// tmp 同目录写、rename 原子落位,失败清 tmp。
-pub fn decode_m4a_to_standard_wav(m4a: &Path, dest: &Path) -> anyhow::Result<()> {
+/// 任意 afconvert 可读的音频 → **标准 44 头** 16k 单声道 WAV(原生播放器的解码缓存、
+/// 以及音频导入共用)。afconvert 产物是胖头(40 字节 fmt + FLLR 填充),mmap 按 `44+2i`
+/// 直接索引会错位,必须解析 RIFF 取纯 data 后用标准头重写——与 decode_one 的续录路径
+/// 同一策略。tmp 同目录写、rename 原子落位,失败清 tmp。
+///
+/// 入参从前叫 `m4a`:解码参数(`-f WAVE -d LEI16@16000 -c 1`)与输入容器无关,
+/// afconvert 吃什么由 CoreAudio 决定(mp3/m4a/aac/aiff/caf/wav/flac…),
+/// 函数名与参数名 2026-09-19 随音频导入一并正名,实现一个字没动。
+pub fn decode_to_standard_wav(src: &Path, dest: &Path) -> anyhow::Result<()> {
     let tmp = dest.with_extension("wav.tmp");
     let run = || -> anyhow::Result<()> {
-        afconvert_decode(m4a, &tmp)?;
+        afconvert_decode(src, &tmp)?;
         let pcm = extract_wav_data(&tmp)?;
         if pcm.is_empty() {
-            anyhow::bail!("解码得到空 WAV: {}", m4a.display());
+            anyhow::bail!("解码得到空 WAV: {}", src.display());
         }
         let mut canonical = Vec::with_capacity(HEADER_LEN as usize + pcm.len());
         canonical.extend_from_slice(&wav_header(pcm.len() as u32));

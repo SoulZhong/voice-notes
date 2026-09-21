@@ -23,6 +23,9 @@ struct Req {
     /// 强制本次重转写使用的本地识别引擎(如 "firered");缺省按设置决策。
     #[serde(default)]
     engine: Option<String>,
+    /// 导入音频的本地文件绝对路径(op = "import")。
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -139,13 +142,22 @@ trait UdsBackend {
     ) -> Result<serde_json::Value, String>;
     /// 当前重转写任务;空闲返回 null。
     fn retranscribe_status(&self) -> serde_json::Value;
+    /// 导入本地音频文件建笔记(同步建档、异步转写,返回新笔记 id)。
+    /// 默认实现报未支持,生产 AppBackend 覆写——mock 后端们不关心此 op。
+    fn import_audio(&self, _path: &str) -> Result<serde_json::Value, String> {
+        Err("import 未实现".into())
+    }
 }
 
 /// 策略层:控制类 op 统一先过门控(集中一处,新增控制 op 不会漏挂门控),再路由到
 /// backend;tail clamp 与 title trim 也在此,便于单测。未知 op 报错。
 fn dispatch_with<B: UdsBackend>(b: &B, req: &Req) -> Resp {
     let op = req.op.as_str();
-    if matches!(op, "start" | "stop" | "pause" | "resume" | "reaing" | "retranscribe") && !b.control_allowed() {
+    // import 进控制类:它建一篇新笔记并起一条转写任务(与录制/重转写同一把资源槽),
+    // 是不折不扣的写操作,必须与其它控制 op 同一道门。
+    if matches!(op, "start" | "stop" | "pause" | "resume" | "reaing" | "retranscribe" | "import")
+        && !b.control_allowed()
+    {
         return err(CONTROL_DENIED);
     }
     let result = match op {
@@ -165,6 +177,10 @@ fn dispatch_with<B: UdsBackend>(b: &B, req: &Req) -> Resp {
             None => Err("retranscribe 需要 note_id".into()),
         },
         "retranscribe_status" => Ok(b.retranscribe_status()),
+        "import" => match req.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(path) => b.import_audio(path),
+            None => Err("import 需要 path(本地音频文件的绝对路径)".into()),
+        },
         "refine_status" => match req.note_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(id) => b.refine_status(id),
             None => Err("refine_status 需要 note_id".into()),
@@ -440,6 +456,11 @@ impl UdsBackend for AppBackend<'_> {
         }))
     }
 
+    fn import_audio(&self, path: &str) -> Result<serde_json::Value, String> {
+        let note_id = crate::do_import_audio(self.0, path)?;
+        Ok(serde_json::json!({ "started": true, "note_id": note_id, "path": path }))
+    }
+
     fn retranscribe_status(&self) -> serde_json::Value {
         let state = self.0.state::<crate::AppState>();
         // poison 只可能因锁内 panic 产生,槽是纯数据,中毒后继续读最后写入值好过永久卡死。
@@ -528,10 +549,14 @@ mod tests {
             self.log("retranscribe_status");
             serde_json::json!({ "running": false, "last": null })
         }
+        fn import_audio(&self, path: &str) -> Result<serde_json::Value, String> {
+            self.log(format!("import:{path}"));
+            Ok(serde_json::json!({ "started": true, "note_id": "N9" }))
+        }
     }
 
     fn req(op: &str) -> Req {
-        Req { op: op.into(), title: None, tail: None, note_id: None, input: None, engine: None }
+        Req { op: op.into(), title: None, tail: None, note_id: None, input: None, engine: None, path: None }
     }
 
     #[test]
@@ -550,7 +575,7 @@ mod tests {
     fn query_ops_not_gated() {
         let b = MockBackend::new(false); // 即便控制关
         assert!(dispatch_with(&b, &req("status")).ok, "status 不受门控");
-        assert!(dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None, input: None, engine: None }).ok, "live 不受门控");
+        assert!(dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None, input: None, engine: None, path: None }).ok, "live 不受门控");
         assert!(b.called("status") && b.called("live:50"));
     }
 
@@ -564,7 +589,7 @@ mod tests {
         assert!(
             dispatch_with(&b, &Req {
                 op: "retranscribe".into(), title: None, tail: None,
-                note_id: Some("n1".into()), input: Some("dual".into()), engine: None,
+                note_id: Some("n1".into()), input: Some("dual".into()), engine: None, path: None,
             }).ok,
             "retranscribe 门控开时应放行"
         );
@@ -576,9 +601,9 @@ mod tests {
     #[test]
     fn live_tail_clamped_and_defaulted() {
         let b = MockBackend::new(true);
-        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(1000), note_id: None, input: None, engine: None });
-        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(0), note_id: None, input: None, engine: None });
-        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None, input: None, engine: None });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(1000), note_id: None, input: None, engine: None, path: None });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(0), note_id: None, input: None, engine: None, path: None });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None, input: None, engine: None, path: None });
         assert!(b.called("live:500"), "上限 500");
         assert!(b.called("live:1"), "下限 1");
         assert!(b.called("live:50"), "缺省 50");
@@ -587,8 +612,8 @@ mod tests {
     #[test]
     fn start_title_trimmed() {
         let b = MockBackend::new(true);
-        dispatch_with(&b, &Req { op: "start".into(), title: Some("  评审会  ".into()), tail: None, note_id: None, input: None, engine: None });
-        dispatch_with(&b, &Req { op: "start".into(), title: Some("   ".into()), tail: None, note_id: None, input: None, engine: None });
+        dispatch_with(&b, &Req { op: "start".into(), title: Some("  评审会  ".into()), tail: None, note_id: None, input: None, engine: None, path: None });
+        dispatch_with(&b, &Req { op: "start".into(), title: Some("   ".into()), tail: None, note_id: None, input: None, engine: None, path: None });
         assert!(b.called("start:Some(\"评审会\")"), "两端空白应 trim: {:?}", b.calls.borrow());
         assert!(b.called("start:None"), "纯空白 title → None");
     }
@@ -602,7 +627,7 @@ mod tests {
         let r = dispatch_with(&b, &Req {
             op: "retranscribe".into(), title: None, tail: None,
             note_id: Some("n1".into()), input: Some("dual".into()),
-            engine: Some("  firered  ".into()),
+            engine: Some("  firered  ".into()), path: None,
         });
         assert!(r.ok);
         assert!(b.called("retranscribe:n1:dual:firered"), "engine 应 trim 后传下去");
@@ -611,9 +636,41 @@ mod tests {
         let r2 = dispatch_with(&b2, &Req {
             op: "retranscribe".into(), title: None, tail: None,
             note_id: Some("n1".into()), input: Some("dual".into()), engine: Some("   ".into()),
+            path: None,
         });
         assert!(r2.ok);
         assert!(b2.called("retranscribe:n1:dual"), "空串等于未指定");
+    }
+
+    /// 音频导入是写操作(建笔记 + 占转写槽),必须与其它控制 op 同门:关门时拒、
+    /// 开门时路由;path 两端空白 trim,纯空白等于没给(报缺 path,不把空串传下去
+    /// 当文件名打开)。新增控制 op 最容易漏的就是门控那一行,这条用例把它锁住。
+    #[test]
+    fn import_is_gated_and_requires_path() {
+        let denied = MockBackend::new(false);
+        let r = dispatch_with(&denied, &Req {
+            op: "import".into(), title: None, tail: None, note_id: None, input: None,
+            engine: None, path: Some("/tmp/a.m4a".into()),
+        });
+        assert!(!r.ok, "control 关闭时 import 必须被拒");
+        assert!(!denied.called("import:/tmp/a.m4a"), "被拒就不该路由到 backend");
+
+        let b = MockBackend::new(true);
+        let r = dispatch_with(&b, &Req {
+            op: "import".into(), title: None, tail: None, note_id: None, input: None,
+            engine: None, path: Some("  /tmp/a.m4a  ".into()),
+        });
+        assert!(r.ok);
+        assert!(b.called("import:/tmp/a.m4a"), "path 应 trim 后传下去");
+
+        let b2 = MockBackend::new(true);
+        for path in [None, Some("   ".into())] {
+            let r = dispatch_with(&b2, &Req {
+                op: "import".into(), title: None, tail: None, note_id: None, input: None,
+                engine: None, path,
+            });
+            assert!(!r.ok, "没给 path 必须报错而不是拿空串去开文件");
+        }
     }
 
     #[test]
@@ -621,12 +678,12 @@ mod tests {
         let denied = MockBackend::new(false);
         let r = dispatch_with(&denied, &Req {
             op: "retranscribe".into(), title: None, tail: None,
-            note_id: Some("n1".into()), input: Some("dual".into()), engine: None,
+            note_id: Some("n1".into()), input: Some("dual".into()), engine: None, path: None,
         });
         assert!(!r.ok, "control 关闭时 retranscribe 必须被拒");
         let r = dispatch_with(&denied, &Req {
             op: "retranscribe_status".into(), title: None, tail: None, note_id: None,
-            input: None, engine: None,
+            input: None, engine: None, path: None,
         });
         assert!(r.ok, "status 查询不受 control 门控");
         assert!(denied.called("retranscribe_status"));
@@ -634,7 +691,7 @@ mod tests {
         let allowed = MockBackend::new(true);
         let r = dispatch_with(&allowed, &Req {
             op: "retranscribe".into(), title: None, tail: None,
-            note_id: Some("n1".into()), input: None, engine: None,
+            note_id: Some("n1".into()), input: None, engine: None, path: None,
         });
         assert!(r.ok);
         assert!(allowed.called("retranscribe:n1:dual"), "input 缺省应补 dual");

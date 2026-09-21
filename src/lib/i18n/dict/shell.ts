@@ -16,6 +16,14 @@ export const zh = {
   "shell.record.stop": "停止录制",
   "shell.record.start": "开始录制",
 
+  // ── 侧栏:导入已有录音 ──
+  "shell.import.action": "导入音频",
+  "shell.import.running": "导入中…",
+  "shell.import.hint": "把已有的录音文件导入成一篇笔记(转写在后台继续)",
+  "shell.import.busyRecording": "录制中不能导入,请先停止录制",
+  "shell.import.filterName": "音频文件",
+  "shell.import.failed": "导入失败: {e}",
+
   // ── 侧栏:笔记列表 ──
   "shell.notes.filterPlaceholder": "按标题过滤",
   "shell.notes.empty": "还没有笔记",
@@ -198,6 +206,13 @@ export const en = {
   "shell.record.paused": "Paused",
   "shell.record.stop": "Stop recording",
   "shell.record.start": "Start recording",
+
+  "shell.import.action": "Import audio",
+  "shell.import.running": "Importing…",
+  "shell.import.hint": "Turn an existing recording into a note (transcription continues in the background)",
+  "shell.import.busyRecording": "Cannot import while recording; stop the recording first",
+  "shell.import.filterName": "Audio files",
+  "shell.import.failed": "Import failed: {e}",
 
   "shell.notes.filterPlaceholder": "Filter by title",
   "shell.notes.empty": "No notes yet",
