@@ -114,7 +114,7 @@ impl TranscribeInput for DualTrackInput {
             }
         }
         if !found {
-            anyhow::bail!("mic/system 音轨均不可读,无法重转写");
+            anyhow::bail!("mic/system 音轨均不可读,无法重新转文字");
         }
         if let (Some((mic_off, mic_pcm)), Some((sys_off, sys_pcm))) = (&mic_track, &sys_track) {
             self.gate_spans =
