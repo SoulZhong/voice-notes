@@ -39,13 +39,45 @@ describe("refinedToBlocks", () => {
     const blocks = refinedToBlocks(d);
     expect(blocks[0].kind).toBe("runs");
     expect(blocks[0].runs).toEqual([
-      { text: "张三", entityId: "P1" },
-      { text: "在会上发言", entityId: null },
+      { text: "张三", entityId: "P1", entityKind: null },
+      { text: "在会上发言", entityId: null, entityKind: null },
     ]);
     expect(blocks[0].origIndex).toBe(0);
     expect(blocks[0].speaker).toBe("R1");
     expect(blocks[1].kind).toBe("markdown");
     expect(blocks[1].markdown).toBe("无实体段落");
+  });
+
+  /** 正文提及的颜色按实体类型取(与头顶 chip 同色),所以 run 必须带上 kind。
+      稿上留着一条指向已删实体的悬空 mention 时,kind 落 null 让下游走中性兜底
+      ——不能因为一条悬空引用就把整段降级成无标注纯文本(那会连同段里其它
+      正常实体的高亮一起丢掉)。 */
+  it("run 带上实体类型;悬空 mention 的类型为 null 而不丢掉整段标注", () => {
+    const d = doc({
+      entities: [
+        { id: "P1", kind: "person", name: "张三" },
+        { id: "T1", kind: "term", name: "决策机" },
+      ],
+      paragraphs: [
+        {
+          speaker: "R1", start_ms: 0, end_ms: 1000, source_seqs: [1],
+          text: "张三说决策机和幽灵",
+          mentions: [
+            { id: "m1", entity: "P1", start: 0, end: 2 },
+            { id: "m2", entity: "T1", start: 3, end: 6 },
+            { id: "m3", entity: "GONE", start: 7, end: 9 },
+          ],
+        },
+      ],
+    });
+    const runs = refinedToBlocks(d)[0].runs;
+    expect(runs).toEqual([
+      { text: "张三", entityId: "P1", entityKind: "person" },
+      { text: "说", entityId: null, entityKind: null },
+      { text: "决策机", entityId: "T1", entityKind: "term" },
+      { text: "和", entityId: null, entityKind: null },
+      { text: "幽灵", entityId: "GONE", entityKind: null },
+    ]);
   });
 
   it("graph_support_mentions 中的 mention 被过滤(不产出实体 run)", () => {

@@ -65,6 +65,8 @@
     noteEntityRename,
     noteEntityDelete,
     noteEntitySetKind,
+    noteEntityMerge,
+    noteEntitySetAliases,
     personAddEmail,
     setNoteAttendeesRemoved,
     type CutRange,
@@ -652,6 +654,28 @@
     await noteEntitySetKind(id, entityId, kind);
     await reloadRefinedForEntities();
   }
+  /** 合并(二期):本篇立即合,全局治理账本由后端同步。合完正文提及会改指胜方,
+      所以要整份重载修订稿(与增/删/改名同一条闸门)。 */
+  async function entityMerge(entityId: string, targetId: string) {
+    await noteEntityMerge(id, entityId, targetId);
+    // 定位态可能还指着刚被并掉的那个实体:清掉,免得下次点 chip 找一个不存在的 id。
+    entityLocate = null;
+    await reloadRefinedForEntities();
+  }
+  /** 别名整表替换:改完提及会变(加了多认出、删了少认出),整份重载修订稿。 */
+  async function entitySetAliases(entityId: string, aliases: string[]) {
+    await noteEntitySetAliases(id, entityId, aliases);
+    await reloadRefinedForEntities();
+  }
+  /** 实体 → 图谱/人物页链接(解析不到全局 id 的返回 null,浮层不出这个入口)。
+      与正文悬浮浮层的 gotoEntity 同一份 entityLinks,口径不分叉。 */
+  function entityGraphHref(eid: string): string | null {
+    const link = entityLinks[eid];
+    if (!link) return null;
+    return link.is_person
+      ? "/speakers/" + link.global_id
+      : "/graph?e=" + encodeURIComponent(link.global_id);
+  }
   /** 点实体定位正文提及:滚到第一处并高亮全部,再点同一实体跳下一处。
       实体只存在于修订稿,原始稿视图先切过去(段落异步渲染,重试一拍)。 */
   let entityLocate: { id: string; idx: number } | null = null;
@@ -667,6 +691,13 @@
     }
     const idx = entityLocate?.id === entId ? (entityLocate.idx + 1) % spans.length : 0;
     entityLocate = { id: entId, idx };
+    // 清的是**整篇**的定位类,不只是本实体那几个:先点 A 再点 B 时,A 的 2.6s 清理
+    // 定时器会被下面的 clearTimeout 取消,只清 B 的话 A 的环会一直挂到正文重渲染。
+    // 顺带也解决"同一实体连点两次动画不重放"——目标 span 上的类被清掉再加回,
+    // 配合下面的强制回流,CSS 动画才会重新起跑。
+    for (const sp of transcriptEl?.querySelectorAll<HTMLElement>(".entity-mention") ?? [])
+      sp.classList.remove("entity-located", "entity-located-current");
+    void spans[idx].offsetWidth;
     for (const sp of spans) sp.classList.add("entity-located");
     spans[idx].classList.add("entity-located-current");
     spans[idx].scrollIntoView({ block: "center", behavior: "smooth" });
@@ -3010,6 +3041,9 @@
           onRename={entityRename}
           onDelete={entityDelete}
           onSetKind={entitySetKind}
+          onMerge={entityMerge}
+          onSetAliases={entitySetAliases}
+          graphHref={entityGraphHref}
         />
       {/if}
 
@@ -3801,14 +3835,37 @@
   .transcript :global(.md-seg.playing) {
     background: var(--accent-tint);
   }
-  /* 实体定位:点实体 chip 后全部提及浮 accent 底,当前一处加描边(2.6s 消散) */
+  /* 实体定位:点实体 chip 后全部提及套同色虚线环,当前一处实线环 + 脉冲一下(2.6s 消散)。
+     环用实体自己的色(--ent-ink)而不是 accent:正文里的提及本就按类型着色了,
+     定位态再换成统一的 accent 就等于把"这是哪一类"这条信息在最需要看清的时刻抹掉。 */
   .transcript :global(.entity-mention.entity-located) {
-    background: var(--accent-tint);
-    border-radius: var(--radius-sm);
+    outline: 1px dashed var(--ent-ink, var(--accent));
+    outline-offset: 2px;
   }
   .transcript :global(.entity-mention.entity-located-current) {
-    outline: 1.5px solid var(--accent);
-    outline-offset: 1px;
+    outline: 2px solid var(--ent-ink, var(--accent));
+    outline-offset: 2px;
+    animation: entity-pulse 620ms ease-out;
+  }
+  /* 定位命中的那一下:同色光晕从字身扩散开再散尽。只跑一次,结束回落原状——
+     正文里几十处提及常驻动画会晃眼,动效只用来回答"我刚点的那个跳到哪了"。
+     用 box-shadow 而不是 transform:见上方 .entity-mention 里不改 display 的理由。 */
+  @keyframes entity-pulse {
+    0% {
+      box-shadow: 0 0 0 0 var(--ent-ink, var(--accent));
+    }
+    55% {
+      box-shadow: 0 0 0 7px transparent;
+    }
+    100% {
+      box-shadow: 0 0 0 0 transparent;
+    }
+  }
+  /* prefers-reduced-motion:系统要求减弱动效时不做缩放/光晕,只留实线环定位。 */
+  @media (prefers-reduced-motion: reduce) {
+    .transcript :global(.entity-mention.entity-located-current) {
+      animation: none;
+    }
   }
   /* 圈选游标联动:拖动游标时离它最近的段 accent-tint 底 + 切线交代边界方向——
      开始游标的线在文字上方(从这里起导出)、结束游标在下方(到这里为止)。
@@ -3852,19 +3909,39 @@
     outline: 2px solid var(--accent);
     border-radius: var(--radius-sm);
   }
-  /* 实体提及高亮:正文单色,静态无底(不染正文),hover 才浮 accent-tint 底 + accent 字。
+  /* 实体提及高亮:常驻一层极淡的 accent-tint-soft 底(2026-09-19 用户点名改)。
+     此前是「静态无底,hover 才显形」——顾虑是别把正文染花,但代价太大:一篇 83 处
+     提及在页面上完全看不出来,人以为实体识别没生效(实际 offset 全都精准命中),
+     只能靠顶部实体行的「定位」按钮一处处跳。常驻底色让"哪些词被认出来了"一眼可见。
+     浓度必须停在 soft 这一档:再浓就和 hover / 实体定位 / 当前播放段那一档
+     (accent-tint)撞车,那三层信息就没法靠深浅区分了(见 app.css 的令牌注释)。
      :global 原因同上——原始稿(.md-seg 内)与修订稿(NodeView 的 .md-para 内)共用同一套
      class,两者都是 PM 命令式创建的 DOM,没有 Svelte scope hash。 */
   .transcript :global(.entity-mention) {
+    /* 颜色取自实体自己的类型色(行内 --ent-tint / --ent-ink,见 $lib/entityKind),
+       与头顶那枚 chip 逐字同色——"正文这个词"和"行里那枚 chip"是同一个东西,
+       这件事全靠同色传达。查不到类型时回落中性灰,不至于没色可上。 */
+    background: var(--ent-tint, var(--tint-gray));
+    color: var(--ent-ink, var(--tint-gray-ink));
+    font-size: 1.08em;
+    font-weight: 500;
     border-radius: var(--radius-sm);
+    /* 横向撑开一点,底色块不贴着字;负外边距抵掉,密排正文的字距不被推开。
+       纵向只给 0.05em:行高 1.7 的中文稿里再多就会和上下行的底色块糊在一起。 */
+    padding: 0.05em 0.15em;
+    margin: 0 -0.05em;
+    /* 刻意**不**改 display:修订稿是 contenteditable,行内元素换成 inline-block
+       会带来光标落点与选区的怪癖(编辑体验 > 一点缩放动效)。因此定位脉冲只用
+       box-shadow(行内元素上生效),不用 transform(行内非替换元素上不作用)。 */
     cursor: default;
     transition:
       background 120ms ease,
-      color 120ms ease;
+      color 120ms ease,
+      box-shadow 120ms ease;
   }
+  /* hover:同色相加一圈光环,而不是换色——换色会和"定位命中"那一档撞车。 */
   .transcript :global(.entity-mention:hover) {
-    background: var(--accent-tint);
-    color: var(--accent);
+    box-shadow: 0 0 0 2px var(--ent-tint, var(--tint-gray));
   }
   /* 可导航的实体提及(能解析到全局 id):区别于纯 tooltip 态,给出可点信号 */
   .transcript :global(.entity-mention.linkable) {

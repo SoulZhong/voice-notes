@@ -28,6 +28,8 @@ pub use refined::load_refined_for_display; // 纯展示面(笔记页/导出)专�
 pub use refined::{aing_exists, AING_DOC_FILE, LEGACY_REFINED_FILE}; // 迁移感知的存在性判断 + 落盘/旧文件名(mcp::tools、refine::agent 消费)。
 pub use refined::update_refined_for_retry; // 部分重试写回(lib.rs 消费)。
 pub use refined::{add_note_entities, delete_note_entity, rename_note_entity, set_note_entity_kind}; // 笔记页实体编辑(lib.rs 命令层消费,2026-09-17)。
+pub use refined::merge_note_entities; // 笔记页实体合并(二期,2026-09-19)。
+pub use refined::set_note_entity_aliases; // 笔记页实体别名编辑(二期,2026-09-20)。
 pub use refined::heal_stale_refined; // 停摆自愈(lifecycle::actor 消费,issue #173)。
 pub use refined::{join_note_identities, mark_refined_stale, sync_refined_after_split}; // 修订稿维护(lib.rs 命令层消费;一波说话人后身份编辑走 notes.rs 的 S 域入口)。
 pub use refined::{save_refined_paragraphs, ParagraphPayload}; // 笔记页 WYSIWYG 整篇保存(lib.rs 命令层消费)。
