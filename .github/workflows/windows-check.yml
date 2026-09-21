@@ -30,6 +30,46 @@ jobs:
           # 找不到 sherpa-onnx-c-api。平时靠同一份 Cargo.lock 的完整缓存命中掩盖着,
           # 一旦依赖变更换了缓存键就必现(2026-08-18 接入 posthog-rs 时踩到)。
           cache-directories: src-tauri/target/sherpa-onnx-prebuilt
+      # 缓存自愈(2026-09-21)。rust-cache 会按**前缀**恢复到一份旧 Cargo.lock 的缓存
+      # (失败日志里那句 `full match: false`)。那份缓存带着 sherpa-onnx-sys 的
+      # fingerprint,cargo 据此认为 build script 是新鲜的、跳过重跑;而预编译静态库
+      # 并不在其中,于是链接阶段报 `could not find native static library
+      # sherpa-onnx-c-api`。
+      #
+      # 这个坑会**自持**:失败的 job 不保存缓存(cache-on-failure 默认 false),那份
+      # 坏缓存因此永远不会被刷新——2026-09-18 一破之后 master 就连红到今天,重跑
+      # 多少次都好不了。上一轮只把预编译目录加进 cache-directories,挡得住"完全没
+      # 命中",挡不住"部分命中"这条路。
+      #
+      # 致命的那一环在 sherpa-onnx-sys 的 build.rs 里:
+      #
+      #     let lib_dir = extracted_dir.join("lib");
+      #     if lib_dir.is_dir() { return Ok(lib_dir); }   // 只看目录在不在
+      #
+      # 它**只检查目录存在**就直接返回并发出 `-L`,不验证 .lib 是否真在里面。
+      # 缓存恢复出一个空/残缺的 `lib/`,它就一秒返回,链接必炸——失败日志里
+      # 「Compiling sherpa-onnx-sys」到报错只隔 1 秒,正是这条快路。
+      #
+      # 所以自愈必须**删掉那个目录本身**:`cargo clean -p` 只动 cargo 的构建产物,
+      # target/sherpa-onnx-prebuilt 在它管辖之外,清了也白清(2026-09-21 实测,
+      # 第一版修法就栽在这里)。两件事都做:删目录(逼重新下载)+ 清 fingerprint
+      # (逼 build script 重跑)。
+      #
+      # 判据只看**产物在不在**,与缓存命中与否无关。首次构建(本就没有产物)时
+      # 是一次无副作用的 no-op。
+      - name: 预编译静态库自愈(缓存可能只是部分命中)
+        working-directory: src-tauri
+        shell: pwsh
+        run: |
+          $lib = Get-ChildItem -Path target/sherpa-onnx-prebuilt -Recurse -Filter sherpa-onnx-c-api.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $lib) {
+            Write-Host "预编译静态库缺失 -> 删掉 target/sherpa-onnx-prebuilt 并清 fingerprint,逼 build script 重新下载"
+            Remove-Item -Recurse -Force target/sherpa-onnx-prebuilt -ErrorAction SilentlyContinue
+            cargo clean -p sherpa-onnx-sys
+          } else {
+            Write-Host "预编译静态库就位: $($lib.FullName)"
+          }
+
       # DLL 占位步骤已删除:sherpa-onnx 官方 crate 默认静态链接(含 onnxruntime),
       # tauri.windows.conf.json 不再声明任何运行时 DLL 资源。这里必须真正 build：
       # cargo check 不做最终链接，会让静态库缺失或 MT/MD 运行时冲突静默过绿。
