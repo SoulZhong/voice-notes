@@ -41,8 +41,21 @@ jobs:
       # 多少次都好不了。上一轮只把预编译目录加进 cache-directories,挡得住"完全没
       # 命中",挡不住"部分命中"这条路。
       #
-      # 判据只看**产物在不在**,与缓存命中与否无关:不在就删掉这个 crate 的
-      # fingerprint,逼 build script 重跑并重新下载。首次构建(本就没有产物)时
+      # 致命的那一环在 sherpa-onnx-sys 的 build.rs 里:
+      #
+      #     let lib_dir = extracted_dir.join("lib");
+      #     if lib_dir.is_dir() { return Ok(lib_dir); }   // 只看目录在不在
+      #
+      # 它**只检查目录存在**就直接返回并发出 `-L`,不验证 .lib 是否真在里面。
+      # 缓存恢复出一个空/残缺的 `lib/`,它就一秒返回,链接必炸——失败日志里
+      # 「Compiling sherpa-onnx-sys」到报错只隔 1 秒,正是这条快路。
+      #
+      # 所以自愈必须**删掉那个目录本身**:`cargo clean -p` 只动 cargo 的构建产物,
+      # target/sherpa-onnx-prebuilt 在它管辖之外,清了也白清(2026-09-21 实测,
+      # 第一版修法就栽在这里)。两件事都做:删目录(逼重新下载)+ 清 fingerprint
+      # (逼 build script 重跑)。
+      #
+      # 判据只看**产物在不在**,与缓存命中与否无关。首次构建(本就没有产物)时
       # 是一次无副作用的 no-op。
       - name: 预编译静态库自愈(缓存可能只是部分命中)
         working-directory: src-tauri
@@ -50,7 +63,8 @@ jobs:
         run: |
           $lib = Get-ChildItem -Path target/sherpa-onnx-prebuilt -Recurse -Filter sherpa-onnx-c-api.lib -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($null -eq $lib) {
-            Write-Host "预编译静态库缺失(缓存未命中或只是部分命中) -> cargo clean -p sherpa-onnx-sys,让 build script 重跑"
+            Write-Host "预编译静态库缺失 -> 删掉 target/sherpa-onnx-prebuilt 并清 fingerprint,逼 build script 重新下载"
+            Remove-Item -Recurse -Force target/sherpa-onnx-prebuilt -ErrorAction SilentlyContinue
             cargo clean -p sherpa-onnx-sys
           } else {
             Write-Host "预编译静态库就位: $($lib.FullName)"
