@@ -2676,12 +2676,14 @@
   onclick={() => {
     exportMenuOpen = false;
     editsManage = false;
+    retransConfirm = false;
     entityChipsEl?.closeAll();
   }}
   onkeydown={(e) => {
     if (e.key === "Escape") {
       exportMenuOpen = false;
       editsManage = false;
+      retransConfirm = false;
     }
   }}
 />
@@ -3141,7 +3143,15 @@
             aria-expanded={retransConfirm}
             disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
             title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
-            onclick={() => (retransConfirm = !retransConfirm)}
+            onclick={() => {
+              // 先关同工具条里的其它浮层:本 wrap 会 stopPropagation(不然点自己
+              // 就被 window 的关闭处理吞掉),于是"点开这个顺带关掉那个"的默认
+              // 行为也一起没了,两层浮层会在吸顶栏里叠着。
+              exportMenuOpen = false;
+              editsManage = false;
+              entityChipsEl?.closeAll();
+              retransConfirm = !retransConfirm;
+            }}
           >
             <svg class:spin={retranscribing} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
