@@ -435,10 +435,23 @@ impl NoteStore {
         write_speakers_atomic(&dir, &speakers)
     }
 
-    /// 解除说话人与声纹库人物的关联:只清 person_id,表项与段落归属一概不动。
+    /// 解除说话人与声纹库人物的关联:清 person_id,表项与段落归属一概不动。
     ///
-    /// 清完 person_id 之后 name 必然还是空串(assign_speaker_person 关联时就把本地名
-    /// 清了),于是显示回落到「新说话人 N」——这正是"取消关联"该有的样子。
+    /// **同时清掉"就是那个人名字"的本地名**(2026-09-20 用户实报:取消关联后卡片还
+    /// 挂着原来那个人的姓名)。原注释断言"关联时就把本地名清了,所以清完必然回落
+    /// 「新说话人 N」"——这条不变式只有 assign_speaker_person 那一条路成立;
+    /// assign_speaker_person_if(一键拆分收尾)与 set_speaker_hints 的 prior_person
+    /// 回填都只写 person_id、不动 name,于是盘上真实存在 name=「仲维建」+
+    /// person_id=P14 这种表项,取消关联之后名字照样显示。
+    ///
+    /// 判据刻意收窄到"本地名 == 库里那个人的现名":那种名字本就是**那个人的**名字,
+    /// 用户说"它不是那个人"时理应随之消失;而本地名与库名不同(用户给本篇这个簇起的
+    /// 自己的标签)与关联无关,清掉等于替用户丢掉他亲手打的字。读不到声纹库一律不清
+    /// (缺失/损坏时宁可留着名字,也不猜)。
+    ///
+    /// hint_person 指向刚解除的这个人时一并清:否则取消关联的下一刻,chip 上又浮出
+    /// 「建议:仲维建」——把用户刚否掉的结论原样再劝一遍。
+    ///
     /// **不复用 delete_speaker**:那个会连表项一起删、把名下段落全退回未标注,
     /// 而用户要的只是断开与库人物的绑定,段落该归谁还归谁。
     pub fn clear_speaker_person(&self, id: &str, speaker_id: &str) -> anyhow::Result<()> {
@@ -449,11 +462,36 @@ impl NoteStore {
         let meta = speakers
             .get_mut(speaker_id)
             .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
-        if meta.person_id.is_none() {
+        let Some(person_id) = meta.person_id.clone() else {
             return Ok(()); // 本就没关联,幂等返回
-        }
+        };
+        let person_name = self.person_display_name(&person_id);
         meta.person_id = None;
+        // 名字要不要清,取决于"它是不是那个人的名字",所以必须查库。
+        if let Some(pname) = person_name.as_deref() {
+            if !meta.name.is_empty() && meta.name.trim() == pname.trim() {
+                meta.name = String::new();
+            }
+        }
+        // 声纹建议清不清,只看 id 相不相等,**不依赖查库**——这一句此前嵌在上面的
+        // `if let Some(pname)` 里,于是库读不出名字时(未命名的自动人物是常态、
+        // 被合并重定向走、voiceprints.json 读失败)建议就留着,取消关联的下一刻
+        // chip 上又浮出「建议:某某」,把用户刚否掉的结论原样再劝一遍。
+        if meta.hint_person.as_deref() == Some(person_id.as_str()) {
+            meta.hint_person = None;
+        }
         write_speakers_atomic(&dir, &speakers)
+    }
+
+    /// 库里某人的现名(经 redirects 归一)。读不到库/查无此人 → None。
+    /// 与 join_person_names 同一条加载路径(VoiceprintStore 挂在 notes_dir 上一级),
+    /// 口径不分叉:那边用它做展示兜底,这边用它判定"本地名是不是就是这个人的名字"。
+    fn person_display_name(&self, person_id: &str) -> Option<String> {
+        let root = self.notes_dir.parent()?;
+        let vp = super::VoiceprintStore::new(root.to_path_buf()).load();
+        let resolved = super::VoiceprintStore::resolve(&vp, person_id)?;
+        let name = vp.people.get(resolved)?.name.clone();
+        (!name.is_empty()).then_some(name)
     }
 
     /// 一键拆分的恢复原状(不拆/撤销共用):多人标记复位,人物关联按打标前快照
@@ -1903,6 +1941,97 @@ mod tests {
         assert_eq!(n.speakers["S1"].name, "", "本地名仍为空 → 显示回落到「新说话人 N」");
         assert_eq!(n.segments[0].speaker.as_deref(), Some("S1"), "段落归属一律不动");
         assert_eq!(n.segments[1].speaker.as_deref(), Some("S3"), "他人不受影响");
+    }
+
+    /// 2026-09-20 用户实报:取消关联之后,卡片上还挂着原来那个人的姓名。
+    ///
+    /// 根因是一条只对 assign_speaker_person 成立的不变式被当成了全局成立:
+    /// assign_speaker_person_if(一键拆分收尾)只写 person_id、不动 name,盘上因此
+    /// 真实存在 `name=「王虎」+ person_id=P7` 这种表项(用户库里就有),取消关联
+    /// 只清 person_id,名字照样显示。
+    ///
+    /// 本用例同时钉住**收窄后的判据**:本地名等于库里那个人的现名才清(那名字本就
+    /// 是"那个人的"),本地名是用户给本篇起的别的标签则留着——清掉等于替用户丢掉
+    /// 他亲手打的字。
+    #[test]
+    fn clear_speaker_person_drops_the_name_that_came_from_that_person() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 声纹库挂在 notes_dir 的上一级(与 join_person_names 同一条路径),
+        // 所以笔记根要落在 tmp/notes 下,库文件落 tmp/voiceprints.json。
+        let notes = tmp.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(
+            tmp.path().join("voiceprints.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "next_person": 8,
+                "people": { "P7": { "name": "王虎", "total_ms": 0, "last_seen": "" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = NoteStore::new(notes.clone());
+
+        // ① 本地名 == 库现名(一键拆分那条路造出来的形态)→ 取消关联应一并清掉
+        let id = make_spk_note(&notes, &[("甲", Some("S1"))], &["S1"]);
+        store.rename_speaker(&id, "S1", "王虎").unwrap();
+        store.assign_speaker_person_if(&id, "S1", "P7").unwrap();
+        let n = store.load(&id).unwrap();
+        assert_eq!(n.speakers["S1"].name, "王虎", "前提:本地名与库名同字");
+        assert_eq!(n.speakers["S1"].person_id.as_deref(), Some("P7"));
+
+        store.clear_speaker_person(&id, "S1").unwrap();
+        let n = store.load(&id).unwrap();
+        assert_eq!(n.speakers["S1"].person_id, None, "关联断开");
+        assert_eq!(n.speakers["S1"].name, "", "那个人的名字必须随关联一起消失(回落「新说话人 N」)");
+        assert!(n.speakers.contains_key("S1"), "表项仍在");
+        assert_eq!(n.segments[0].speaker.as_deref(), Some("S1"), "段落归属不动");
+
+        // ② 本地名是用户自己的标签(与库名不同)→ 留着,不替用户丢字
+        let id2 = make_spk_note(&notes, &[("乙", Some("S1"))], &["S1"]);
+        store.rename_speaker(&id2, "S1", "左边那位").unwrap();
+        store.assign_speaker_person_if(&id2, "S1", "P7").unwrap();
+        store.clear_speaker_person(&id2, "S1").unwrap();
+        let n2 = store.load(&id2).unwrap();
+        assert_eq!(n2.speakers["S1"].person_id, None);
+        assert_eq!(n2.speakers["S1"].name, "左边那位", "与库名不同的本地标签与关联无关,不该被清");
+    }
+
+    /// 合并前审核(低):声纹建议的清除**不该**依赖"库里查得到名字"。未命名的自动
+    /// 人物是常态(新说话人 130 这种),库读不出名字时若把建议留着,取消关联的下一刻
+    /// chip 上又浮出「建议:此人」——把用户刚否掉的结论原样再劝一遍。
+    #[test]
+    fn clear_speaker_person_drops_the_hint_even_for_an_unnamed_person() {
+        let tmp = tempfile::tempdir().unwrap();
+        let notes = tmp.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        // P7 存在但**没有名字**(自动建档、尚未命名)
+        std::fs::write(
+            tmp.path().join("voiceprints.json"),
+            serde_json::json!({
+                "schema_version": 1, "next_person": 8,
+                "people": { "P7": { "name": "", "total_ms": 0, "last_seen": "" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = NoteStore::new(notes.clone());
+        let id = make_spk_note(&notes, &[("甲", Some("S1"))], &["S1"]);
+        store.assign_speaker_person_if(&id, "S1", "P7").unwrap();
+        store.set_speaker_hints(&id, &[("S1".to_string(), "P7".to_string())]).unwrap();
+        assert_eq!(
+            store.load(&id).unwrap().speakers["S1"].hint_person.as_deref(),
+            Some("P7"),
+            "前提:建议指向即将被解除的那个人"
+        );
+
+        store.clear_speaker_person(&id, "S1").unwrap();
+        let n = store.load(&id).unwrap();
+        assert_eq!(n.speakers["S1"].person_id, None);
+        assert_eq!(
+            n.speakers["S1"].hint_person, None,
+            "刚否掉的人不得立刻又被建议一遍(哪怕库里他还没名字)"
+        );
     }
 
     /// 样本↔会议同步的 CAS:期望值命中才改派/解除;被改成别人则拒绝不覆盖;幂等。
