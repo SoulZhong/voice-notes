@@ -202,7 +202,7 @@ pub fn run(
 
     // 提交门:结果空、或占位段过半 → 整体放弃,盘上一字不动(spec §提交与安全网)。
     if recs.is_empty() {
-        anyhow::bail!("重转写产出 0 段,放弃提交(原稿保留)");
+        anyhow::bail!("重新转文字产出 0 段,放弃提交(原稿保留)");
     }
     if summary.failed_segments * 2 > recs.len() {
         anyhow::bail!(
