@@ -119,6 +119,14 @@
   // lastSaved 的不变式:它只能反映「已确认落在盘上的内容」。一旦被置成尚未确认的
   // 当前内容,排队中的下一次 flush 会因指纹相等直接 return,那部分输入永不落盘。
   let lastSaved = "";
+  // baseline/lastSaved 惰性物化:长稿(上千段)载入时逐段序列化两遍要几十毫秒,全压在
+  // 点开笔记那一下的主线程上。setRefined 只记下载入那一刻的文档,首次真正要用
+  // (保存/回执)时才序列化——载入文档是不可变的 PM 节点,晚算与当场算结果相同。
+  let baselineSrc: { doc: RefinedDoc; node: PMNode } | null = null;
+  // 载入后有没有过用户编辑(与 scheduleIdleSave 同一判据)。基线未物化且无编辑 ⇒
+  // 当前文档就是载入文档、指纹必等于 lastSaved,flush 可以直接返回,不必为了
+  // "没变"这个结论把整篇序列化一遍(离开页面时的 flush 就是这条路)。
+  let editedSinceLoad = false;
   // flushRefined 在 T0 发出的那份载荷及其指纹。markSaved 到达时据此判断 invoke 往返
   // 期间有没有新编辑(指纹分歧),并用它——而不是当前文档——推导保存后的段序/基线。
   // 发送未落定即作废:markSaveFailed / setRefined 都会清空。
@@ -231,6 +239,9 @@
       null,
       paras.length ? paras : [schema.nodes.paragraph.createAndFill()!],
     );
+    baselineSrc = { doc, node: docNode };
+    editedSinceLoad = false;
+    lastSaved = "";
     suppressNextUpdate = true;
     view.dispatch(
       view.state.tr
@@ -238,13 +249,38 @@
         .setMeta("addToHistory", false)
         .setMeta("external-load", true),
     );
-    paras.forEach((p) => {
-      if (p.attrs.origIndex !== null) {
-        const md = serializeBlock(ctx, p, true);
-        if (md !== null) baseline.set(p.attrs.origIndex as number, md);
+  }
+
+  /** 把 setRefined 记下的载入文档物化成 baseline/lastSaved(见 baselineSrc 注释)。
+      口径与原先载入当场计算逐字一致:baseline 只收 refined_paragraph 且 origIndex
+      非空的块(fallbackToText=true);lastSaved 按 collectBlocks 的规则走整篇载入文档。
+      幂等:已物化/被 markSaved 等重建过则无事可做。 */
+  function materializeBaseline() {
+    const src = baselineSrc;
+    if (!src || !ctxRef) return;
+    baselineSrc = null;
+    const ctx = ctxRef;
+    const next = new Map<number, string>();
+    const blocks: EditedBlock[] = [];
+    let failed = false;
+    src.node.forEach((node) => {
+      if (node.type.name === "refined_paragraph" && node.attrs.origIndex !== null) {
+        const md = serializeBlock(ctx, node, true);
+        if (md !== null) next.set(node.attrs.origIndex as number, md);
       }
+      if (failed) return;
+      const md = blockMarkdown(ctx, node, false);
+      if (md === null) {
+        failed = true;
+        return;
+      }
+      blocks.push({
+        origIndex: node.type.name === "refined_paragraph" ? (node.attrs.origIndex as number | null) : null,
+        markdown: md,
+      });
     });
-    lastSaved = JSON.stringify(refinedSavePayload(doc, collectBlocks() ?? [], baseline).paragraphs);
+    baseline = next;
+    lastSaved = JSON.stringify(refinedSavePayload(src.doc, failed ? [] : blocks, baseline).paragraphs);
   }
 
   /** 顶层块 → EditedBlock[],用于保存载荷。空块(blockMarkdown 判定)markdown
@@ -277,6 +313,8 @@
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = null;
     if (!loadedDoc || !onSaveRefined) return;
+    if (baselineSrc && !editedSinceLoad) return;
+    materializeBaseline();
     if (saveInFlight) {
       // 普通自动保存仍等待上一趟落定。页面切换/销毁不能依赖稍后会被清掉的
       // timer:此时把离开前的完整快照交给宿主,由宿主按新 revision 串行排空。
@@ -392,6 +430,7 @@
     sentParagraphs = null;
     sentFingerprint = "";
     if (!ctxRef || !loadedDoc) return;
+    materializeBaseline();
     const ctx = ctxRef;
     const view = ctx.get(editorViewCtx);
     // in-flight 编辑检测:loadedDoc/baseline 在往返期间不变,两次指纹计算输入同源,
@@ -652,7 +691,10 @@
               suppressNextUpdate = false;
               return;
             }
-            if (mode === "refined" && !view.state.doc.eq(prev.doc)) scheduleIdleSave();
+            if (mode === "refined" && !view.state.doc.eq(prev.doc)) {
+              editedSinceLoad = true;
+              scheduleIdleSave();
+            }
             if (mode === "segments") {
               const seq = currentSeq();
               if (focusedSeqNo !== null && seq !== focusedSeqNo) commitSegment(focusedSeqNo);

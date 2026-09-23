@@ -3273,7 +3273,11 @@ fn list_notes(app: AppHandle, state: State<AppState>) -> Result<Vec<store::NoteS
 }
 
 #[tauri::command]
-fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
+async fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
+    off_main(move || get_note_blocking(app, id)).await
+}
+
+fn get_note_blocking(app: AppHandle, id: String) -> Result<store::Note, String> {
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     store::NoteStore::new(dir).load(&id).map_err(|e| e.to_string())
 }
@@ -3490,7 +3494,11 @@ async fn note_refining(app: AppHandle, id: String) -> Result<bool, String> {
 /// 关联了库人物的段落做只读 join：展示名跟随声纹库现名（会议搭子里改名 → 历史修订稿
 /// 跟着变），person_id 归一到 merge 后的 winner。只影响返回值，不落盘。
 #[tauri::command]
-fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, String> {
+async fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, String> {
+    off_main(move || get_refined_blocking(app, id)).await
+}
+
+fn get_refined_blocking(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let root = notes_dir(&app).map_err(|e| e.to_string())?;
     let dir = root.join(&id);
@@ -3842,7 +3850,11 @@ fn retranscribe_status(state: State<AppState>) -> Option<RetranscribeStatus> {
 
 /// 成品轨入口可用性:None = 可用;Some(原因) = 置灰并提示。
 #[tauri::command]
-fn mixed_input_status(app: AppHandle, id: String) -> Result<Option<String>, String> {
+async fn mixed_input_status(app: AppHandle, id: String) -> Result<Option<String>, String> {
+    off_main(move || mixed_input_status_blocking(app, id)).await
+}
+
+fn mixed_input_status_blocking(app: AppHandle, id: String) -> Result<Option<String>, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
     Ok(retranscribe::input::mixed_untrusted(&store::audio::load_audio_meta(&dir)))
@@ -3968,6 +3980,18 @@ pub(crate) fn do_import_audio(app: &AppHandle, path: &str) -> Result<String, Str
 /// 导入本地音频文件建笔记。解码要跑几秒(afconvert 子进程 + 数百 MB 落盘),丢阻塞
 /// 线程池,不占住 Tauri 的 IPC 执行路径——同步命令在 Windows 上会表现为 WebView
 /// 整个停止重绘(同 stop_recording 的理由)。
+/// 点开笔记那一串读命令的公共外壳(2026-09-22 实测卡顿):同步 `#[tauri::command] fn`
+/// 在 macOS 上跑在主线程,主线程占着 WebView 就不响应——长笔记一次点开要连跑十来个
+/// 这样的读(向量打分、人物清单、图谱查询),几十毫秒叠在界面冻结上。挪到阻塞线程池,
+/// 读本身一行不改。
+async fn off_main<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| tr!("后台任务异常: {e}", "Background task failed: {e}", e = e))?
+}
+
 #[tauri::command]
 async fn import_audio(app: AppHandle, path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || do_import_audio(&app, &path))
@@ -4140,7 +4164,11 @@ fn assemble_mixed_playback(
 }
 
 #[tauri::command]
-fn mixed_playback_info(app: AppHandle, id: String) -> Result<MixedPlaybackInfo, String> {
+async fn mixed_playback_info(app: AppHandle, id: String) -> Result<MixedPlaybackInfo, String> {
+    off_main(move || mixed_playback_info_blocking(app, id)).await
+}
+
+fn mixed_playback_info_blocking(app: AppHandle, id: String) -> Result<MixedPlaybackInfo, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let note_dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
     if !note_dir.is_dir() {
@@ -6221,7 +6249,11 @@ fn latest_undoable_split(
 
 /// 场景判定结果(2026-08-23 一期):笔记页信息级提示用。纯读。
 #[tauri::command]
-fn get_scene(app: AppHandle, note_id: String) -> Result<Option<scene::SceneDoc>, String> {
+async fn get_scene(app: AppHandle, note_id: String) -> Result<Option<scene::SceneDoc>, String> {
+    off_main(move || get_scene_blocking(app, note_id)).await
+}
+
+fn get_scene_blocking(app: AppHandle, note_id: String) -> Result<Option<scene::SceneDoc>, String> {
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
     Ok(scene::load(&dir))
@@ -6582,7 +6614,11 @@ fn person_notes(app: AppHandle, person_id: String) -> Result<Vec<store::NoteSumm
 /// 相关笔记:与该笔记共享 Aing 实体的其他笔记(经知识图谱),按共享实体数降序。
 /// 纯增值:图谱缺失/查询失败 → 返回空列表(前端据此隐藏该区块),绝不 Err 拖垮详情页。
 #[tauri::command]
-fn note_related(app: AppHandle, id: String) -> Result<Vec<ipc::RelatedNote>, String> {
+async fn note_related(app: AppHandle, id: String) -> Result<Vec<ipc::RelatedNote>, String> {
+    off_main(move || note_related_blocking(app, id)).await
+}
+
+fn note_related_blocking(app: AppHandle, id: String) -> Result<Vec<ipc::RelatedNote>, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let Ok(root) = data_root(&app) else { return Ok(vec![]) };
     let pairs = match graph::related_notes(&root, &id) {
@@ -7014,7 +7050,11 @@ fn entity_detail(app: AppHandle, id: String) -> Result<Option<ipc::EntityDetail>
 
 /// 笔记页高亮点击导航:该笔记局部实体 → 全局 id(+是否人)。失败/无实体 → 空。
 #[tauri::command]
-fn note_entity_links(app: AppHandle, id: String) -> Result<Vec<ipc::EntityLink>, String> {
+async fn note_entity_links(app: AppHandle, id: String) -> Result<Vec<ipc::EntityLink>, String> {
+    off_main(move || note_entity_links_blocking(app, id)).await
+}
+
+fn note_entity_links_blocking(app: AppHandle, id: String) -> Result<Vec<ipc::EntityLink>, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let Ok(root) = data_root(&app) else { return Ok(vec![]) };
     match graph::resolve_local_ids(&root, &id) {
@@ -8261,7 +8301,11 @@ fn save_refined(
 /// stop 排干窗口 / 开录入槽窗口里 session 槽都是空的,check-then-act 挡不住与
 /// 写盘线程并发互踩,读路径必须无副作用。
 #[tauri::command]
-fn note_audio_info(app: AppHandle, id: String) -> Result<Vec<store::audio::TrackInfo>, String> {
+async fn note_audio_info(app: AppHandle, id: String) -> Result<Vec<store::audio::TrackInfo>, String> {
+    off_main(move || note_audio_info_blocking(app, id)).await
+}
+
+fn note_audio_info_blocking(app: AppHandle, id: String) -> Result<Vec<store::audio::TrackInfo>, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     let note_dir = dir.join(&id);
@@ -8751,11 +8795,38 @@ fn export_note(
 /// 纯读嵌入缓存(embeddings.json),不跑模型不读音频;无缓存或某人无覆盖段则
 /// 该人缺席,前端回落时长序。太短的段(听不出人)排到达标段之后而非剔除。
 #[tauri::command]
-fn note_clip_ranks(app: AppHandle, id: String) -> Result<std::collections::HashMap<String, Vec<u64>>, String> {
+async fn note_clip_ranks(app: AppHandle, id: String) -> Result<std::collections::HashMap<String, Vec<u64>>, String> {
+    off_main(move || note_clip_ranks_blocking(app, id)).await
+}
+
+fn note_clip_ranks_blocking(app: AppHandle, id: String) -> Result<std::collections::HashMap<String, Vec<u64>>, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     let note_dir = dir.join(&id);
     let note = store::NoteStore::new(dir).load(&id).map_err(|e| e.to_string())?;
+    // 结果缓存:输入只有 embeddings.json 与各段(seq,起止,来源,说话人)。前者按文件签名、
+    // 后者按内容指纹比对,都没变就还上次的排名——长会议每次点开都重解析几 MB 向量、
+    // 重算几万次余弦,是后端这串读里最重的一个(3131 段实测约 31ms)。
+    type Ranks = std::collections::HashMap<String, Vec<u64>>;
+    type Sig = (Option<(std::time::SystemTime, u64)>, u64);
+    static RANK_CACHE: Mutex<Option<std::collections::HashMap<PathBuf, (Sig, Ranks)>>> = Mutex::new(None);
+    let emb_sig = std::fs::metadata(note_dir.join(store::embed_cache::EMBED_CACHE_FILE))
+        .ok()
+        .and_then(|m| Some((m.modified().ok()?, m.len())));
+    let seg_fp = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for s in &note.segments {
+            (s.seq, s.start_ms, s.end_ms, s.source.as_str(), s.speaker.as_deref()).hash(&mut h);
+        }
+        h.finish()
+    };
+    let sig: Sig = (emb_sig, seg_fp);
+    if let Some((cached, ranks)) = RANK_CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&note_dir)) {
+        if *cached == sig && sig.0.is_some() {
+            return Ok(ranks.clone());
+        }
+    }
     let Some(cache) = store::embed_cache::load(&note_dir) else {
         return Ok(Default::default());
     };
@@ -8774,7 +8845,16 @@ fn note_clip_ranks(app: AppHandle, id: String) -> Result<std::collections::HashM
                 .push((s.seq, (*v).clone(), s.end_ms.saturating_sub(s.start_ms)));
         }
     }
-    Ok(rank_clips_by_margin(&per))
+    let ranks = rank_clips_by_margin(&per);
+    {
+        let mut g = RANK_CACHE.lock().unwrap();
+        let m = g.get_or_insert_with(Default::default);
+        if m.len() >= 16 && !m.contains_key(&note_dir) {
+            m.clear();
+        }
+        m.insert(note_dir, (sig, ranks.clone()));
+    }
+    Ok(ranks)
 }
 
 /// note_clip_ranks 的纯打分本体(可测)。见命令注释:分数 = cos(本簇质心) −
@@ -8786,15 +8866,15 @@ pub(crate) fn rank_clips_by_margin(
     fn norm(v: &[f32]) -> f32 {
         v.iter().map(|x| x * x).sum::<f32>().sqrt()
     }
-    fn cos(a: &[f32], b: &[f32]) -> f64 {
-        let (na, nb) = (norm(a), norm(b));
+    // 模长预先算好传进来(质心与段向量各算一次),不在每对余弦里重算。
+    fn cos(a: &[f32], na: f32, b: &[f32], nb: f32) -> f64 {
         if na <= 0.0 || nb <= 0.0 {
             return -1.0;
         }
         f64::from(a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() / (na * nb))
     }
     // 各簇未归一化均值质心(段数 ≥2 才有质心可言)
-    let centroids: std::collections::HashMap<&str, Vec<f32>> = per
+    let centroids: std::collections::HashMap<&str, (Vec<f32>, f32)> = per
         .iter()
         .filter(|(_, items)| items.len() >= 2)
         .map(|(sid, items)| {
@@ -8805,19 +8885,21 @@ pub(crate) fn rank_clips_by_margin(
                     *m += x;
                 }
             }
-            (sid.as_str(), mean)
+            let n = norm(&mean);
+            (sid.as_str(), (mean, n))
         })
         .collect();
     let mut out = std::collections::HashMap::new();
     for (sid, items) in per {
-        let Some(own) = centroids.get(sid.as_str()) else { continue };
-        let others: Vec<&Vec<f32>> =
+        let Some((own, own_n)) = centroids.get(sid.as_str()) else { continue };
+        let others: Vec<&(Vec<f32>, f32)> =
             centroids.iter().filter(|(k, _)| **k != sid.as_str()).map(|(_, c)| c).collect();
         let mut scored: Vec<(f64, u64, u64)> = items
             .iter()
             .map(|(seq, v, dur)| {
-                let own_sim = cos(own, v);
-                let rival = others.iter().map(|c| cos(c, v)).fold(f64::NEG_INFINITY, f64::max);
+                let vn = norm(v);
+                let own_sim = cos(own, *own_n, v, vn);
+                let rival = others.iter().map(|(c, cn)| cos(c, *cn, v, vn)).fold(f64::NEG_INFINITY, f64::max);
                 let score = if rival.is_finite() { own_sim - rival } else { own_sim };
                 (score, *dur, *seq)
             })
@@ -9081,7 +9163,11 @@ fn attendees_prior(meta: &store::NoteMeta) -> Option<store::CalendarSnapshot> {
 
 /// 读笔记的音频剪辑表(edits.json;无文件即空表)。
 #[tauri::command]
-fn note_edits(app: AppHandle, id: String) -> Result<store::edits::EditList, String> {
+async fn note_edits(app: AppHandle, id: String) -> Result<store::edits::EditList, String> {
+    off_main(move || note_edits_blocking(app, id)).await
+}
+
+fn note_edits_blocking(app: AppHandle, id: String) -> Result<store::edits::EditList, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     Ok(store::edits::load_edits(&dir.join(&id)))
@@ -9171,24 +9257,31 @@ fn open_voiceprint_store(app: &AppHandle) -> Result<store::VoiceprintStore, Stri
 /// 那场(停止到样本落盘之间还有转码/入库,几分钟内正常);更远的不猜,给 None。
 fn sample_note_ref(
     store: &store::VoiceprintStore,
+    trace: &store::sample_trace::SampleTrace,
     notes: &[store::NoteSummary],
     path: &std::path::Path,
     mtime: Option<chrono::DateTime<chrono::Local>>,
 ) -> Option<ipc::SampleNoteRef> {
-    sample_note_ref_within(store, notes, path, mtime, 10 * 60)
+    sample_note_ref_within(store, Some(trace), notes, path, mtime, 10 * 60)
 }
 
 /// 同上,推断窗口可调:展示用 10 分钟(宁可多标"按时间推测"),**同步动笔记用 2 分钟**
 /// (Codex P2:相邻两场或落盘延迟时猜错场会改错簇;实测样本与会议结束时间差全为 0 秒,
 /// 同步用 30 秒窗口,相邻两场结束时间差不可能小于一场的最短时长)。
+/// `trace`:调用方一次读好的样本溯源表(批量场景,如人物清单逐样本查);None 则现读。
 fn sample_note_ref_within(
     store: &store::VoiceprintStore,
+    trace: Option<&store::sample_trace::SampleTrace>,
     notes: &[store::NoteSummary],
     path: &std::path::Path,
     mtime: Option<chrono::DateTime<chrono::Local>>,
     max_gap_secs: i64,
 ) -> Option<ipc::SampleNoteRef> {
-    if let Some((note_id, cluster_id)) = store.sample_origin(path) {
+    let origin = match trace {
+        Some(t) => store.sample_origin_in(t, path),
+        None => store.sample_origin(path),
+    };
+    if let Some((note_id, cluster_id)) = origin {
         let title = notes.iter().find(|n| n.id == note_id).map(|n| n.title.clone()).unwrap_or_default();
         return Some(ipc::SampleNoteRef { note_id, title, cluster_id: Some(cluster_id), inferred: false });
     }
@@ -9269,7 +9362,7 @@ fn rebuild_person_blocking(app: &AppHandle, id: &str) -> Result<(), String> {
 fn sample_origin_ref(app: &AppHandle, store: &store::VoiceprintStore, path: &std::path::Path) -> Option<ipc::SampleNoteRef> {
     let notes = notes_dir(app).map(|d| store::NoteStore::new(d).list()).unwrap_or_default();
     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok().map(chrono::DateTime::<chrono::Local>::from);
-    sample_note_ref_within(store, &notes, path, mtime, 30)
+    sample_note_ref_within(store, None, &notes, path, mtime, 30)
 }
 
 /// 样本↔会议同步(2026-08-29 用户:"更新样本,对应出现的会议也要更新"):样本改归属/
@@ -9445,11 +9538,17 @@ async fn move_person_sample(
 }
 
 #[tauri::command]
-fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
+async fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
+    off_main(move || list_people_blocking(app)).await
+}
+
+fn list_people_blocking(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
     let store = open_voiceprint_store(&app)?;
     let vp = store.load();
     // 样本↔会议关联要查笔记清单(标题、时间);一次读出全库共用。
     let notes = notes_dir(&app).map(|d| store::NoteStore::new(d).list()).unwrap_or_default();
+    // 溯源表同样一次读出:逐样本现读是 225 份样本 × 整表解析。
+    let trace = store::sample_trace::load(store.root());
     let mut people: Vec<ipc::PersonSummary> = vp
         .people
         .iter()
@@ -9469,7 +9568,7 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
             let sample_notes = sample_paths
                 .iter()
                 .zip(&sample_mtimes)
-                .map(|(sp, mt)| sample_note_ref(&store, &notes, sp, *mt))
+                .map(|(sp, mt)| sample_note_ref(&store, &trace, &notes, sp, *mt))
                 .collect();
             ipc::PersonSummary {
                 id: id.clone(),

@@ -202,6 +202,11 @@ pub struct VoiceprintStore {
 }
 
 impl VoiceprintStore {
+    /// 数据根目录(样本溯源表等同级文件所在处)。
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
@@ -1254,12 +1259,21 @@ impl VoiceprintStore {
     /// 样本文件 → 溯源 receipt(note_id, cluster_id)。无溯源(2026-08-20 之前写下的
     /// 老样本)返回 None,由调用方按时间推断。只读不加锁。
     pub fn sample_origin(&self, path: &std::path::Path) -> Option<(String, String)> {
+        self.sample_origin_in(&super::sample_trace::load(&self.root), path)
+    }
+
+    /// 同 sample_origin,溯源表由调用方传入(批量查时只读一次)。
+    pub fn sample_origin_in(
+        &self,
+        trace: &super::sample_trace::SampleTrace,
+        path: &std::path::Path,
+    ) -> Option<(String, String)> {
         let rel = path.strip_prefix(&self.root).ok()?.to_string_lossy().replace('\\', "/");
-        super::sample_trace::load(&self.root)
+        trace
             .receipts
-            .into_iter()
+            .iter()
             .find(|r| r.path == rel)
-            .map(|r| (r.note_id, r.cluster_id))
+            .map(|r| (r.note_id.clone(), r.cluster_id.clone()))
     }
 
     /// 库内「无录音样本」的人数——切换嵌入模型前供前端预告:这些人 rebuild_for_model
