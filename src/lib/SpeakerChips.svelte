@@ -406,124 +406,125 @@
                 <button class="row quiet" onclick={cancelEdit}>{t("speakers.cancel")}</button>
               </div>
             {:else}
-              {#if !editingDirty}
-                {#if previewClips && onPreviewClip}
-                  {@const clips = previewClips(id)}
-                  {#if clips.length === 0}
-                    <div class="row row-off">
-                      <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d="M5 3.5v9l7.5-4.5z" />
-                      </svg>
-                      {t("speakers.chipPreview")}
-                      <span class="row-sub">{t("speakers.chipPreviewEmpty")}</span>
-                    </div>
-                  {:else}
-                    <!-- 片段列表:最长的几段各成一行,时间点 + 时长,正在播的高亮。听清哪段
-                         就据此改名/选人,那段会成为这个人的声纹样本(与后端 audited_seq 一致)。 -->
-                    <div class="clips">
-                      <div class="clips-title">{t("speakers.chipClipsTitle", { n: clips.length })}</div>
-                      {#each clips as c, i (c.seq)}
-                        {@const playing = previewingId === id && previewingSeq === c.seq}
-                        {@const picked = sampleSel.includes(c.seq)}
-                        <div class="clip-line" class:playing class:picked={sampleSel.includes(c.seq)}>
-                        <!-- 播放态只靠均衡器动画 + accent 高亮传达,不再塞行内状态文字——
-                             浮层定宽,长文字会把「作为样本」挤压重叠(2026-09-05 用户截图);
-                             「再点停止」的说明进 title。 -->
-                        <button
-                          class="row clip"
-                          class:playing
-                          title={playing ? t("speakers.chipClipPlaying") : t("speakers.chipClipPlayTitle")}
-                          onclick={() => { lastPlayed[id] = c.seq; onPreviewClip(id, c.seq); }}
-                        >
-                          {#if playing}
-                            <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
-                          {:else}
-                            <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                              <path d="M5 3.5v9l7.5-4.5z" />
-                            </svg>
-                          {/if}
-                          <span class="clip-idx">{i + 1}</span>
-                          <span class="clip-at">{clockOf(c.start_ms)}</span>
-                          <span class="row-sub">{t("speakers.chipClipDur", { s: Math.round((c.end_ms - c.start_ms) / 1000) })}</span>
-                        </button>
-                        <!-- 两个动作都用带文字的小胶囊,不再靠图标猜(2026-09-05 用户实报:
-                             外链样图标被当成"跳转",裸勾选框不像操作)。
-                             「＋样本/✓样本」切换态,「拆出」明说动作。 -->
+              <!-- 试听区打字时也保留(2026-09-22 实报):改名会带上这里勾的样本,先敲名字再边听边勾
+                   是自然顺序;此前一输入就收起,只能先勾后打。面板内 mousedown 已 preventDefault,
+                   点播放/勾样本不会让输入框失焦提前提交。 -->
+              {#if previewClips && onPreviewClip}
+                {@const clips = previewClips(id)}
+                {#if clips.length === 0}
+                  <div class="row row-off">
+                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M5 3.5v9l7.5-4.5z" />
+                    </svg>
+                    {t("speakers.chipPreview")}
+                    <span class="row-sub">{t("speakers.chipPreviewEmpty")}</span>
+                  </div>
+                {:else}
+                  <!-- 片段列表:最长的几段各成一行,时间点 + 时长,正在播的高亮。听清哪段
+                       就据此改名/选人,那段会成为这个人的声纹样本(与后端 audited_seq 一致)。 -->
+                  <div class="clips">
+                    <div class="clips-title">{t("speakers.chipClipsTitle", { n: clips.length })}</div>
+                    {#each clips as c, i (c.seq)}
+                      {@const playing = previewingId === id && previewingSeq === c.seq}
+                      {@const picked = sampleSel.includes(c.seq)}
+                      <div class="clip-line" class:playing class:picked={sampleSel.includes(c.seq)}>
+                      <!-- 播放态只靠均衡器动画 + accent 高亮传达,不再塞行内状态文字——
+                           浮层定宽,长文字会把「作为样本」挤压重叠(2026-09-05 用户截图);
+                           「再点停止」的说明进 title。 -->
+                      <button
+                        class="row clip"
+                        class:playing
+                        title={playing ? t("speakers.chipClipPlaying") : t("speakers.chipClipPlayTitle")}
+                        onclick={() => { lastPlayed[id] = c.seq; onPreviewClip(id, c.seq); }}
+                      >
+                        {#if playing}
+                          <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
+                        {:else}
+                          <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M5 3.5v9l7.5-4.5z" />
+                          </svg>
+                        {/if}
+                        <span class="clip-idx">{i + 1}</span>
+                        <span class="clip-at">{clockOf(c.start_ms)}</span>
+                        <span class="row-sub">{t("speakers.chipClipDur", { s: Math.round((c.end_ms - c.start_ms) / 1000) })}</span>
+                      </button>
+                      <!-- 两个动作都用带文字的小胶囊,不再靠图标猜(2026-09-05 用户实报:
+                           外链样图标被当成"跳转",裸勾选框不像操作)。
+                           「＋样本/✓样本」切换态,「拆出」明说动作。 -->
+                      <button
+                        class="clip-act"
+                        class:on={picked}
+                        title={t("speakers.chipClipPickTitle")}
+                        aria-pressed={picked}
+                        onclick={() => {
+                          sampleSel = picked ? sampleSel.filter((q) => q !== c.seq) : [...sampleSel, c.seq];
+                        }}
+                      >
+                        {#if picked}
+                          <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
+                        {:else}
+                          <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                        {/if}
+                        {t("speakers.chipClipPick")}
+                      </button>
+                      {#if onDetachClip}
                         <button
                           class="clip-act"
-                          class:on={picked}
-                          title={t("speakers.chipClipPickTitle")}
-                          aria-pressed={picked}
-                          onclick={() => {
-                            sampleSel = picked ? sampleSel.filter((q) => q !== c.seq) : [...sampleSel, c.seq];
+                          title={t("speakers.chipClipDetachTitle")}
+                          onclick={async () => {
+                            if (await run(() => onDetachClip(id, c.seq)))
+                              flashClipAction(t("speakers.clipDetached", { at: clockOf(c.start_ms) }));
                           }}
                         >
-                          {#if picked}
-                            <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
-                          {:else}
-                            <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-                          {/if}
-                          {t("speakers.chipClipPick")}
+                          {t("speakers.chipClipDetachShort")}
                         </button>
-                        {#if onDetachClip}
-                          <button
-                            class="clip-act"
-                            title={t("speakers.chipClipDetachTitle")}
-                            onclick={async () => {
-                              if (await run(() => onDetachClip(id, c.seq)))
-                                flashClipAction(t("speakers.clipDetached", { at: clockOf(c.start_ms) }));
-                            }}
-                          >
-                            {t("speakers.chipClipDetachShort")}
-                          </button>
-                        {/if}
-                        {#if onMarkMultiClip}
-                          <button
-                            class="clip-act"
-                            title={t("speakers.chipClipMultiTitle")}
-                            onclick={async () => {
-                              if (await run(() => onMarkMultiClip(id, c.seq)))
-                                flashClipAction(t("speakers.clipMarkedMulti", { at: clockOf(c.start_ms) }));
-                            }}
-                          >
-                            {t("speakers.chipClipMulti")}
-                          </button>
-                        {/if}
-                        </div>
-                      {/each}
-                      {#if clipActionMsg}
-                        <div class="clips-done">{clipActionMsg}</div>
                       {/if}
-                      {#if sampleSel.length > 0}
-                        {@const secs = Math.round(clips.filter((c) => sampleSel.includes(c.seq)).reduce((a, c) => a + (c.end_ms - c.start_ms), 0) / 1000)}
-                        <div class="clips-hint" class:warn={secs < 10}>
-                          {secs < 10 ? t("speakers.chipClipsSelShort", { n: sampleSel.length, s: secs }) : t("speakers.chipClipsSel", { n: sampleSel.length, s: secs })}
-                        </div>
-                      {:else}
-                        <div class="clips-hint">{t("speakers.chipClipsHint")}</div>
+                      {#if onMarkMultiClip}
+                        <button
+                          class="clip-act"
+                          title={t("speakers.chipClipMultiTitle")}
+                          onclick={async () => {
+                            if (await run(() => onMarkMultiClip(id, c.seq)))
+                              flashClipAction(t("speakers.clipMarkedMulti", { at: clockOf(c.start_ms) }));
+                          }}
+                        >
+                          {t("speakers.chipClipMulti")}
+                        </button>
                       {/if}
-                    </div>
-                  {/if}
-                {:else if onPreview}
-                  {#if counts && !counts[id]}
-                    <!-- 名下已无段落(如拆分后清空的原始说话人):试听无物可放,静默
-                         没反应会被当成坏了(2026-08-22 用户实测)——置灰并说明白。 -->
-                    <div class="row row-off">
-                      <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d="M5 3.5v9l7.5-4.5z" />
-                      </svg>
-                      {t("speakers.chipPreview")}
-                      <span class="row-sub">{t("speakers.chipPreviewEmpty")}</span>
-                    </div>
-                  {:else}
-                    <button class="row" onclick={() => onPreview(id)}>
-                      <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d="M5 3.5v9l7.5-4.5z" />
-                      </svg>
-                      {t("speakers.chipPreview")}
-                      {#if previewingId === id}<span class="row-sub">{t("speakers.chipPreviewPlaying")}</span>{/if}
-                    </button>
-                  {/if}
+                      </div>
+                    {/each}
+                    {#if clipActionMsg}
+                      <div class="clips-done">{clipActionMsg}</div>
+                    {/if}
+                    {#if sampleSel.length > 0}
+                      {@const secs = Math.round(clips.filter((c) => sampleSel.includes(c.seq)).reduce((a, c) => a + (c.end_ms - c.start_ms), 0) / 1000)}
+                      <div class="clips-hint" class:warn={secs < 10}>
+                        {secs < 10 ? t("speakers.chipClipsSelShort", { n: sampleSel.length, s: secs }) : t("speakers.chipClipsSel", { n: sampleSel.length, s: secs })}
+                      </div>
+                    {:else}
+                      <div class="clips-hint">{t("speakers.chipClipsHint")}</div>
+                    {/if}
+                  </div>
+                {/if}
+              {:else if onPreview}
+                {#if counts && !counts[id]}
+                  <!-- 名下已无段落(如拆分后清空的原始说话人):试听无物可放,静默
+                       没反应会被当成坏了(2026-08-22 用户实测)——置灰并说明白。 -->
+                  <div class="row row-off">
+                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M5 3.5v9l7.5-4.5z" />
+                    </svg>
+                    {t("speakers.chipPreview")}
+                    <span class="row-sub">{t("speakers.chipPreviewEmpty")}</span>
+                  </div>
+                {:else}
+                  <button class="row" onclick={() => onPreview(id)}>
+                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M5 3.5v9l7.5-4.5z" />
+                    </svg>
+                    {t("speakers.chipPreview")}
+                    {#if previewingId === id}<span class="row-sub">{t("speakers.chipPreviewPlaying")}</span>{/if}
+                  </button>
                 {/if}
               {/if}
               <!-- 动作行常驻(输入名字时也在):拆分排第一——分人错了是最常见、

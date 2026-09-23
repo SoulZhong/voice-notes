@@ -74,7 +74,7 @@
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
   import { playback } from "$lib/playback.svelte";
-  import { t } from "$lib/i18n/index.svelte";
+  import { i18n, t } from "$lib/i18n/index.svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
   import { schemeToDefaultPlayback, shouldFallbackToDual } from "$lib/audioScheme";
   import { getSettings, modelsStatus } from "$lib/models";
@@ -707,13 +707,39 @@
     }, 2600);
   }
 
-  function refinedBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
+  type Badge = { label: string; bg: string; ink: string };
+  /** 徽章按说话人记忆:长稿上千个段落 NodeView 各自现算一遍标签/配色,每次都穿过
+      响应式代理读说话人表,是点开长笔记卡顿的大头(1197 段实测约 58ms)。一场只有
+      十几二十个说话人,按 id 算一次即可。表或界面语言一换(身份比对)整张作废,
+      语义与逐段现算相同。 */
+  let refinedBadgeMemo: { src: object; locale: string; map: Map<string, Badge> } | null = null;
+  // 同一次同步重建(setRefined 一口气造完全部 NodeView)内只核对一次响应式表:
+  // 读 $derived 本身每次都要走一遍脏检查,上千次也是十几毫秒。重建循环中途表
+  // 不可能变,下一个微任务起恢复逐次核对。
+  let refinedBadgeChecked = false;
+  function refinedBadge(attrs: BadgeAttrs): Badge {
     const sid = attrs.speaker;
-    return {
-      label: speakerLabel(sid, "mic", refinedSpeakers),
-      bg: speakerColor(sid, "mic", refinedSpeakers),
-      ink: speakerInk(sid, "mic", refinedSpeakers),
-    };
+    if (!refinedBadgeChecked || !refinedBadgeMemo) {
+      const sp = refinedSpeakers;
+      const locale = i18n.locale;
+      if (refinedBadgeMemo?.src !== sp || refinedBadgeMemo.locale !== locale) {
+        refinedBadgeMemo = { src: sp, locale, map: new Map() };
+      }
+      refinedBadgeChecked = true;
+      queueMicrotask(() => (refinedBadgeChecked = false));
+    }
+    const sp = refinedBadgeMemo.src as typeof refinedSpeakers;
+    const key = sid ?? "";
+    let b = refinedBadgeMemo.map.get(key);
+    if (!b) {
+      b = {
+        label: speakerLabel(sid, "mic", sp),
+        bg: speakerColor(sid, "mic", sp),
+        ink: speakerInk(sid, "mic", sp),
+      };
+      refinedBadgeMemo.map.set(key, b);
+    }
+    return b;
   }
 
   async function doSaveRefined(payload: { revision: number; paragraphs: ParagraphPayload[] }) {
@@ -2251,11 +2277,22 @@
     resumeFollow(); // 点时间戳跳播 = 想跟着听
   }
 
+  /** seq → 段 的查找表:segBadge 每个段落 NodeView 调一次,逐个 find 是 O(n²)
+      (3131 段即数百万次代理读)。按 note.segments 身份缓存,段表一换即重建。 */
+  let noteSegMemo: { src: object; len: number; map: Map<number, Note["segments"][number]> } | null = null;
+  function noteSegBySeq(seq: number): Note["segments"][number] | undefined {
+    const segs = note?.segments;
+    if (!segs) return undefined;
+    if (noteSegMemo?.src !== segs || noteSegMemo.len !== segs.length) {
+      noteSegMemo = { src: segs, len: segs.length, map: new Map(segs.map((s) => [s.seq, s])) };
+    }
+    return noteSegMemo.map.get(seq);
+  }
   /** segments 模式徽章:按 seq 回查 note.segments 拿权威 speaker/source(与 note.speakers
       命名/关联人物一致)——NodeView 透传的 attrs 只是点击当下的渲染快照,不作数
       (MarkdownEditor 顶部注释同款告诫)。 */
   function segBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
-    const seg = note?.segments.find((s) => s.seq === attrs.seq);
+    const seg = attrs.seq === undefined || attrs.seq === null ? undefined : noteSegBySeq(attrs.seq);
     const speaker = seg?.speaker ?? null;
     const source = seg?.source ?? "mic";
     // 多人混杂段(用户手标,2026-09-06):优先于一切兜底——它不是"没认出来",
@@ -3893,6 +3930,15 @@
     margin: 0 0 6px;
     line-height: 1.7;
   }
+  /* 屏外段落跳过排版/绘制:长稿(上千段)点开时一次性排完整篇是卡顿的另一半。
+     contain-intrinsic-size 的 auto 让浏览器记住渲染过的真实高度,来回滚动不跳;
+     首次按两行估高(滚动条长度粗估,滚到即校正)。只作用于屏外,不影响可见区的
+     编辑、选区与高亮。 */
+  .transcript :global(.md-para),
+  .transcript :global(.md-seg) {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 3.4em;
+  }
   .transcript :global(.md-para .para-text) {
     white-space: pre-wrap;
   }
@@ -4545,7 +4591,11 @@
     background: transparent;
     color: var(--ink);
     font-size: 0.78rem;
-    min-width: 9em;
+    /* 占满本行余宽:浏览器默认 size=20 太短,连打几个名字就看不全(2026-09-22 实报)。
+       余宽不足 14em 时整体折到下一行,仍然有一整行可写。 */
+    flex: 1 1 14em;
+    min-width: 14em;
+    max-width: 100%;
     padding: 0.1em 0.3em;
     border-radius: var(--radius-sm);
   }
