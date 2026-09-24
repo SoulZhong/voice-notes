@@ -13,6 +13,7 @@ pub mod migrate;
 pub mod mix_regen;
 pub mod notelock;
 mod notes;
+mod speaker_table;
 pub mod refined;
 pub mod transcode;
 mod voiceprints;
@@ -194,6 +195,23 @@ pub struct SpeakerMeta {
     /// 「像是 {name}?」;关联/改名即清除。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint_person: Option<String>,
+}
+
+impl SpeakerMeta {
+    /// 空表项:无名、未关联、无质心。新号分配、改名建项、占号都从这里起步。
+    pub fn blank() -> Self {
+        Self {
+            name: String::new(),
+            sources: Vec::new(),
+            centroid: None,
+            count: 0,
+            person_id: None,
+            multi_speaker: false,
+            reserved_by: None,
+            split_born: false,
+            hint_person: None,
+        }
+    }
 }
 
 /// 一场会议的完整内容（详情页 / 导出用）。
