@@ -37,6 +37,8 @@ pub(crate) struct LinkPlan {
     pub sample: Option<SamplePlan>,
     /// 整组回灌 / 并入无名先前人物(普通说话人)。`prior` = (先前人物 id, 库名)。
     pub group_feedback: Option<Option<(String, String)>>,
+    /// 普通说话人没存成样本的原因(执行层在关联落定后记日志;计划本身不产生副作用)。
+    pub sample_skipped: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +108,7 @@ pub(crate) fn plan_link(
             retire_prior,
             sample: (!picks.is_empty()).then_some(SamplePlan { picks, reinforce: true }),
             group_feedback: None,
+            sample_skipped: None,
         };
     }
     // 确认才入库时代的样本闭环(codex:停录不再自动写样本后,经确认的人物若一份样本都
@@ -117,10 +120,11 @@ pub(crate) fn plan_link(
     // "我听过的最有代表性的那几段,而不是全部"。合计不足 10s 则不入库。
     let selected: Vec<store::SegmentRecord> =
         selected_seqs.iter().filter_map(|q| pool.iter().find(|s| s.seq == *q).cloned()).collect();
+    let mut sample_skipped = None;
     let mut picks = if !selected.is_empty() {
         let total: u64 = selected.iter().map(|s| s.end_ms.saturating_sub(s.start_ms)).sum();
         if total < store::AUTO_ENROLL_MS {
-            eprintln!("确认样本跳过({resolved}):勾选段合计 {total}ms < 10s,不入库(未按最长补)");
+            sample_skipped = Some(format!("勾选段合计 {total}ms < 10s,不入库(未按最长补)"));
             Vec::new()
         } else {
             selected
@@ -145,13 +149,14 @@ pub(crate) fn plan_link(
             });
         }
     }
-    if picks.is_empty() {
-        eprintln!("确认样本跳过({resolved}):确认段总时长不足 10s");
+    if picks.is_empty() && sample_skipped.is_none() {
+        sample_skipped = Some("确认段总时长不足 10s".to_string());
     }
     LinkPlan {
         retire_prior,
         sample: (!picks.is_empty()).then_some(SamplePlan { picks, reinforce: false }),
         group_feedback: Some(prior),
+        sample_skipped,
     }
 }
 
@@ -186,6 +191,9 @@ pub(crate) fn link_speaker_with(
         speaker_id: speaker_id.to_string(),
         person_id: resolved.clone(),
     })?;
+    if let Some(why) = &plan.sample_skipped {
+        eprintln!("确认样本跳过({resolved}):{why}");
+    }
     if let Some(pid) = plan.retire_prior {
         spawn_retire_samples(env, pid, note_id.to_string(), speaker_id.to_string());
     }

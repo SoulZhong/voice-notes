@@ -241,6 +241,7 @@ fn plan_selected_segments_are_used_as_is_or_not_at_all() {
     );
     let p = plan_for(&env, &id, "P1", None, &[0, 2]);
     assert_eq!(p.sample, None, "勾选合计 7s 不足 10s:不入库、也不按最长补");
+    assert!(p.sample_skipped.is_some(), "跳过原因随计划返回,由执行层记日志");
     assert_eq!(p.group_feedback, Some(None), "整组回灌照做");
 }
 
