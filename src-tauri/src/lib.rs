@@ -33,6 +33,7 @@ pub mod mcp;
 mod redact;
 mod telemetry;
 mod lifecycle;
+mod occupancy;
 mod hooks_external;
 
 use std::path::PathBuf;
@@ -4481,7 +4482,6 @@ fn retry_relation_backfill_index(
 #[tauri::command]
 fn assign_note_speaker_person(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     speaker_id: String,
     person_id: String,
@@ -4489,7 +4489,7 @@ fn assign_note_speaker_person(
     // 用户在试听面板勾选的「作为样本」段(2026-08-30):非空则样本**只**由这些段构成。
     selected_seqs: Option<Vec<u64>>,
 ) -> Result<(), String> {
-    reject_if_active(&state, &note_id)?;
+    admit_note(&app, &note_id, occupancy::Intent::Edit)?;
     do_assign_note_speaker_person_with(
         &app,
         &note_id,
@@ -4501,7 +4501,7 @@ fn assign_note_speaker_person(
 }
 
 /// 关联的可复用本体:命令壳与 identify 建议确认(apply_identify_suggestion)共用。
-/// 调用方自备录制中守卫(reject_if_active);EditNote 经 lifecycle actor 串行,
+/// 调用方自备准入(admit_note);EditNote 经 lifecycle actor 串行,
 /// spawn_feedback 承担纠错回灌。一波说话人设计(2026-08-21)后这是唯一的关联写入口。
 fn do_assign_note_speaker_person(
     app: &AppHandle,
@@ -4820,11 +4820,10 @@ fn spawn_confirmed_sample(
 #[tauri::command]
 fn clear_note_speaker_person(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     speaker_id: String,
 ) -> Result<(), String> {
-    reject_if_active(&state, &note_id)?;
+    admit_note(&app, &note_id, occupancy::Intent::Edit)?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     let note = store::NoteStore::new(dir).load(&note_id).map_err(|e| e.to_string())?;
     // 撤销回灌要的两样东西必须在清空之前取:清完就查不到当初关联的是谁了。
@@ -6018,15 +6017,11 @@ struct AutoSplitOut {
 #[tauri::command]
 async fn auto_split_speaker(
     app: AppHandle,
-    state: State<'_, AppState>,
     note_id: String,
     speaker_id: String,
 ) -> Result<AutoSplitOut, String> {
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
-    reject_if_active(&state, &note_id)?;
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err(tr!("该笔记正在 Aing 中,稍后再试", "This note is being refined; try again later"));
-    }
+    admit_note(&app, &note_id, occupancy::Intent::EditOutsideAing)?;
     let root = data_root(&app).map_err(|e| e.to_string())?;
     // 断点续跑:同一说话人已有未完成 op(嵌入中途被重启杀掉是常态,实测一天两单)
     // 就接着跑,绝不另起炉灶——重复 mark 会叠出第二个 op,隔离悬置、账目成灾。
@@ -6150,7 +6145,7 @@ async fn auto_split_speaker(
 /// 删除 → 多人标记复位 → 原人物关联恢复 → 修订稿反向同步。段落被后续编辑动过
 /// 则拒绝(CAS 兜底)。幂等:已撤销过的 op 直接拒。
 #[tauri::command]
-fn undo_auto_split(app: AppHandle, state: State<AppState>, op_id: String) -> Result<(), String> {
+fn undo_auto_split(app: AppHandle, op_id: String) -> Result<(), String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
     let op_lock = split_op_lock(&op_id);
     let _op_guard = op_lock.lock().unwrap();
@@ -6161,10 +6156,7 @@ fn undo_auto_split(app: AppHandle, state: State<AppState>, op_id: String) -> Res
     if op.undone_at.is_some() {
         return Err(tr!("该拆分已撤销过", "This split was already undone"));
     }
-    reject_if_active(&state, &op.note_id)?;
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&op.note_id) {
-        return Err(tr!("该笔记正在 Aing 中,稍后再试", "This note is being refined; try again later"));
-    }
+    admit_note(&app, &op.note_id, occupancy::Intent::EditOutsideAing)?;
     let nroot = notes_dir(&app).map_err(|e| e.to_string())?;
     let nstore = store::NoteStore::new(nroot.clone());
     let dir = nroot.join(&op.note_id);
@@ -7256,12 +7248,11 @@ async fn list_calendar_candidates(
 #[tauri::command]
 async fn set_note_calendar_event(
     app: AppHandle,
-    state: State<'_, AppState>,
     id: String,
     event_id: Option<String>,
 ) -> Result<(), String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
-    reject_if_active(&state, &id)?;
+    admit_note(&app, &id, occupancy::Intent::EditMeta)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let root = notes_dir(&app).map_err(|e| e.to_string())?;
         let store_ = store::NoteStore::new(root);
@@ -7322,15 +7313,9 @@ async fn backfill_calendar_matches(app: AppHandle) -> Result<u32, String> {
 /// 内含于 identify_executor);持 FEEDBACK_GATE 全程——嵌入并发与 track_pcm
 /// 临时文件竞争都收敛于此门。
 #[tauri::command]
-async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+async fn identify_note(app: AppHandle, id: String) -> Result<(), String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&id) {
-        return Err(tr!(
-            "该笔记正在 Aing 中,稍后再试",
-            "This note is being refined; try again later"
-        ));
-    }
-    reject_if_active(&state, &id)?;
+    admit_note(&app, &id, occupancy::Intent::EditOutsideAing)?;
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let run = || -> anyhow::Result<()> {
@@ -8033,15 +8018,11 @@ fn spawn_ack_reinforce(
 #[tauri::command]
 async fn undo_identify_apply(
     app: AppHandle,
-    state: State<'_, AppState>,
     note_id: String,
     op_id: String,
 ) -> Result<bool, String> {
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err(tr!("该笔记正在 Aing 中,稍后再试", "This note is being refined; try again later"));
-    }
-    reject_if_active(&state, &note_id)?;
+    admit_note(&app, &note_id, occupancy::Intent::EditOutsideAing)?;
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
         let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
@@ -8190,7 +8171,7 @@ async fn apply_identify_suggestion(
             _ => return Err(tr!("建议数据异常", "Corrupt suggestion")),
         };
         // 录制中拒绝(speakers.json 由 writer 独占;与手动关联命令同守卫)。
-        if let Err(e) = reject_if_active(&app2.state::<AppState>(), &note_id)
+        if let Err(e) = admit_note(&app2, &note_id, occupancy::Intent::Edit)
             .and_then(|_| do_assign_note_speaker_person(&app2, &note_id, &speaker, &target))
         {
             if created {
@@ -8253,18 +8234,11 @@ fn reject_identify_suggestion(
 #[tauri::command]
 fn save_refined(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     revision: u64,
     paragraphs: Vec<store::ParagraphPayload>,
 ) -> Result<u64, String> {
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err(tr!(
-            "该笔记正在 Aing 中，稍后再存",
-            "This note is being refined by AI; save again later"
-        ));
-    }
-    reject_if_active(&state, &note_id)?;
+    admit_note(&app, &note_id, occupancy::Intent::SaveRefined)?;
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
     let root = notes_dir(&app).map_err(|e| e.to_string())?;
     store::save_refined_paragraphs(&root.join(&note_id), revision, &paragraphs)
@@ -8332,21 +8306,8 @@ fn note_audio_info_blocking(app: AppHandle, id: String) -> Result<Vec<store::aud
 }
 
 #[tauri::command]
-fn rename_note(app: AppHandle, state: State<AppState>, id: String, title: String) -> Result<(), String> {
-    if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
-        return Err(tr!("录制中的笔记不能改名", "A note being recorded cannot be renamed"));
-    }
-    // 重转写全程持本篇 NoteLock,改名会被锁层以通用的"被占用"拒绝,用户对不上号
-    // (2026-09-05 实报:反复改名"不生效",实为 FireRed 重转写在跑)。前置判定给出
-    // 能行动的原因。
-    if let Some((rid, _)) = state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-        if rid == id {
-            return Err(tr!(
-                "本篇正在重转写,期间不能改名;等重转写完成后再试",
-                "This note is being re-transcribed; renaming is unavailable until it finishes"
-            ));
-        }
-    }
+fn rename_note(app: AppHandle, id: String, title: String) -> Result<(), String> {
+    admit_note(&app, &id, occupancy::Intent::Rename)?;
     let title = title.trim();
     if title.is_empty() {
         return Err(tr!("标题不能为空", "Title cannot be empty"));
@@ -8358,10 +8319,8 @@ fn rename_note(app: AppHandle, state: State<AppState>, id: String, title: String
 }
 
 #[tauri::command]
-fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
-    if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
-        return Err(tr!("录制中的笔记不能删除", "A note being recorded cannot be deleted"));
-    }
+fn delete_note(app: AppHandle, id: String) -> Result<(), String> {
+    admit_note(&app, &id, occupancy::Intent::Delete)?;
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::Delete { id },
     })
@@ -8517,25 +8476,28 @@ fn rename_speaker(
 #[tauri::command]
 fn delete_note_speaker(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     speaker_id: String,
 ) -> Result<(), String> {
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err(tr!("该笔记正在 Aing 中，稍后再删", "This note is being refined by AI; try again later"));
-    }
-    reject_if_active(&state, &note_id)?;
+    admit_note(&app, &note_id, occupancy::Intent::EditOutsideAing)?;
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::DeleteSpeaker { id: note_id, speaker_id },
     })
 }
 
-/// 段落编辑共用 guard：活动会话笔记一律拒绝（与 rename_note 同模式）。
-fn reject_if_active(state: &State<AppState>, note_id: &str) -> Result<(), String> {
-    if state.session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false) {
-        return Err(tr!("录制中的笔记不能编辑", "A note being recorded cannot be edited"));
-    }
-    Ok(())
+/// 命令入口准入(规则表见 occupancy.rs):按意图取所需的占用快照,拒绝时点名是谁挡的。
+///
+/// 每把锁只在自己那条语句里取值即放:Aing 查询要走 actor 往返,而 actor 的执行体可能
+/// 要取 session 锁,持锁等 reply 会成环(见 actor.rs 死锁注记③)——所以 Aing 放最后、
+/// 且只在该意图会被 Aing 挡时才问。判定与执行之间的竞态仍由存储层的锁兜底报错。
+fn admit_note(app: &AppHandle, note_id: &str, intent: occupancy::Intent) -> Result<(), String> {
+    let st = app.state::<AppState>();
+    let recording = st.session.lock().unwrap().as_ref().is_some_and(|s| s.note_id == note_id);
+    let retranscribing = retranscribing_blocks_refine(&st.retranscribing, note_id);
+    let mixed_regen = mixed_regen_blocks_refine(&st.mixed_regen, note_id);
+    let refining = intent.needs_refining() && app.state::<lifecycle::LifecycleHandle>().is_refining(note_id);
+    let o = occupancy::Occupancy { recording, refining, retranscribing, mixed_regen };
+    occupancy::admit(o, intent).map_err(|b| occupancy::refusal(b, intent))
 }
 
 /// 活动会话判定：与 rename_speaker 同款 statement-scoped 取值——request() 阻塞等
@@ -8556,6 +8518,7 @@ fn edit_segment(
     expected_text: String,
     new_text: String,
 ) -> Result<(), String> {
+    admit_note(&app, &note_id, occupancy::Intent::LiveEdit)?;
     if is_active_note(&state, &note_id) {
         return app.state::<lifecycle::LifecycleHandle>().request(
             lifecycle::machine::Msg::EditActiveSegment { note_id, seq, expected_text, new_text },
@@ -8569,12 +8532,11 @@ fn edit_segment(
 #[tauri::command]
 fn delete_segment(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     seq: u64,
     expected_text: String,
 ) -> Result<(), String> {
-    reject_if_active(&state, &note_id)?;
+    admit_note(&app, &note_id, occupancy::Intent::Edit)?;
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::DeleteSegment { id: note_id, seq, expected_text },
     })
@@ -8587,11 +8549,10 @@ fn delete_segment(
 #[tauri::command]
 fn delete_segments(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     moves: Vec<(u64, String)>,
 ) -> Result<(), String> {
-    reject_if_active(&state, &note_id)?;
+    admit_note(&app, &note_id, occupancy::Intent::Edit)?;
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::DeleteSegments { id: note_id, moves },
     })
@@ -8601,8 +8562,8 @@ fn delete_segments(
 /// 与停录自动折叠同一实现(scene 终判 dual_path 才动作,幂等);Aing 中拒绝
 /// (折叠改变可见集合,管线整写会拿到折叠前后不一致的输入)。
 #[tauri::command]
-fn fold_scene_echo(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
-    reject_if_active(&state, &note_id)?;
+fn fold_scene_echo(app: AppHandle, note_id: String) -> Result<(), String> {
+    admit_note(&app, &note_id, occupancy::Intent::Edit)?;
     // Aing 判定在 actor 串行流里做(EditOp::FoldSceneEcho,codex:命令线程
     // check-then-act 与 refine 准入有竞态窗口;同信箱 FIFO 才是真值)。
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
@@ -8616,11 +8577,10 @@ fn fold_scene_echo(app: AppHandle, state: State<AppState>, note_id: String) -> R
 #[tauri::command]
 fn restore_suppressed_segments(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     seqs: Vec<u64>,
 ) -> Result<(), String> {
-    reject_if_active(&state, &note_id)?;
+    admit_note(&app, &note_id, occupancy::Intent::Edit)?;
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::RestoreSuppressed { id: note_id, seqs },
     })
@@ -8629,12 +8589,11 @@ fn restore_suppressed_segments(
 #[tauri::command]
 fn set_segments_speaker(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     moves: Vec<(u64, String)>,
     speaker_id: String,
 ) -> Result<String, String> {
-    reject_if_active(&state, &note_id)?;
+    admit_note(&app, &note_id, occupancy::Intent::Edit)?;
     let first = moves.first().map(|(q, _)| *q);
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::SetSegmentsSpeaker {
@@ -8661,6 +8620,7 @@ fn set_segment_speaker(
     expected_text: String,
     speaker_id: String,
 ) -> Result<String, String> {
+    admit_note(&app, &note_id, occupancy::Intent::LiveEdit)?;
     if is_active_note(&state, &note_id) {
         // 录制中不开放新建说话人:"new" 分配的 id 会与 diar 注册表的 S-id 空间撞车
         // (writer 侧亦有同款拒绝,此处先拒是为给出面向用户的双语文案)。
@@ -10975,7 +10935,7 @@ fn audio_disk_usage(app: AppHandle) -> Result<u64, String> {
 /// 是否为「活动笔记」用 session 槽的 note_id 比对,而非 state 参数——此时 running 已由
 /// migrate_guard 确认为 false,正常不会有会话在槽里;这里仍查一次是纯防御(万一未来某处
 /// 状态机出现 running=false 但 session 槽未及时清空的窗口,也不至于删正在使用的笔记的音频)。
-/// 这与 `reject_if_active`(单笔记编辑命令按 note_id 拒绝活动笔记)同源:那边有具体 note_id
+/// 这与 `admit_note`(单笔记编辑命令按 note_id 判定占用)同源:那边有具体 note_id
 /// 可比对,这边是批量清理、无单一 note_id,故退化为「跳过 == session 槽笔记」的防御性比对。
 ///
 /// 清理本体,`purge_audio` 命令与启动期音频保留期自动清理(见 setup 内
