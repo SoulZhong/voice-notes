@@ -5983,6 +5983,8 @@ fn acknowledge_identify(app: AppHandle, note_id: String, op_id: String) -> Resul
 /// 回执「撤销」(identify_actions::undo_identify_apply_with)。
 #[tauri::command]
 async fn undo_identify_apply(app: AppHandle, note_id: String, op_id: String) -> Result<bool, String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    admit_note(&app, &note_id, occupancy::Intent::EditOutsideAing)?;
     let env = TauriEnv(app);
     tauri::async_runtime::spawn_blocking(move || identify_actions::undo_identify_apply_with(&env, note_id, op_id))
         .await

@@ -163,8 +163,12 @@ pub(crate) fn recover_identify_ops(env: &dyn LinkEnv, note_id: &str) {
         let doc = store::load_refined(&dir).ok_or_else(|| anyhow::anyhow!("精修稿缺失"))?;
         let mut idoc = refine::identify::load_identify(&dir)
             .ok_or_else(|| anyhow::anyhow!("identify.json 缺失"))?;
-        // 关联现状查说话人表(段落不带身份,见模块文档)。
-        let speakers = store::NoteStore::new(root.clone()).load(note_id)?.speakers;
+        // 关联现状查说话人表(段落不带身份,见模块文档)。只有前滚判定要用;读不到时
+        // 那几条 op 本轮先不动(下次再判),撤销中途的恢复不依赖它。
+        let speakers = store::NoteStore::new(root.clone()).load(note_id).map(|n| n.speakers);
+        if let Err(e) = &speakers {
+            eprintln!("identify({note_id}): 说话人表读取失败,本轮只恢复撤销中途的 op: {e}");
+        }
         let vp = store::VoiceprintStore::new(env.root()?).load();
         for op_id in pending {
             let Some(op) = ops.ops.iter_mut().find(|o| o.op_id == op_id) else { continue };
@@ -223,11 +227,12 @@ pub(crate) fn recover_identify_ops(env: &dyn LinkEnv, note_id: &str) {
                 }
                 _ => {}
             }
+            let Ok(speakers) = &speakers else { continue };
             let seqs: std::collections::BTreeSet<u64> = op.seqs.iter().copied().collect();
             let linked_to_target = refine::identify::cluster_members_from_doc(&doc)
                 .iter()
                 .find(|(_, sq)| **sq == seqs)
-                .is_some_and(|(sp, _)| cluster_linked_to(&speakers, &vp, sp, &op.target_person));
+                .is_some_and(|(sp, _)| cluster_linked_to(speakers, &vp, sp, &op.target_person));
             if op.stage == "pending" && !linked_to_target {
                 // assign 未发生:放弃,建议卡还在,无痕。
                 op.stage = "aborted".into();
@@ -283,9 +288,19 @@ pub(crate) fn recover_identify_ops(env: &dyn LinkEnv, note_id: &str) {
 pub(crate) fn list_identify_suggestions_with(env: &dyn LinkEnv) -> Result<Vec<ipc::IdentifySuggestion>, String> {
     let root = env.notes_dir().map_err(|e| e.to_string())?;
     let vp = store::VoiceprintStore::new(env.root().map_err(|e| e.to_string())?).load();
-    let notes = store::NoteStore::new(root.clone()).list();
+    let nstore = store::NoteStore::new(root.clone());
+    let notes = nstore.list();
+    // 每篇的说话人表只读一次(建议与回执两轮共用)。Err = 读取失败,与「无关联」区分。
+    let mut speakers_cache: std::collections::HashMap<String, Result<std::collections::BTreeMap<String, store::SpeakerMeta>, String>> =
+        Default::default();
+    let mut speakers_of = |id: &str| {
+        speakers_cache
+            .entry(id.to_string())
+            .or_insert_with(|| nstore.load(id).map(|nt| nt.speakers).map_err(|e| e.to_string()))
+            .clone()
+    };
     let mut out: Vec<ipc::IdentifySuggestion> = Vec::new();
-    for n in notes {
+    for n in &notes {
         let dir = root.join(&n.id);
         let Some(idoc) = refine::identify::load_identify(&dir) else { continue };
         if idoc.assignments.iter().all(|a| a.status != "suggested") {
@@ -300,8 +315,15 @@ pub(crate) fn list_identify_suggestions_with(env: &dyn LinkEnv) -> Result<Vec<ip
             .iter()
             .map(|(sp, seqs)| (refine::identify::cluster_fingerprint(seqs), sp.clone()))
             .collect();
-        // 已关联的说话人查说话人表(段落不带身份,见模块文档)。
-        let speakers = store::NoteStore::new(root.clone()).load(&n.id).map(|nt| nt.speakers).unwrap_or_default();
+        // 已关联的说话人查说话人表(段落不带身份,见模块文档)。读不到就跳过这篇:
+        // 当成「无关联」会把已关联的簇的过期建议又摆出来。
+        let speakers = match speakers_of(&n.id) {
+            Ok(sp) => sp,
+            Err(e) => {
+                eprintln!("识别建议:{} 说话人表读取失败,本篇建议暂不展示: {e}", n.id);
+                continue;
+            }
+        };
         let linked: std::collections::BTreeSet<&str> = speakers
             .iter()
             .filter(|(_, m)| m.person_id.is_some())
@@ -355,7 +377,7 @@ pub(crate) fn list_identify_suggestions_with(env: &dyn LinkEnv) -> Result<Vec<ip
     // 撤销入口不能因稿变化/淘汰而消失);revertible=簇仍可按指纹定位且关联仍是
     // 自动目标(否则冲突态只留「好」)。
     let mut receipts: Vec<ipc::IdentifySuggestion> = Vec::new();
-    for n in store::NoteStore::new(root.clone()).list() {
+    for n in &notes {
         let dir = root.join(&n.id);
         let ops = refine::identify::load_ops(&dir);
         let pending: Vec<_> = ops
@@ -367,7 +389,12 @@ pub(crate) fn list_identify_suggestions_with(env: &dyn LinkEnv) -> Result<Vec<ip
             continue;
         }
         let doc = store::load_refined(&dir);
-        let speakers = store::NoteStore::new(root.clone()).load(&n.id).map(|nt| nt.speakers).unwrap_or_default();
+        // 回执永续可见(撤销入口不能丢);说话人表读不到时照常展示,但不给撤销——
+        // 拿不准现关联时撤销可能覆盖用户的改动。
+        let speakers = speakers_of(&n.id).unwrap_or_else(|e| {
+            eprintln!("识别回执:{} 说话人表读取失败,本次不提供撤销: {e}", n.id);
+            Default::default()
+        });
         for op in pending {
             let revertible = doc.as_ref().is_some_and(|d| {
                 let seqs: std::collections::BTreeSet<u64> = op.seqs.iter().copied().collect();
@@ -569,9 +596,8 @@ fn spawn_ack_reinforce(
 
 /// P2b 回执「撤销」:CAS 解除关联 + 按 op 对账还原质心 + 拒绝键。返回质心是否
 /// 还原(false=已被后续写动过,关联已解除但声纹保留,前端如实提示)。
+/// 调用方自备 id 校验与准入(命令壳在切到阻塞线程池之前做,与原实现同时机)。
 pub(crate) fn undo_identify_apply_with(env: &dyn LinkEnv, note_id: String, op_id: String) -> Result<bool, String> {
-    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
-    env.admit(&note_id, occupancy::Intent::EditOutsideAing)?;
     {
         let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
         let root = env.notes_dir().map_err(|e| e.to_string())?;
