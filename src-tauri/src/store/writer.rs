@@ -303,14 +303,7 @@ impl NoteWriter {
     pub fn set_speaker_name(&mut self, id: &str, name: &str) {
         self.speakers
             .entry(id.to_string())
-            .or_insert_with(|| SpeakerMeta {
-                name: String::new(),
-                sources: Vec::new(),
-                centroid: None,
-                count: 0,
-                person_id: None,
-                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
-            })
+            .or_insert_with(SpeakerMeta::blank)
             .name = name.to_string();
     }
 
@@ -321,14 +314,7 @@ impl NoteWriter {
     pub fn set_speaker_person(&mut self, id: &str, person: &str) {
         self.speakers
             .entry(id.to_string())
-            .or_insert_with(|| SpeakerMeta {
-                name: String::new(),
-                sources: Vec::new(),
-                centroid: None,
-                count: 0,
-                person_id: None,
-                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
-            })
+            .or_insert_with(SpeakerMeta::blank)
             .person_id = Some(person.to_string());
     }
 
@@ -499,14 +485,7 @@ impl NoteWriter {
         for (id, sources) in infos {
             let entry = self.speakers.entry(id.clone()).or_insert_with(|| {
                 changed = true;
-                SpeakerMeta {
-                    name: String::new(),
-                    sources: Vec::new(),
-                    centroid: None,
-                    count: 0,
-                    person_id: None,
-                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
-                }
+                SpeakerMeta::blank()
             });
             for s in sources {
                 if !entry.sources.contains(s) {
@@ -559,14 +538,7 @@ impl NoteWriter {
             let winner_entry =
                 self.speakers
                     .entry(winner.to_string())
-                    .or_insert_with(|| SpeakerMeta {
-                        name: String::new(),
-                        sources: Vec::new(),
-                        centroid: None,
-                        count: 0,
-                        person_id: None,
-                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
-                    });
+                    .or_insert_with(SpeakerMeta::blank);
             if winner_entry.name.is_empty() && !loser_meta.name.is_empty() {
                 winner_entry.name = loser_meta.name;
             }
