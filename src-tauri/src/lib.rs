@@ -4918,8 +4918,9 @@ trait SplitEnv: Send + Sync {
     fn consume_pending_rebuild(&self);
     /// 回灌纠错把某人质心清空了:丢弃常驻嵌入器并排一次全库重建。
     fn request_rebuild(&self, reason: &'static str);
-    /// 整个 op 收尾(DONE 之前):刷热词缓存;拆分模式另排人物图谱重建。
-    fn on_split_done(&self, split_commit: bool) -> Result<(), String>;
+    /// 整个 op 收尾(DONE 之前):刷热词缓存;拆分模式另排人物图谱重建。`root` 由调用方给
+    /// (就是这次收尾读写 split_ops 的那个目录),不在这里重取——重取会与收尾所用的目录分叉。
+    fn on_split_done(&self, root: &std::path::Path, split_commit: bool) -> Result<(), String>;
     /// 分组嵌入进度(大簇要算数分钟,前端靠它区分「在算」与「卡死」)。
     fn split_progress(&self, note_id: &str, done: usize, total: usize);
 }
@@ -4977,11 +4978,10 @@ impl SplitEnv for TauriSplitEnv {
         *st.embedder_cache.lock().unwrap() = None;
         spawn_voiceprint_rebuild(&self.0, st.embedder_cache.clone(), reason);
     }
-    fn on_split_done(&self, split_commit: bool) -> Result<(), String> {
+    fn on_split_done(&self, root: &std::path::Path, split_commit: bool) -> Result<(), String> {
         refresh_qwen_hotwords_cache(&self.0);
         if split_commit {
-            let root = data_root(&self.0).map_err(|e| e.to_string())?;
-            queue_person_graph_rebuild(&self.0, root, &tr!("拆分说话人", "Speaker split"))?;
+            queue_person_graph_rebuild(&self.0, root.to_path_buf(), &tr!("拆分说话人", "Speaker split"))?;
         }
         Ok(())
     }
@@ -5475,7 +5475,7 @@ fn complete_released(
     // 没做完都补不回来(codex 实现轮五 P1①)。前面各步全部幂等,重试安全。
     let op = store::split_ops::load(root, op_id).map_err(|e| e.to_string())?;
     env.consume_pending_rebuild();
-    env.on_split_done(op.mode == "split_commit")?;
+    env.on_split_done(root, op.mode == "split_commit")?;
     store::split_ops::advance_guarded(
         vp_store,
         root,

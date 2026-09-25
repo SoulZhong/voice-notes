@@ -128,7 +128,7 @@ impl SplitEnv for FakeEnv {
     fn request_rebuild(&self, _reason: &'static str) {
         self.rebuild_requests.fetch_add(1, Ordering::SeqCst);
     }
-    fn on_split_done(&self, split_commit: bool) -> Result<(), String> {
+    fn on_split_done(&self, _root: &std::path::Path, split_commit: bool) -> Result<(), String> {
         if self.fail_done_once.swap(false, Ordering::SeqCst) {
             return Err("注入失败: on_split_done".into());
         }
