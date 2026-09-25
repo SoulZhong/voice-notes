@@ -25,10 +25,12 @@ const paras = (text: string): ParagraphPayload[] => [{ orig_index: 0, text, dirt
 
 /** 每次调用都排进队列,由测试决定何时、以何值落地。 */
 class FakeBackend implements RefinedSyncPorts {
+  constructor(private log: string[] = []) {}
   gets: { id: string; d: Deferred<RefinedDoc | null> }[] = [];
   saves: { id: string; revision: number; paragraphs: ParagraphPayload[]; d: Deferred<number> }[] = [];
   getRefined(id: string) {
     const d = deferred<RefinedDoc | null>();
+    this.log.push("get");
     this.gets.push({ id, d });
     return d.promise;
   }
@@ -40,6 +42,7 @@ class FakeBackend implements RefinedSyncPorts {
 }
 
 class FakeEditor implements RefinedEditorHandle {
+  constructor(private log: string[] = []) {}
   focused = false;
   set: RefinedDoc[] = [];
   saved: number[] = [];
@@ -51,16 +54,19 @@ class FakeEditor implements RefinedEditorHandle {
     this.set.push(d);
   }
   markSaved(r: number) {
+    this.log.push("markSaved");
     this.saved.push(r);
   }
   markSaveFailed() {
+    this.log.push("markSaveFailed");
     this.failed += 1;
   }
 }
 
 function setup(id = "N1") {
-  const be = new FakeBackend();
-  const ed = new FakeEditor();
+  const log: string[] = [];
+  const be = new FakeBackend(log);
+  const ed = new FakeEditor(log);
   const cur = { id, editor: ed as FakeEditor | null };
   const sync = new RefinedSync(be, {
     currentId: () => cur.id,
@@ -68,7 +74,7 @@ function setup(id = "N1") {
     saveFailedText: (e) => `保存失败: ${e}`,
     drainFailedText: (e) => `收尾失败: ${e}`,
   });
-  return { be, ed, cur, sync };
+  return { be, ed, cur, sync, log };
 }
 
 /** 把编辑器同步到一份稿(模拟同步 effect 首跑),之后保存以这篇为目标。 */
@@ -158,11 +164,12 @@ describe("编辑器同步", () => {
 
 describe("保存", () => {
   it("成功:先 markSaved 再回读;回读后的稿记为已同步,同步 effect 不再重建", async () => {
-    const { be, ed, sync } = mounted();
+    const { be, ed, sync, log } = mounted();
     void sync.save({ revision: 1, paragraphs: paras("改") });
     be.saves[0].d.resolve(2);
     await flush();
     expect(ed.saved).toEqual([2]);
+    expect(log, "markSaved 必须先于回读(空窗里的下一次自动保存会撞冲突)").toEqual(["markSaved", "get"]);
     expect(be.gets).toHaveLength(1);
     const latest = doc(2, "改");
     be.gets[0].d.resolve(latest);
@@ -203,11 +210,12 @@ describe("保存", () => {
   });
 
   it("乐观并发冲突:markSaveFailed 之后重载盘上稿并推给编辑器", async () => {
-    const { be, ed, sync } = mounted();
+    const { be, ed, sync, log } = mounted();
     void sync.save({ revision: 1, paragraphs: paras("a") });
     be.saves[0].d.reject("修订稿已在别处更新");
     await flush();
     expect(ed.failed).toBe(1);
+    expect(log, "markSaveFailed 先于冲突重载").toEqual(["markSaveFailed", "get"]);
     const latest = doc(5, "别处");
     be.gets[0].d.resolve(latest);
     await flush();
@@ -289,5 +297,80 @@ describe("切笔记复位", () => {
     expect(sync.synced).toBeNull();
     sync.queueDrain({ revision: 2, paragraphs: paras("旧篇最后一笔") });
     expect(be.saves[0].id).toBe("N1");
+  });
+});
+
+// ── 补充守卫分支 ──
+
+describe("守卫分支", () => {
+  it("实体编辑后重取:失焦才推给编辑器;有焦点只更新 doc", async () => {
+    const { be, ed, sync } = mounted();
+    ed.focused = true;
+    void sync.reloadIntoEditor("N1");
+    be.gets[0].d.resolve(doc(2));
+    await flush();
+    expect(sync.doc?.revision).toBe(2);
+    expect(ed.set).toHaveLength(1); // 只有挂载那次
+    ed.focused = false;
+    void sync.reloadIntoEditor("N1");
+    be.gets[1].d.resolve(doc(3));
+    await flush();
+    expect(ed.set.at(-1)?.revision).toBe(3);
+  });
+
+  it("实体编辑后重取途中切走笔记:不落地、不推编辑器", async () => {
+    const { be, ed, cur, sync } = mounted();
+    void sync.reloadIntoEditor("N1");
+    cur.id = "N2";
+    be.gets[0].d.resolve(doc(2));
+    await flush();
+    expect(sync.doc).toBeNull();
+    expect(ed.set).toHaveLength(1);
+  });
+
+  it("保存成功但回读为 null 或失败:doc 保持原样,不清空整篇", async () => {
+    const { be, sync } = mounted();
+    void sync.load("N1");
+    be.gets[0].d.resolve(doc(1));
+    await flush();
+    const kept = sync.doc;
+    void sync.save({ revision: 1, paragraphs: paras("a") });
+    be.saves[0].d.resolve(2);
+    await flush();
+    be.gets[1].d.resolve(null);
+    await flush();
+    expect(sync.doc).toBe(kept);
+    void sync.save({ revision: 2, paragraphs: paras("b") });
+    be.saves[1].d.resolve(3);
+    await flush();
+    be.gets[2].d.reject(new Error("io"));
+    await flush();
+    expect(sync.doc).toBe(kept);
+    expect(sync.loading).toBe(0);
+  });
+
+  it("冲突重载途中切走笔记:不把旧篇稿子推给新编辑器", async () => {
+    const { be, ed, cur, sync } = mounted();
+    void sync.save({ revision: 1, paragraphs: paras("a") });
+    be.saves[0].d.reject("修订稿已在别处更新");
+    await flush();
+    cur.id = "N2";
+    be.gets[0].d.resolve(doc(7));
+    await flush();
+    expect(ed.set.map((d) => d.revision)).not.toContain(7);
+  });
+
+  it("带在途保存的收尾失败:进错误横幅,排队清空后可再发", async () => {
+    const { be, sync } = mounted();
+    void sync.save({ revision: 1, paragraphs: paras("a") });
+    sync.queueDrain({ revision: 1, paragraphs: paras("ab") });
+    be.saves[0].d.resolve(2);
+    await flush();
+    be.saves[1].d.reject("磁盘满");
+    await flush();
+    expect(sync.saveErr).toContain("收尾失败");
+    sync.queueDrain({ revision: 2, paragraphs: paras("abc") });
+    await flush();
+    expect(be.saves).toHaveLength(3);
   });
 });
