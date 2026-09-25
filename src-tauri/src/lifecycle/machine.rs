@@ -133,7 +133,9 @@ pub enum EditOp {
     /// 手动与会人员整表替换(2026-09-16 与会人先验)。
     SetAttendees { id: String, attendees: Vec<String> },
     Delete { id: String },
-    RenameSpeaker { id: String, speaker_id: String, name: String },
+    /// 改本地名;`unlink_from` 给出时,若该说话人此刻仍关联这个人,则在同一次写入里先解除
+    /// (改名即指认:改成与库名不同的名字 = 「这不是那个人」)。
+    RenameSpeaker { id: String, speaker_id: String, name: String, unlink_from: Option<String> },
     DeleteSpeaker { id: String, speaker_id: String },
     AssignPerson { id: String, speaker_id: String, person_id: String },
     ClearPerson { id: String, speaker_id: String },

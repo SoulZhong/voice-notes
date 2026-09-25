@@ -418,6 +418,27 @@ impl NoteStore {
         })
     }
 
+    /// 改名即指认的笔记侧:改本地名;`unlink_from` 给出且该说话人此刻仍关联这个人时,
+    /// 同一次写入里先解除关联(规则同 [`Self::clear_speaker_person`])。此刻关联的已不是
+    /// 那个人(期间被改过)则只改名、不动关联。
+    pub fn rename_speaker_unlinking(
+        &self,
+        id: &str,
+        speaker_id: &str,
+        name: &str,
+        unlink_from: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.edit_speakers(id, |_, t| {
+            if let Some(expect) = unlink_from {
+                if t.unlink_if(speaker_id, expect, |p| self.person_display_name(p)).is_err() {
+                    eprintln!("改名:{speaker_id} 已不再关联 {expect},只改名");
+                }
+            }
+            t.rename(speaker_id, name);
+            Ok(())
+        })
+    }
+
     /// 用户指认:把说话人关联到声纹库人物。
     pub fn assign_speaker_person(&self, id: &str, speaker_id: &str, person_id: &str) -> anyhow::Result<()> {
         self.edit_speakers(id, |_, t| t.link(speaker_id, person_id))

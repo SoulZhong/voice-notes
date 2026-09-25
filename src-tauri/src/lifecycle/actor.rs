@@ -155,9 +155,9 @@ fn run_edit(app: &AppHandle, op: EditOp, refining_ids: &[String]) -> Result<(), 
             store.set_attendees(&id, &attendees).map_err(|e| e.to_string())
         }
         EditOp::Delete { id } => store.delete(&id).map_err(|e| e.to_string()),
-        EditOp::RenameSpeaker { id, speaker_id, name } => {
-            store.rename_speaker(&id, &speaker_id, &name).map_err(|e| e.to_string())
-        }
+        EditOp::RenameSpeaker { id, speaker_id, name, unlink_from } => store
+            .rename_speaker_unlinking(&id, &speaker_id, &name, unlink_from.as_deref())
+            .map_err(|e| e.to_string()),
         EditOp::DeleteSpeaker { id, speaker_id } => {
             store.delete_speaker(&id, &speaker_id).map_err(|e| e.to_string())
         }

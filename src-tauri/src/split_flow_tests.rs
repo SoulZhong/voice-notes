@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::diar::SpeakerEmbedder;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 
@@ -56,7 +57,7 @@ impl FakeEnv {
     }
 }
 
-impl SplitEnv for FakeEnv {
+impl crate::voice_env::VoiceEnv for FakeEnv {
     fn root(&self) -> anyhow::Result<PathBuf> {
         Ok(self.root.clone())
     }
@@ -113,6 +114,12 @@ impl SplitEnv for FakeEnv {
             .embedding_model;
         Ok(diar::TaggedEmbedder::new(tag, Box::new(AmplitudeEmbedder)))
     }
+    fn request_rebuild(&self, _reason: &'static str) {
+        self.rebuild_requests.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl SplitEnv for FakeEnv {
     fn seeds_for(&self, _tag: &str) -> Vec<diar::registry::SeedCluster> {
         Vec::new()
     }
@@ -124,9 +131,6 @@ impl SplitEnv for FakeEnv {
     }
     fn consume_pending_rebuild(&self) {
         self.consumed_pending.fetch_add(1, Ordering::SeqCst);
-    }
-    fn request_rebuild(&self, _reason: &'static str) {
-        self.rebuild_requests.fetch_add(1, Ordering::SeqCst);
     }
     fn on_split_done(&self, _root: &std::path::Path, split_commit: bool) -> Result<(), String> {
         if self.fail_done_once.swap(false, Ordering::SeqCst) {
