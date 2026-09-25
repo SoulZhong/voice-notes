@@ -49,7 +49,6 @@
     saveRefined,
     getScene,
     type SceneDoc,
-    type ParagraphPayload,
     listCalendarCandidates,
     setNoteCalendarEvent,
     noteCalendarPermission,
@@ -91,7 +90,7 @@
   import type { Notice } from "$lib/notices";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
-  import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
+  import { RefinedSync } from "$lib/editor/refinedSync.svelte";
   import Segmented from "$lib/Segmented.svelte";
   import type { SegmentedItem } from "$lib/segmented";
 
@@ -117,65 +116,18 @@
       addEventListener,capture 阶段)。 */
   let segRenderTick = $state(0);
 
-  // 修订稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
-  let refined = $state<RefinedDoc | null>(null);
-  /** 修订稿的载入闸门。写 refined 的有四路:refresh()、Aing 终态事件、在跑复核、
-      编辑器保存后的回读。它们各自 await,谁先发起不代表谁先落地——Codex 连着几轮
-      抓到的一串竞态(旧稿盖新稿、忙态解除得比新稿早、提示在重取途中闪一下)本质
-      是同一件事:多个写者无序。这里一次收口:
-      ① 取稿一律走 loadRefined,末次请求赢(seq 比对),旧响应作废;
-      ② 取稿在途(refinedLoading > 0)期间不出「这场没做 AI 整理」——眼前这份稿子
-         随时可能被换掉,凭它下结论必然出错;
-      ③ 编辑器回读那几处自己取稿,同样走 beginRefinedLoad()(占号 + 计入在途)/
-         commitRefined(seq, doc)/endRefinedLoad(seq, ok) 三件套——占号必须在 await
-         **之前**,否则一份早发出、慢回来的旧回读会拿到更大的号把新稿盖掉;计入在途
-         则是为了让提示在任何一路取稿在途时都闭嘴,不只在 loadRefined 那一路;
-      ④ 重取失败时不放行提示:那份留在手里的旧稿(stages.llm 仍是 "off")正是
-         误报的来源,宁可不提示。 */
-  let refinedSeq = 0;
-  let refinedLoading = $state(0);
-  /** 重取失败,手里这份可能是过期稿:提示一律不出,直到某次重取成功。 */
-  let refinedStale = $state(false);
-  /** 发起一次取稿:占号 + 计入在途。每个 begin 必须配一个 endRefinedLoad(放 finally)。
-      untrack 不可省:`refinedLoading += 1` 是"读 + 写",而 refresh() 是在 $effect 里
-      **同步**调到这里的——不 untrack 的话那个 effect 会把 refinedLoading 记成依赖、
-      又亲手改它,自我失效成死循环,Svelte 抛 effect_update_depth_exceeded 中止整页
-      渲染,笔记页永远停在"加载中"(2026-08-16 真机撞到)。 */
-  function beginRefinedLoad(): number {
-    untrack(() => {
-      refinedLoading += 1;
-    });
-    refinedSeq += 1;
-    return refinedSeq;
-  }
-  /** 结束一次取稿。committed=false 且自己仍是最新请求时,说明手里这份可能过期
-      (取失败/取回来是 null/守卫没过),提示一律不出——被更新的请求顶掉则不算。 */
-  function endRefinedLoad(seq: number, committed: boolean) {
-    untrack(() => {
-      refinedLoading -= 1;
-    });
-    if (!committed && seq === refinedSeq) refinedStale = true;
-  }
-  /** 只有仍是最新一次请求、且没切走笔记时才落地;返回是否真的落了。
-      调用方要据此决定跟着落不落编辑器同步——被判过期的那份稿子绝不能推给编辑器,
-      否则 refined 是新的、编辑器却被回滚成旧的。 */
-  function commitRefined(seq: number, doc: RefinedDoc | null, forId: string): boolean {
-    if (seq !== refinedSeq || forId !== id) return false;
-    refined = doc;
-    refinedStale = false;
-    return true;
-  }
-  async function loadRefined(forId: string): Promise<void> {
-    const seq = beginRefinedLoad();
-    let ok = false;
-    try {
-      ok = commitRefined(seq, await getRefined(forId), forId);
-    } catch {
-      /* 增值层:取不到就维持现状,过期与否交给 endRefinedLoad 判 */
-    } finally {
-      endRefinedLoad(seq, ok);
-    }
-  }
+  // 修订稿:取稿闸门、保存排队、冲突重载、编辑器身份闸门全部在 RefinedSync 里
+  // (规则与来由见 refinedSync.svelte.ts,逐条有测试)。页面只把 effect 接上去。
+  const refinedSync = new RefinedSync(
+    { getRefined, saveRefined },
+    {
+      currentId: () => id,
+      editor: () => refinedEditor,
+      saveFailedText: (e) => t("notes.detail.saveRefinedFailed", { e }),
+      drainFailedText: (e) => t("notes.detail.drainFailed", { e }),
+    },
+  );
+  const refined = $derived(refinedSync.doc);
   let refining = $state(false);
   /** Aing 逐块进度(行内「精修中 3/8 · 约剩 4 分」)。null=无进度可画。 */
   let aingProg = $state<{ stage: string; done: number; total: number; avgMs: number } | null>(null);
@@ -366,92 +318,6 @@
   }
   // 精修稿说话人徽章点击浮层:沿用说话人条改名/选人入口,弹层只做身份提示。
   let refinedBadgePop = $state<{ attrs: BadgeAttrs; rect: DOMRect } | null>(null);
-  // 保存错误粘性去重:markSaveFailed 无退避地按 2s 重试,持续性拒绝(Aing 中/录制中)
-  // 不该每次都刷新一条 banner——同一条错误只设置一次,markSaved 成功后清空。
-  let refinedSaveErr = $state("");
-  // 当前编辑器里加载的是哪个笔记的精修稿(而非 route 的 id):id 切换时 flush 必须
-  // 落到*旧*笔记,不能用已经翻新的 id——否则会把上一篇的编辑存进新笔记。
-  let loadedRefinedId: string | null = null;
-  type RefinedSaveSnapshot = { revision: number; paragraphs: ParagraphPayload[] };
-  type ActiveRefinedSave = { payload: RefinedSaveSnapshot; done: Promise<number> };
-  // lifecycle drain 活在页面层,不依赖即将销毁的 MarkdownEditor 实例。每篇笔记至多
-  // 保留一份最新快照;active 完成后按其新 revision/段序重基并串行落盘。
-  const activeRefinedSaves = new Map<string, ActiveRefinedSave>();
-  const pendingRefinedDrains = new Map<string, RefinedSaveSnapshot>();
-  const runningRefinedDrains = new Set<string>();
-  // 身份闸门:标记"编辑器已同步到的那份 refined 对象"+"是哪个编辑器实例同步的"。
-  // 保存成功后 refined 换新对象身份(revision 更新)必然触发下面的同步 effect;若
-  // 不闸,失焦保存场景 hasFocus() 为 false,effect 会用*旧*的段落快照把编辑器里
-  // 刚打上的内容重建一遍,吹掉用户紧接着的输入。凡是"页面主动把 doc 写成与编辑器
-  // 一致"的地方(保存成功回写、冲突重载显式 setRefined),都要顺手把该 doc 记进
-  // syncedRefined、当前编辑器实例记进 syncedEditor,让 effect 识别出"已经同步
-  // 过,不用再来一次"。两者必须配对判定(Fix Round 2):只闸 doc 不闸 editor 实例,
-  // 会在「修订稿→原始稿→修订稿」来回切时炸——MarkdownEditor 挂在
-  // {#if effectiveView === "refined"} 里,视图切走会销毁旧实例、切回来挂全新实例;
-  // 若 refined 对象没变(没有新保存/新精修),新实例挂载触发 effect 重跑时
-  // doc === syncedRefined 命中就直接 return,新实例永远收不到 setRefined,渲染空白
-  // 且其中打字因组件内部 loadedDoc 为 null 静默不落盘。
-  let syncedRefined: RefinedDoc | null = null;
-  let syncedEditor: unknown = null;
-
-  function queueRefinedDrain(payload: RefinedSaveSnapshot) {
-    const targetId = loadedRefinedId ?? id;
-    pendingRefinedDrains.set(targetId, payload);
-    if (runningRefinedDrains.has(targetId)) return;
-    const active = activeRefinedSaves.get(targetId) ?? null;
-    void drainRefinedAfterActive(targetId, active);
-  }
-
-  async function drainRefinedAfterActive(targetId: string, initial: ActiveRefinedSave | null) {
-    runningRefinedDrains.add(targetId);
-    let revision: number | null = null;
-    let previous: ParagraphPayload[] | null = null;
-    try {
-      if (initial) {
-        revision = await initial.done;
-        previous = initial.payload.paragraphs;
-      }
-      while (pendingRefinedDrains.has(targetId)) {
-        const queued = pendingRefinedDrains.get(targetId)!;
-        pendingRefinedDrains.delete(targetId);
-        const next =
-          revision !== null && previous
-            ? rebaseQueuedRefinedSave(revision, previous, queued.paragraphs)
-            : queued;
-        revision = await saveRefined(targetId, next.revision, next.paragraphs);
-        previous = next.paragraphs;
-      }
-      // 仍停留在本篇且没有继续输入时,把 detached 保存的最终盘上状态同步回来。
-      if (targetId === id && !refinedEditor?.hasFocus()) {
-        const seq = beginRefinedLoad(); // 占号+计入在途必须在 await 之前(见闸门注释 ③)
-        let ok = false;
-        try {
-          const latest = await getRefined(targetId);
-          // 被更新的取稿顶掉时不推给编辑器(见 commitRefined 注释)。
-          if (latest && targetId === id && !refinedEditor?.hasFocus()) {
-            ok = commitRefined(seq, latest, targetId);
-            if (ok) {
-              syncedRefined = latest;
-              syncedEditor = refinedEditor;
-              refinedEditor?.setRefined(latest);
-            }
-          }
-        } finally {
-          endRefinedLoad(seq, ok);
-        }
-      }
-    } catch (err) {
-      const msg = t("notes.detail.drainFailed", { e: err });
-      if (targetId === id && msg !== refinedSaveErr) refinedSaveErr = msg;
-    } finally {
-      runningRefinedDrains.delete(targetId);
-      // 排空结束的极窄窗口里可能又收到一份更新快照,继续下一轮而不丢它。
-      if (pendingRefinedDrains.has(targetId)) {
-        void drainRefinedAfterActive(targetId, activeRefinedSaves.get(targetId) ?? null);
-      }
-    }
-  }
-
   /** 说话人徽章签名:改名/关联/删除会改它,其他 refresh 不会——徽章重放只认它,
       避免每次 refresh 都整份重建修订稿编辑器(滚动/选区抖动)。 */
   const speakerBadgeSig = $derived(
@@ -472,7 +338,7 @@
   $effect(() => {
     const sig = speakerBadgeSig;
     const ed = refinedEditor;
-    const doc = syncedRefined;
+    const doc = refinedSync.synced;
     if (!ed || !doc || effectiveView !== "refined") {
       lastBadgeSig = sig;
       return;
@@ -620,24 +486,7 @@
     }
     return m;
   });
-  async function reloadRefinedForEntities() {
-    const forId = id;
-    const seq = beginRefinedLoad();
-    let ok = false;
-    try {
-      const latest = await getRefined(forId);
-      if (latest && forId === id) {
-        ok = commitRefined(seq, latest, forId);
-        if (ok && !refinedEditor?.hasFocus()) {
-          syncedRefined = latest;
-          syncedEditor = refinedEditor;
-          refinedEditor?.setRefined(latest);
-        }
-      }
-    } finally {
-      endRefinedLoad(seq, ok);
-    }
-  }
+  const reloadRefinedForEntities = () => refinedSync.reloadIntoEditor(id);
   async function entityAdd(entries: [string, string][]) {
     await noteEntitiesAdd(id, entries);
     await reloadRefinedForEntities();
@@ -742,106 +591,13 @@
     return b;
   }
 
-  async function doSaveRefined(payload: { revision: number; paragraphs: ParagraphPayload[] }) {
-    const targetId = loadedRefinedId ?? id;
-    const done = saveRefined(targetId, payload.revision, payload.paragraphs);
-    const active = { payload, done };
-    activeRefinedSaves.set(targetId, active);
-    try {
-      const newRev = await done;
-      // await 期间编辑器可能已经切到别的笔记(loadedRefinedId 变了):这份回执打在
-      // *旧*笔记上,组件自己的 setRefined(切笔记时会重新整份载入)早就复位过
-      // saveInFlight,不需要再补 markSaveFailed——直接丢弃回执即可。
-      if (loadedRefinedId !== targetId) return;
-      // markSaved 用后端刚返回的 newRev,在下面的 getRefined 之前调用:避免编辑器
-      // revision 出现空窗期(空窗期内若触发下一次自动保存,会拿着旧 revision 去打
-      // 乐观并发冲突)。
-      refinedEditor?.markSaved(newRev);
-      // 不再本地拼 { ...refined, revision: newRev }(Fix Round 2 之前的做法):那样
-      // refined.paragraphs 仍是保存前的旧内容,与编辑器里实际内容(用户刚打的字)
-      // 对不上——"空稿提示与输入并存"之类的问题正是源于此。保存成功后直接回读
-      // 盘上最新精修稿,让 refined 说真话;这份内容和编辑器一致,配合下面 syncedRefined/
-      // syncedEditor 闸门,视图来回切换重建新编辑器实例时会用这份正确内容渲染,
-      // 而不是被闸门跳过导致空白。
-      const seq = beginRefinedLoad(); // 占号+计入在途必须在 await 之前(见闸门注释 ③)
-      let ok = false;
-      try {
-        const latest = await getRefined(targetId);
-        // await 后重验守卫:回读期间用户可能已经切走了笔记。
-        if (targetId === id && loadedRefinedId === targetId) {
-          if (latest) {
-            ok = commitRefined(seq, latest, targetId);
-            if (ok) {
-              syncedRefined = latest;
-              syncedEditor = refinedEditor;
-            }
-          }
-          // latest 为 null(极端情况,如笔记目录被清):保持 refined 原样不动,不因
-          // 一次回读失败就把已展示的内容整篇清空。
-        }
-      } catch {
-        /* 回读失败:refined 保持原状;本次保存本身已经成功(markSaved 已确认落定) */
-      } finally {
-        endRefinedLoad(seq, ok);
-      }
-      if (refinedSaveErr) refinedSaveErr = "";
-    } catch (err) {
-      // 同上:编辑器已经切走,回执作废,不需要 markSaveFailed。
-      if (loadedRefinedId !== targetId) return;
-      // markSaveFailed 必须无条件调用(即使随后走冲突重载分支):否则一次拒绝就让
-      // 组件 saveInFlight 卡 true,自动保存永久停摆。
-      refinedEditor?.markSaveFailed();
-      // 精修稿保存错误走独立粘性 banner(refinedSaveErr),不写共享 error——refresh()
-      // 成功会清 error,若复用它,持续性失败(Aing 中反复被拒)会被后台刷新悄悄抹掉。
-      const msg = t("notes.detail.saveRefinedFailed", { e: err });
-      if (msg !== refinedSaveErr) refinedSaveErr = msg;
-      // revision 冲突(乐观并发):当前编辑已经落空,重载盘上最新内容重建文档。
-      // 非冲突失败(Aing 中/录制中被拒):只保留错误提示,让编辑按 idle 定时器重试
-      // (markSaveFailed 已排好下一次)。
-      if (String(err).includes("已在别处更新")) { // i18n-exempt: 与后端错误原文判等
-        const seq = beginRefinedLoad(); // 占号+计入在途必须在 await 之前(见闸门注释 ③)
-        let ok = false;
-        try {
-          const latest = await getRefined(targetId);
-          if (targetId === id && loadedRefinedId === targetId) {
-            ok = commitRefined(seq, latest, targetId);
-          }
-          // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest/当前编辑器
-          // 实例记进 syncedRefined/syncedEditor,让下面的同步 effect 认出"已经
-          // 同步过"直接跳过——否则 effect 会因 refined 换了身份再 setRefined 一次,
-          // 属于重复重建。
-          if (ok && latest) {
-            refinedEditor?.setRefined(latest);
-            syncedRefined = latest;
-            syncedEditor = refinedEditor;
-          }
-        } catch {
-          /* 重载失败保持错误横幅 */
-        } finally {
-          endRefinedLoad(seq, ok);
-        }
-      }
-    } finally {
-      if (activeRefinedSaves.get(targetId) === active) activeRefinedSaves.delete(targetId);
-    }
-  }
-
-  // refined 变化(载入/精修完成/冲突重载)→ 重建编辑器文档;输入中不打断。
-  // 身份闸门(syncedRefined + syncedEditor,见上方声明的注释):doSaveRefined 成功
-  // 回写/显式冲突重载已经让*这个*编辑器实例和这个具体 doc 对象同步过,不必再来
-  // 一次——否则失焦保存场景会用刚落盘的旧引用重建文档,吹掉用户紧接着的输入。
-  // 两者必须配对判定:只闸 doc 会在视图来回切换、MarkdownEditor 被销毁重挂出新
-  // 实例但 refined 对象没变时,把新实例挂载这次也跳过,渲染空白且输入静默不保存。
+  // refined 或编辑器实例变化(载入/精修完成/冲突重载/视图切换重挂)→ 重建编辑器文档;
+  // 已同步过的跳过、输入中不打断(见 RefinedSync.syncEditor)。
   $effect(() => {
     const doc = refined;
     const ed = refinedEditor;
     if (!ed || !doc || effectiveView !== "refined") return;
-    if (doc === syncedRefined && ed === syncedEditor) return;
-    if (ed.hasFocus()) return; // 常驻编辑态:正在打字时外部刷新不吹掉输入
-    ed.setRefined(doc);
-    syncedRefined = doc;
-    syncedEditor = ed;
-    loadedRefinedId = id;
+    refinedSync.syncEditor(ed, doc);
   });
 
   // 实体悬浮浮层桥接:组件在编辑器根上派发 entityhover/entityleave,两者都不带
@@ -1017,8 +773,8 @@
     if (regenErr) out.push({ key: "regenErr", level: "error", text: regenErr });
     if (refineErr) out.push({ key: "refineErr", level: "error", text: refineErr });
     if (retransErr) out.push({ key: "retransErr", level: "error", text: retransErr });
-    if (effectiveView === "refined" && refined && refinedSaveErr)
-      out.push({ key: "refinedSaveErr", level: "error", text: refinedSaveErr });
+    if (effectiveView === "refined" && refined && refinedSync.saveErr)
+      out.push({ key: "refinedSaveErr", level: "error", text: refinedSync.saveErr });
     if (effectiveView === "refined" && refined?.stages.llm === "failed")
       out.push({ key: "llmFailed", level: "error", text: t("notes.banner.llmFailed") });
     if (effectiveView === "refined" && refined?.stale)
@@ -1432,7 +1188,7 @@
   async function refresh() {
     // 并行发起，note 失败才是真正的加载失败；refined/people 是增值层，取不到静默降级。
     const notePromise = getNote(id);
-    const refinedLoad = loadRefined(id);
+    const refinedLoad = refinedSync.load(id);
     const peoplePromise = listPeople().catch(() => []);
     try {
       note = await notePromise;
@@ -1583,7 +1339,7 @@
   // 只在 id 变化时清；编辑后的 refresh() 不经此处，不会闪屏。
   $effect(() => {
     void id;
-    // 落盘先于复位:flushRefined 内部用 loadedRefinedId(不是下面即将复位的
+    // 落盘先于复位:flushRefined 经 RefinedSync 按编辑器里载入的那篇(不是下面即将复位的
     // refined/id)找旧笔记,必须在清空编辑态之前调用。
     //
     // 必须 untrack:refinedEditor 是 bind:this 的 $state,裸读会让本 effect 除 id 外
@@ -1596,11 +1352,7 @@
     editing = false;
     segMenuPop = null;
     segDeletePop = null;
-    refined = null;
-    // 换了笔记,上一篇的"手里这份可能过期"作废;新一篇由自己的取稿重新判定。
-    refinedStale = false;
-    syncedRefined = null;
-    syncedEditor = null;
+    refinedSync.reset();
     refining = false;
     refineRunFailed = false;
     refineErr = "";
@@ -1622,7 +1374,6 @@
     cancelHideEntityPop();
     entityPop = null;
     refinedBadgePop = null;
-    refinedSaveErr = "";
     exportMenuOpen = false;
     exportMsg = "";
     // 圈选游标是会话态且以毫秒记在**本篇**时间轴上:不清的话切到别篇会沿用旧值,
@@ -1667,7 +1418,7 @@
         // refining 要等新稿到手再落:进页时缓存的那份 refined 还是跑之前的
         // (stages.llm = "off"),先落 refining 会让「这场没做 AI 整理」闪一下、
         // 还能被点到重跑。loadRefined 自己吞异常,不会留下未处理的 rejection。
-        void loadRefined(forId).finally(() => {
+        void refinedSync.load(forId).finally(() => {
           if (forId === id) refining = false;
         });
       }
@@ -1688,7 +1439,7 @@
           // 跑完,那条终态事件谁也没接到,缓存里还是 stages.llm="off" 的旧稿——
           // 直接放行会让整理成功的笔记显示「这场没做 AI 整理」(Codex P2 八轮)。
           // 重取一次再放行(refineStatusKnown 在下面的 finally 里置,会等这一步)。
-          await loadRefined(forId);
+          await refinedSync.load(forId);
           return;
         }
         refining = true;
@@ -1707,7 +1458,7 @@
               // 却继续显示「这场没做 AI 整理」并邀请再跑一次(Codex P2 六轮)。
               // refining 等新稿到手再落,免得中间闪一下(七轮);await 在 try 内,
               // 失败由下面的 catch 收掉,不留未处理的 rejection(八轮)。
-              await loadRefined(forId);
+              await refinedSync.load(forId);
               if (!disposed && forId === id) refining = false;
               return;
             } catch {
@@ -1992,7 +1743,7 @@
       noteComplete: note?.meta.state === "complete",
       // 未确定、或修订稿正在重取期间,一律按"可能在跑"处理:宁可晚一拍提示,
       // 不可拿一份随时会被换掉的旧稿下结论。
-      running: refining || !refineStatusKnown || refinedLoading > 0 || refinedStale,
+      running: refining || !refineStatusKnown || refinedSync.loading > 0 || refinedSync.stale,
       refineEnabled: refineOn,
       ready: refineConfigured,
     }),
@@ -2475,7 +2226,7 @@
 
   // note.segments 变化(载入/提交回执/冲突重载)→ 重建编辑器文档;输入中不打断
   // (与精修稿的同步 effect 同一套身份守卫哲学,这里只需 hasFocus,不需要
-  // syncedRefined 那层对象身份闸门——setSegments 本身就是幂等重建,没有"刚保存
+  // refinedSync.synced 那层对象身份闸门——setSegments 本身就是幂等重建,没有"刚保存
   // 成功回写又被自己吹掉"的问题,因为提交回执走 markSegmentSaved 而非整份换新
   // note 对象触发的重复 setSegments)。显式引用 displaySegments/note/note.speakers/
   // effectiveView/segEditor 以保持依赖追踪(syncSegments 内部重读同一批,读法
@@ -2508,9 +2259,9 @@
     if (effectiveView === "refined") {
       // 修订稿(默认视图)同样要标被删段:只在原始稿灰显的话,删完在默认视图里
       // 看不到任何变化,像没生效(Codex 审出)。段落 DOM 带 data-start-ms
-      // (refinedSchema NodeView),回查 syncedRefined 拿 end_ms 判"完全落在删减内";
-      // syncedRefined 在 setRefined 同步落 DOM 后赋值,依赖它即拿到已挂好的 .md-para。
-      const paras = syncedRefined?.paragraphs ?? [];
+      // (refinedSchema NodeView),回查 refinedSync.synced 拿 end_ms 判"完全落在删减内";
+      // synced 在 setRefined 同步落 DOM 后赋值,依赖它即拿到已挂好的 .md-para。
+      const paras = refinedSync.synced?.paragraphs ?? [];
       const byStart = new Map(paras.filter((p) => p.end_ms > p.start_ms).map((p) => [p.start_ms, p]));
       for (const node of el.querySelectorAll<HTMLElement>(".md-para")) {
         const sm = node.dataset.startMs;
@@ -3237,8 +2988,8 @@
             mode="refined"
             editable={canEdit}
             speakerBadge={refinedBadge}
-            onSaveRefined={doSaveRefined}
-            onDrainRefined={queueRefinedDrain}
+            onSaveRefined={(p) => refinedSync.save(p)}
+            onDrainRefined={(p) => refinedSync.queueDrain(p)}
             onBadgeClick={(attrs, rect) => (refinedBadgePop = { attrs, rect })}
             onPlayFrom={(ms) => playFrom({ start_ms: ms })}
           />
