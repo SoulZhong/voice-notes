@@ -1,6 +1,6 @@
 //! 拆分状态机:打标 → 样本处置 → 残留 → 分组提交 → 解除隔离,可从任一阶段断点续跑。
 //!
-//! 对外界的全部依赖经 [`SplitEnv`] 注入(生产实现是 lib.rs 的 `TauriSplitEnv`);
+//! 对外界的全部依赖经 [`SplitEnv`] 注入(生产实现是 lib.rs 的 `TauriEnv`);
 //! Tauri 命令壳留在 lib.rs,只负责建 env、切到阻塞线程池。整链行为由
 //! split_flow_tests.rs 用假 env + 临时目录里的真实笔记与声纹库钉住。
 //!
@@ -8,27 +8,17 @@
 //! docs/superpowers/specs/2026-08-20-mixed-speaker-split-design.md 与
 //! 2026-08-22-one-click-split-design.md。
 
+use crate::voice_env::VoiceEnv;
 use crate::{diar, feedback, lifecycle, occupancy, refine, store, tr, FEEDBACK_GATE, IDENTIFY_ACT_GATE};
-use std::path::PathBuf;
 
 /// 拆分状态机(打标 → 样本处置 → 残留 → 分组提交 → 解除隔离,可从任一阶段断点续跑)
-/// 对外界的全部依赖。生产实现是 [`TauriSplitEnv`];测试用假实现驱动整个状态机
+/// 对外界的全部依赖。生产实现是 lib.rs 的 `TauriEnv`;测试用假实现驱动整个状态机
 /// (见 split_flow_tests.rs),不需要 AppHandle、lifecycle actor 或真实嵌入模型。
 ///
 /// 进程级的门(IDENTIFY_ACT_GATE / FEEDBACK_GATE / split_op_lock)不在这里:它们守的是
 /// 本进程内的并发,与"外界是谁"无关。重建单飞例外——它与全库重建共用,测试并行跑时
 /// 必须各用各的,所以经 env 走。
-pub(crate) trait SplitEnv: Send + Sync {
-    /// app_data_dir(声纹库、split_ops 所在)。
-    fn root(&self) -> anyhow::Result<PathBuf>;
-    /// 笔记根目录。
-    fn notes_dir(&self) -> anyhow::Result<PathBuf>;
-    /// 笔记侧编辑(生产经 lifecycle actor 串行,持 NoteLock)。
-    fn edit_note(&self, op: lifecycle::machine::EditOp) -> Result<(), String>;
-    /// 命令入口准入(见 occupancy.rs)。
-    fn admit(&self, note_id: &str, intent: occupancy::Intent) -> Result<(), String>;
-    /// 按当前选型建嵌入器(标签与权重同源)。
-    fn open_embedder(&self) -> anyhow::Result<diar::TaggedEmbedder>;
+pub(crate) trait SplitEnv: VoiceEnv {
     /// 指定空间的声纹种子(拆分分组给去处建议用)。
     fn seeds_for(&self, tag: &str) -> Vec<diar::registry::SeedCluster>;
     /// 抢占重建单飞(与全库重建互斥);false = 已有重建在跑。
@@ -36,8 +26,6 @@ pub(crate) trait SplitEnv: Send + Sync {
     fn end_exclusive_rebuild(&self);
     /// 消化排队中的全库重建(解除隔离之后调:人物还隔离着时全库重建会清空刚算的基线)。
     fn consume_pending_rebuild(&self);
-    /// 回灌纠错把某人质心清空了:丢弃常驻嵌入器并排一次全库重建。
-    fn request_rebuild(&self, reason: &'static str);
     /// 整个 op 收尾(DONE 之前):刷热词缓存;拆分模式另排人物图谱重建。`root` 由调用方给
     /// (就是这次收尾读写 split_ops 的那个目录),不在这里重取——重取会与收尾所用的目录分叉。
     fn on_split_done(&self, root: &std::path::Path, split_commit: bool) -> Result<(), String>;
