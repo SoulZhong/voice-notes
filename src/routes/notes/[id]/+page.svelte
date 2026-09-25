@@ -91,6 +91,7 @@
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { RefinedSync } from "$lib/editor/refinedSync.svelte";
+  import { watchJob } from "$lib/jobWatch";
   import Segmented from "$lib/Segmented.svelte";
   import type { SegmentedItem } from "$lib/segmented";
 
@@ -1207,14 +1208,16 @@
   /** 转码完成计数:transcode_done 事件驱动音轨重拉(停录后立即点播放的竞态窗口:
       转码完成瞬间源 WAV 被删,播放器握着失效引用会无声播放,此处自动切到 m4a)。 */
   let tracksVersion = $state(0);
-  $effect(() => {
-    const un = onTranscodeDone((e) => {
-      if (e.note_id === id) tracksVersion++;
-    });
-    return () => {
-      un.then((f) => f());
-    };
-  });
+  // 整页只装一次监听,回调里才读当前 id(不让 effect 追踪 id):换笔记就重新订阅的话,
+  // 重新 listen 的 IPC 空窗里若恰好发出新笔记的 transcode_done,就会漏掉——正是本
+  // effect 要防的无声播放竞态。
+  $effect(() =>
+    watchJob({
+      subscribe: onTranscodeDone,
+      matches: (e) => e.note_id === id,
+      onEvent: () => tracksVersion++,
+    }),
+  );
 
   $effect(() => {
     const forId = id;
@@ -1397,48 +1400,45 @@
   // running 置 refining=true；stage="all" 是整体完成信号，done/failed 都要重新拉取 refined 并复位。
   $effect(() => {
     const forId = id;
-    let unlisten: (() => void) | null = null;
-    let disposed = false;
+    refineStatusKnown = false;
+    // 订阅 → 监听就位后补问 → 迟到快照让路 → 切走解绑:时序见 $lib/jobWatch。
     // 只有**终态**事件能作废补问的快照:补问可能比终态事件还晚落地(后端先发
     // all/done、再把 id 从在跑集合里摘掉),晚到的 true 会把页面永久钉在"整理中"。
     // 反过来,filter/recluster/llm 这些中间事件不能作废快照——它们都不置
     // refining=true,执行体没配全时后面也不会再有 running 事件,作废了横幅就会在
     // 整理还没结束时冒出来(Codex P2 两轮)。
-    let sawTerminal = false;
-    refineStatusKnown = false;
-    onRefine((e) => {
-      if (e.note_id !== forId) return;
-      if (e.state === "running") {
-        refining = true;
-        refineRunFailed = false;
-      }
-      if (e.stage === "all" && (e.state === "done" || e.state === "failed")) {
-        sawTerminal = true;
-        refineRunFailed = e.state === "failed";
-        // refining 要等新稿到手再落:进页时缓存的那份 refined 还是跑之前的
-        // (stages.llm = "off"),先落 refining 会让「这场没做 AI 整理」闪一下、
-        // 还能被点到重跑。loadRefined 自己吞异常,不会留下未处理的 rejection。
-        void refinedSync.load(forId).finally(() => {
-          if (forId === id) refining = false;
-        });
-      }
-    })
-      .then((u) => {
-        if (disposed) u();
-        else unlisten = u;
-        // 补问在途状态:running 事件是易失的,进页晚了就再也收不到,只看事件会把
-        // "正在整理"误判成"没在整理"——而整理途中 stages.llm 本就是 "off",误判会让
-        // 「这场没做 AI 整理」的横幅在整理途中冒出来(Codex P2)。
-        // 必须等监听挂到位之后再问,否则查询与订阅两头并发,状态可能在缝隙里漏掉。
-        return noteRefining(forId);
-      })
-      .then(async (r) => {
-        if (disposed || forId !== id || sawTerminal) return;
+    const isTerminal = (e: { stage: string; state: string }) =>
+      e.stage === "all" && (e.state === "done" || e.state === "failed");
+    return watchJob({
+      subscribe: onRefine,
+      matches: (e) => e.note_id === forId,
+      invalidates: isTerminal,
+      onEvent: (e) => {
+        if (e.state === "running") {
+          refining = true;
+          refineRunFailed = false;
+        }
+        if (isTerminal(e)) {
+          refineRunFailed = e.state === "failed";
+          // refining 要等新稿到手再落:进页时缓存的那份 refined 还是跑之前的
+          // (stages.llm = "off"),先落 refining 会让「这场没做 AI 整理」闪一下、
+          // 还能被点到重跑。load 自己吞异常,不会留下未处理的 rejection。
+          void refinedSync.load(forId).finally(() => {
+            if (forId === id) refining = false;
+          });
+        }
+      },
+      // 补问在途状态:running 事件是易失的,进页晚了就再也收不到,只看事件会把
+      // "正在整理"误判成"没在整理"——而整理途中 stages.llm 本就是 "off",误判会让
+      // 「这场没做 AI 整理」的横幅在整理途中冒出来(Codex P2)。
+      snapshot: () => noteRefining(forId),
+      onSnapshot: async (r, live) => {
+        if (forId !== id) return;
         if (!r) {
-          // 快照说"没在跑":这一场可能恰好在初次 getRefined 之后、监听装好之前
-          // 跑完,那条终态事件谁也没接到,缓存里还是 stages.llm="off" 的旧稿——
-          // 直接放行会让整理成功的笔记显示「这场没做 AI 整理」(Codex P2 八轮)。
-          // 重取一次再放行(refineStatusKnown 在下面的 finally 里置,会等这一步)。
+          // 快照说"没在跑":这一场可能恰好在初次取稿之后、监听装好之前跑完,那条
+          // 终态事件谁也没接到,缓存里还是 stages.llm="off" 的旧稿——直接放行会让
+          // 整理成功的笔记显示「这场没做 AI 整理」(Codex P2 八轮)。重取一次再放行
+          // (refineStatusKnown 在 onSettled 里置,会等这一步)。
           await refinedSync.load(forId);
           return;
         }
@@ -1448,34 +1448,28 @@
         // (摘除本身不发前端事件),页面会永久卡在"整理中"(Codex P2 五轮)。
         // 因此隔几秒复核一次,直到后端说不在跑或终态事件到达。
         void (async () => {
-          while (!disposed && forId === id && !sawTerminal) {
+          while (live() && forId === id) {
             await new Promise((done) => setTimeout(done, REFINE_RECHECK_MS));
-            if (disposed || forId !== id || sawTerminal) return;
+            if (!live() || forId !== id) return;
             try {
               if (await noteRefining(forId)) continue;
-              // 走到这里说明终态事件被错过了,refined 还是跑之前那份
-              // (stages.llm 仍是 "off")。不重取的话,整理明明成功了,页面
-              // 却继续显示「这场没做 AI 整理」并邀请再跑一次(Codex P2 六轮)。
-              // refining 等新稿到手再落,免得中间闪一下(七轮);await 在 try 内,
-              // 失败由下面的 catch 收掉,不留未处理的 rejection(八轮)。
+              // 走到这里说明终态事件被错过了,refined 还是跑之前那份。不重取的话,
+              // 整理明明成功了,页面却继续显示「这场没做 AI 整理」(Codex P2 六轮)。
+              // refining 等新稿到手再落,免得中间闪一下(七轮)。
               await refinedSync.load(forId);
-              if (!disposed && forId === id) refining = false;
+              if (live() && forId === id) refining = false;
               return;
             } catch {
               return; // 查不动就不再复核:事件通道仍在,不至于全无出路
             }
           }
         })();
-      })
-      .catch(() => {})
+      },
       // 无论成败都算"已确定":查询失败时按事件为准,总不能永远不提示。
-      .finally(() => {
-        if (!disposed && forId === id) refineStatusKnown = true;
-      });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
+      onSettled: () => {
+        if (forId === id) refineStatusKnown = true;
+      },
+    });
   });
 
   // 文件重转写(三期):成品轨入口可用性(取失败按"未知原因"置灰,不悄悄放行)。
@@ -1509,89 +1503,66 @@
   // 不会再被这条迟到快照覆盖成"重转写中"后无人纠正。
   $effect(() => {
     const forId = id;
-    let unlisten: (() => void) | null = null;
-    let disposed = false;
-    onRetranscribe((e) => {
-      if (e.note_id !== forId) return;
-      retransEventSeen = true;
-      if (e.state === "running") {
-        retranscribing = true;
-        retransStage = e.stage;
-        return;
-      }
-      retranscribing = false;
-      retransConfirm = false;
-      if (e.state === "ok") {
-        refresh();
-        recording.bumpNotes();
-      } else if (e.message) {
-        retransErr = t("notes.retrans.failed", { e: e.message });
-      }
-    }).then((u) => {
-      if (disposed) {
-        u();
-        return;
-      }
-      unlisten = u;
-      // 监听器已挂载完成，此后任何终态事件都保证被上面的 handler 收到——现在才
-      // 发起回填查询，杜绝"快照说 running，终态事件却在监听器就位前漏发"的窗口。
-      retranscribeStatus()
-        .then((s) => {
-          if (disposed || forId !== id) return;
-          // 此刻已经收到过 onRetranscribe 事件（可能已经是终态 ok/error）——事件
-          // 通道已经接管了 retranscribing 的真相，这条迟到的快照不再可信，让路。
-          if (retransEventSeen) return;
-          if (s && s.note_id === forId) {
-            retranscribing = true;
-            retransStage = s.stage;
-          }
-        })
-        .catch(() => {});
+    return watchJob({
+      subscribe: onRetranscribe,
+      matches: (e) => e.note_id === forId,
+      // 快照作废看页面自己的 retransEventSeen(startRetranscribe 会清它),不看组件内旗。
+      invalidates: () => false,
+      onEvent: (e) => {
+        retransEventSeen = true;
+        if (e.state === "running") {
+          retranscribing = true;
+          retransStage = e.stage;
+          return;
+        }
+        retranscribing = false;
+        retransConfirm = false;
+        if (e.state === "ok") {
+          refresh();
+          recording.bumpNotes();
+        } else if (e.message) {
+          retransErr = t("notes.retrans.failed", { e: e.message });
+        }
+      },
+      snapshot: () => retranscribeStatus(),
+      onSnapshot: (s) => {
+        if (forId !== id) return;
+        // 此刻已经收到过重转写事件(可能已经是终态)——事件通道已经接管了
+        // retranscribing 的真相,这条迟到的快照不再可信,让路。
+        if (retransEventSeen) return;
+        if (s && s.note_id === forId) {
+          retranscribing = true;
+          retransStage = s.stage;
+        }
+      },
     });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
   });
 
   // 补生成进度事件(二期):订阅→回填的顺序纪律与上方重转写 effect 相同(Fix 3),
   // 回填查询必须等 listen() resolve 之后发起,终态事件才不会漏在监听器就位前。
   $effect(() => {
     const forId = id;
-    let unlisten: (() => void) | null = null;
-    let disposed = false;
-    let regenEventSeen = false;
-    onMixedRegen((e) => {
-      if (e.note_id !== forId) return;
-      regenEventSeen = true;
-      if (e.state === "running") {
-        regenStage = e.stage;
-        return;
-      }
-      regenStage = null;
-      if (e.state === "ok") {
-        // 借 tracksVersion 触发 mixedPlaybackInfo 重拉(同一依赖组)。
-        tracksVersion++;
-      } else if (e.message) {
-        regenErr = t("notes.mix.genFailed", { message: e.message });
-      }
-    }).then((u) => {
-      if (disposed) {
-        u();
-        return;
-      }
-      unlisten = u;
-      mixedRegenStatus()
-        .then((s) => {
-          if (disposed || forId !== id || regenEventSeen) return;
-          if (s === forId) regenStage = "mix";
-        })
-        .catch(() => {});
+    return watchJob({
+      subscribe: onMixedRegen,
+      matches: (e) => e.note_id === forId,
+      onEvent: (e) => {
+        if (e.state === "running") {
+          regenStage = e.stage;
+          return;
+        }
+        regenStage = null;
+        if (e.state === "ok") {
+          // 借 tracksVersion 触发 mixedPlaybackInfo 重拉(同一依赖组)。
+          tracksVersion++;
+        } else if (e.message) {
+          regenErr = t("notes.mix.genFailed", { message: e.message });
+        }
+      },
+      snapshot: () => mixedRegenStatus(),
+      onSnapshot: (s) => {
+        if (forId === id && s === forId) regenStage = "mix";
+      },
     });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
   });
 
   async function startRegen() {
@@ -1608,35 +1579,25 @@
   // 后端自动改名(LLM 主题标题):只改标题字段,不整页 refresh(编辑中也安全)。
   $effect(() => {
     const forId = id;
-    let un: (() => void) | null = null;
-    let disposed = false;
-    onNoteRenamed((e) => {
-      if (e.note_id === forId && note) note.meta.title = e.title;
-    }).then((u) => {
-      if (disposed) u();
-      else un = u;
+    return watchJob({
+      subscribe: onNoteRenamed,
+      matches: (e) => e.note_id === forId,
+      onEvent: (e) => {
+        if (note) note.meta.title = e.title;
+      },
     });
-    return () => {
-      disposed = true;
-      un?.();
-    };
   });
   // 跨轨时基纠正完成:段的时间戳(以及 mic/system 的行序)在后端已换成新时基,整页重拉。
   // 装载音轨后才算得出,故前端不会主动重拉;编辑中跳过,等编辑结束的刷新 effect 带上。
   $effect(() => {
     const forId = id;
-    let un: (() => void) | null = null;
-    let disposed = false;
-    onNoteRealigned((e) => {
-      if (e.note_id === forId && !editing) refresh();
-    }).then((u) => {
-      if (disposed) u();
-      else un = u;
+    return watchJob({
+      subscribe: onNoteRealigned,
+      matches: (e) => e.note_id === forId,
+      onEvent: () => {
+        if (!editing) refresh();
+      },
     });
-    return () => {
-      disposed = true;
-      un?.();
-    };
   });
 
   // 刷新：标题重命名进行中跳过（编辑态是 effect 依赖，编辑结束会自动重跑并刷新）。
