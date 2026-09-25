@@ -181,4 +181,36 @@ describe("watchJob", () => {
     await flush();
     expect(settled).toBe(0);
   });
+
+  it("切走之后订阅才失败:不报已确定", async () => {
+    const src = source();
+    let settled = 0;
+    const dispose = watchJob<Ev, boolean>({
+      subscribe: src.subscribe,
+      onEvent: () => {},
+      snapshot: async () => true,
+      onSettled: () => (settled += 1),
+    });
+    dispose();
+    src.fail();
+    await flush();
+    expect(settled).toBe(0);
+  });
+
+  it("onSnapshot 抛异常:仍报已确定", async () => {
+    const src = source();
+    let settled = 0;
+    watchJob<Ev, boolean>({
+      subscribe: src.subscribe,
+      onEvent: () => {},
+      snapshot: async () => true,
+      onSnapshot: async () => {
+        throw new Error("reload failed");
+      },
+      onSettled: () => (settled += 1),
+    });
+    src.attach();
+    await flush();
+    expect(settled).toBe(1);
+  });
 });

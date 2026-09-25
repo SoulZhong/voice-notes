@@ -1208,14 +1208,16 @@
   /** 转码完成计数:transcode_done 事件驱动音轨重拉(停录后立即点播放的竞态窗口:
       转码完成瞬间源 WAV 被删,播放器握着失效引用会无声播放,此处自动切到 m4a)。 */
   let tracksVersion = $state(0);
-  $effect(() => {
-    const forId = id;
-    return watchJob({
+  // 整页只装一次监听,回调里才读当前 id(不让 effect 追踪 id):换笔记就重新订阅的话,
+  // 重新 listen 的 IPC 空窗里若恰好发出新笔记的 transcode_done,就会漏掉——正是本
+  // effect 要防的无声播放竞态。
+  $effect(() =>
+    watchJob({
       subscribe: onTranscodeDone,
-      matches: (e) => e.note_id === forId,
+      matches: (e) => e.note_id === id,
       onEvent: () => tracksVersion++,
-    });
-  });
+    }),
+  );
 
   $effect(() => {
     const forId = id;

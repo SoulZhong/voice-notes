@@ -59,8 +59,9 @@ export function watchJob<E, S = unknown>(opts: JobWatchOptions<E, S>): () => voi
       if (!live()) return;
       await opts.onSnapshot?.(s, live);
     })
-    .catch(() => {
-      /* 订阅或补问失败:以事件为准,不打断页面 */
+    .catch((e) => {
+      // 订阅或补问失败:以事件为准,不打断页面;留一行日志供排障。
+      console.warn("watchJob:", e);
     })
     .finally(() => {
       if (!disposed && opts.snapshot) opts.onSettled?.();
