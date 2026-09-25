@@ -5,8 +5,13 @@
 //! 与 notes.rs 同一套原子写/静态锁/损坏容忍哲学,但库缺失/损坏绝不能挡住录制,
 //! 因此 load 侧永不返回 Err——降级为空库 + eprintln。
 //!
-//! lib.rs 已接线:种子注入(load_voiceprint_seeds)、停止时 upsert_from_session、
-//! 以及 list/rename/merge/delete 四个 Tauri command,全部公开 API 均被消费。
+//! 写库只在用户确认时发生(2026-08-27「确认才入库」):指认/命名走
+//! append_confirmed_sample + reinforce_feedback,不再有停录自动入库。
+//! `upsert_from_session` 一族已无生产调用方,仅作测试夹具播种用。
+//!
+//! 模型空间:库只接受与 `embedding_model` 同空间的向量(`space_ok`)。调用方的嵌入器
+//! 一律经 lib.rs 的 `open_speaker_embedder` 建出、带着自己的空间标签
+//! (`TaggedEmbedder`),标签不再由调用方另读设置。
 
 use crate::diar::registry::ClusterSnapshot;
 use serde::{Deserialize, Serialize};

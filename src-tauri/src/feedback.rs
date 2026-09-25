@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::diar::SpeakerEmbedder;
+use crate::diar::{SpeakerEmbedder, TaggedEmbedder};
 use crate::store::SegmentRecord;
 
 /// 单段最短 1.5s:与 registry::MIN_CENTROID_UPDATE_SAMPLES(24_000 采样)同口径,
@@ -376,9 +376,9 @@ pub fn reinforce_person(
     filter: &SegFilter,
     person_id: &str,
     vp: &crate::store::VoiceprintStore,
-    library_model: &str,
-    expected_model: &str,
-    embedder: &mut dyn SpeakerEmbedder,
+    // 空间标签取自嵌入器本身(建它时的那份设置快照),不另传:标签与权重分开传的话,
+    // 调用方两处各读一次设置就能让二者分叉(codex review 实现轮 P1)。
+    embedder: &mut TaggedEmbedder,
     now: &str,
     op_id: Option<&str>,
     needs_rebuild: &mut bool,
@@ -387,7 +387,8 @@ pub fn reinforce_person(
     authorized_quarantined: bool,
 ) -> anyhow::Result<ReinforceResult> {
     // 门禁:与种子注入同一严格语义(lib.rs 模型门禁)。
-    if library_model != expected_model {
+    let expected_model = embedder.model().to_string();
+    if vp.load().embedding_model != expected_model {
         return Ok(ReinforceResult::SkippedModelMismatch);
     }
     // 声纹断喂(2026-08-23 场景识别一期 A):与 system 活动重叠 ≥80% 的 mic 段是
@@ -521,9 +522,9 @@ pub fn reinforce_person(
     // 空间门禁在写入这一侧再判一次:上面那道门禁是**开工前**判的,而解码 + 逐段嵌入
     // 本身就要几十秒到几分钟,期间足够用户切一次模型。返回 None = 库已经不是这个空间。
     let applied_opt = if authorized_quarantined {
-        vp.reinforce_feedback_authorized(person_id, &tuples, now, expected_model)?
+        vp.reinforce_feedback_authorized(person_id, &tuples, now, &expected_model)?
     } else {
-        vp.reinforce_feedback(person_id, &tuples, now, expected_model)?
+        vp.reinforce_feedback(person_id, &tuples, now, &expected_model)?
     };
     let Some(applied) = applied_opt else {
         // **必须清掉刚写下的占位账**:它 complete=false,留着会让这个 scope 被永久判成
@@ -554,7 +555,7 @@ pub fn reinforce_person(
             person_id,
             &applied.person_before,
             &applied.person_after,
-            expected_model,
+            &expected_model,
         ) {
             Ok(crate::store::RestoreOutcome::Restored) => true,
             Ok(crate::store::RestoreOutcome::RestoredNeedsRebuild) => {
@@ -613,13 +614,13 @@ mod tests {
 
         // 先写一条别的作用域、别的 op 的账(同一批 seq)
         let other = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
-        let mut e1 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        reinforce_person(note.path(), &segs, &other, &pid, &store, &model, &model, &mut e1, "t1", Some("iop-other"), &mut false, false)
+        let e1 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        reinforce_person(note.path(), &segs, &other, &pid, &store, &mut TaggedEmbedder::new(model.clone(), Box::new(e1)), "t1", Some("iop-other"), &mut false, false)
             .unwrap();
         // 再写我们要撤的那条
         let mine = SegFilter::Seqs(seqs.clone());
-        let mut e2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        reinforce_person(note.path(), &segs, &mine, &pid, &store, &model, &model, &mut e2, "t2", Some("iop-mine"), &mut false, false)
+        let e2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        reinforce_person(note.path(), &segs, &mine, &pid, &store, &mut TaggedEmbedder::new(model.clone(), Box::new(e2)), "t2", Some("iop-mine"), &mut false, false)
             .unwrap();
 
         // 必须撤到 iop-mine 那条,而不是被 iop-other 挡住报 superseded
@@ -789,8 +790,8 @@ mod tests {
         let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
         let model = store.load().embedding_model.clone();
         // 只应嵌入 1 段(独立那段):Mock 只备一份向量,多取会 panic/Err。
-        let mut emb = MockEmbedder::new(vec![Ok(unit(1))]);
-        let r = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1", None, &mut false, false).unwrap();
+        let emb = MockEmbedder::new(vec![Ok(unit(1))]);
+        let r = reinforce_person(note.path(), &segs, &filter, &pid, &store, &mut TaggedEmbedder::new(model.clone(), Box::new(emb)), "t1", None, &mut false, false).unwrap();
         assert!(matches!(r, ReinforceResult::Applied { .. }), "{r:?}");
     }
 
@@ -804,13 +805,13 @@ mod tests {
         let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
         let model = store.load().embedding_model.clone();
 
-        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        let r1 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1", None, &mut false, false).unwrap();
+        let emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        let r1 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &mut TaggedEmbedder::new(model.clone(), Box::new(emb)), "t1", None, &mut false, false).unwrap();
         assert!(matches!(r1, ReinforceResult::Applied { .. }), "{r1:?}");
         let total_after_first = store.load().people[&pid].total_ms;
 
-        let mut emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        let r2 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb2, "t2", None, &mut false, false).unwrap();
+        let emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        let r2 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &mut TaggedEmbedder::new(model.clone(), Box::new(emb2)), "t2", None, &mut false, false).unwrap();
         assert_eq!(r2, ReinforceResult::SkippedAlreadyDone, "同段集合同人重复指认不得重复加权");
         assert_eq!(store.load().people[&pid].total_ms, total_after_first);
     }
@@ -856,10 +857,10 @@ mod tests {
         let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
 
         // ① 先给 A 灌一次(账本条目标签 = campplus)。
-        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        let emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
         let mut nr0 = false;
         reinforce_person(
-            note.path(), &segs, &filter, &pid_a, &store, MODEL, MODEL, &mut emb, "t1", None, &mut nr0, false)
+            note.path(), &segs, &filter, &pid_a, &store, &mut TaggedEmbedder::new(MODEL, Box::new(emb)), "t1", None, &mut nr0, false)
         .unwrap();
         assert!(!nr0);
 
@@ -868,11 +869,11 @@ mod tests {
 
         // ③ 纠错改指 B,但嵌入器一段都算不出来 → 本次回灌 SkippedNoSegments。
         //    还原 A 时因跨空间清空了它的质心,重建标志必须仍然是 true。
-        let mut emb2 = MockEmbedder::new(vec![Err(anyhow::anyhow!("嵌入失败")), Err(anyhow::anyhow!("嵌入失败"))]);
+        let emb2 = MockEmbedder::new(vec![Err(anyhow::anyhow!("嵌入失败")), Err(anyhow::anyhow!("嵌入失败"))]);
         let mut needs_rebuild = false;
         let r = reinforce_person(
-            note.path(), &segs, &filter, &pid_b, &store, "eres2netv2", "eres2netv2",
-            &mut emb2, "t2", None, &mut needs_rebuild, false)
+            note.path(), &segs, &filter, &pid_b, &store,
+            &mut TaggedEmbedder::new("eres2netv2", Box::new(emb2)), "t2", None, &mut needs_rebuild, false)
         .unwrap();
         assert_eq!(r, ReinforceResult::SkippedNoSegments, "本次回灌确实短路了");
         assert!(needs_rebuild, "跨空间还原清空了 A 的质心,重建需求不得随短路丢失");
@@ -909,14 +910,14 @@ mod tests {
         let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
         let model = store.load().embedding_model.clone();
 
-        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        reinforce_person(note.path(), &segs, &filter, &pid_a, &store, &model, &model, &mut emb, "t1", None, &mut false, false).unwrap();
+        let emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        reinforce_person(note.path(), &segs, &filter, &pid_a, &store, &mut TaggedEmbedder::new(model.clone(), Box::new(emb)), "t1", None, &mut false, false).unwrap();
         let a_total_polluted = store.load().people[&pid_a].total_ms;
         assert!(a_total_polluted > 12_000);
 
         // 纠错:同段集合改指 B → A 的上次回灌应被还原(未被动过),B 获得回灌。
-        let mut emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        let r = reinforce_person(note.path(), &segs, &filter, &pid_b, &store, &model, &model, &mut emb2, "t2", None, &mut false, false).unwrap();
+        let emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        let r = reinforce_person(note.path(), &segs, &filter, &pid_b, &store, &mut TaggedEmbedder::new(model.clone(), Box::new(emb2)), "t2", None, &mut false, false).unwrap();
         assert!(matches!(r, ReinforceResult::Applied { .. }), "{r:?}");
         assert_eq!(store.load().people[&pid_a].total_ms, 12_000, "A 的回灌应还原");
         assert!(store.load().people[&pid_b].total_ms > 12_000, "B 获得回灌");
@@ -929,15 +930,15 @@ mod tests {
         let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
         let segs = vec![seg(0, "mic", 0, 2000)];
         let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
-        let mut emb = MockEmbedder::new(vec![Ok(unit(0))]);
+        let emb = MockEmbedder::new(vec![Ok(unit(0))]);
         // 门禁:严格相等,库侧默认模型 vs 期望 "eres2netv2" → 跳过。
-        let r = reinforce_person(note.path(), &segs, &filter, &pid, &store, "campplus", "eres2netv2", &mut emb, "t", None, &mut false, false)
+        let r = reinforce_person(note.path(), &segs, &filter, &pid, &store, &mut TaggedEmbedder::new("eres2netv2", Box::new(emb)), "t", None, &mut false, false)
             .unwrap();
         assert_eq!(r, ReinforceResult::SkippedModelMismatch);
         // 悬空人物:在解码/嵌入之前就短路。
         write_wav(&note.path().join("mic.wav"), 2000);
         let model = store.load().embedding_model.clone();
-        let r2 = reinforce_person(note.path(), &segs, &filter, "P999", &store, &model, &model, &mut emb, "t", None, &mut false, false).unwrap();
+        let r2 = reinforce_person(note.path(), &segs, &filter, "P999", &store, &mut TaggedEmbedder::new(model.clone(), Box::new(MockEmbedder::new(vec![Ok(unit(0))]))), "t", None, &mut false, false).unwrap();
         assert_eq!(r2, ReinforceResult::SkippedUnknownPerson);
     }
     #[test]
@@ -966,8 +967,8 @@ mod tests {
         let model = store.load().embedding_model.clone();
         let seqs: BTreeSet<u64> = [0u64, 1].into_iter().collect();
 
-        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1", Some("iop-9"), &mut false, false)
+        let emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        reinforce_person(note.path(), &segs, &filter, &pid, &store, &mut TaggedEmbedder::new(model.clone(), Box::new(emb)), "t1", Some("iop-9"), &mut false, false)
             .unwrap();
         // 错 op id:superseded,不撤。
         assert_eq!(
