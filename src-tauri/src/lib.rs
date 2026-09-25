@@ -259,11 +259,8 @@ fn should_enqueue_transcode(note_dir: &std::path::Path) -> bool {
 /// SpeakerRegistry::with_seeds 优先命中，免得同一人在新会话里从零建簇。
 /// 库路径不可用/加载损坏 → 一律降级为空种子（load 本身已对损坏文件降级，这里只再兜
 /// app_data_dir 解析失败一层）：声纹库是增值功能，绝不能因为它挡住录制。
-fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedCluster> {
-    load_voiceprint_seeds_for(app, &current_speaker_model(app))
-}
-
-/// 同上,但门禁比对的是**调用方指定的**模型标签。
+///
+/// 门禁比对的是**调用方指定的**模型标签。
 ///
 /// 凡是"先建嵌入器、再取种子"的路径都必须用这个:两处各读一次设置的话,用户在中间
 /// 切了模型就会拿 B 算出来的向量去比 A 空间的种子质心——门禁看的是新设置,已经放行了
@@ -830,7 +827,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 let note = store::NoteStore::new(root).load(&note_id)?;
                 // 标签、权重、种子门禁三者必须出自同一次设置读取(codex review 实现轮五 P1)。
                 let speaker_tag = current_speaker_model(&app);
-                let mut embedder = match diar::SherpaEmbedder::new(&speaker_model_path_for(&speaker_tag)) {
+                let mut embedder = match open_speaker_embedder_for(&speaker_tag) {
                     Ok(e) => Some(e),
                     Err(e) => {
                         eprintln!("refine: 声纹模型不可用，跳过重聚类: {e}");
@@ -1526,22 +1523,23 @@ fn default_download_ids(asr_model: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// 当前声纹模型文件路径(按设置选型;调用点均为低频路径,现场读一次 settings)。
-fn speaker_model_path(app: &AppHandle) -> PathBuf {
-    let model = app
-        .path()
-        .app_data_dir()
-        .map(|d| settings::load(&d).speaker_model)
-        .unwrap_or_default();
-    speaker_model_path_for(&model)
-}
-
-/// 按**给定**模型名取权重路径。重建路径必须用它而不是 speaker_model_path:
-/// 后者自己再读一次设置,于是"库标签写成 A"与"实际用哪个权重嵌入"来自两次独立读取,
-/// 中间用户切一次模型就能让二者分叉——最终把 B 空间的向量写进标着 A 的库
-/// (codex review 二轮 P1#1)。
+/// 按**给定**模型名取权重路径。只给 [`open_speaker_embedder_for`] 与录制期常驻槽用:
+/// 权重路径与空间标签必须出自同一次设置读取,否则中间用户切一次模型就能让二者分叉
+/// ——最终把 B 空间的向量写进标着 A 的库(codex review 二轮 P1#1)。
 fn speaker_model_path_for(model: &str) -> PathBuf {
     models::root().join(models::speaker_model_file(model))
+}
+
+/// 声纹嵌入器的建法:读**一次**设置,标签与权重出自同一份快照,装进 `TaggedEmbedder`。
+/// 下游门禁与写库一律从 `embedder.model()` 取空间标签,不再各自读设置。
+fn open_speaker_embedder(app: &AppHandle) -> anyhow::Result<diar::TaggedEmbedder> {
+    open_speaker_embedder_for(&current_speaker_model(app))
+}
+
+/// 同上,标签由调用方给(它手里已有一份设置快照,例如同一快照还要决定种子门禁)。
+fn open_speaker_embedder_for(tag: &str) -> anyhow::Result<diar::TaggedEmbedder> {
+    let e = diar::SherpaEmbedder::new(&speaker_model_path_for(tag))?;
+    Ok(diar::TaggedEmbedder::new(tag, Box::new(e)))
 }
 
 fn new_silero(vad_path: &std::path::Path) -> anyhow::Result<Box<dyn Segmenter>> {
@@ -3713,7 +3711,7 @@ fn run_retranscribe_once(
     // 标签、权重、种子门禁同源(codex review 实现轮五 P1)。
     let speaker_tag = current_speaker_model(app);
     let mut embedder: Option<Box<dyn diar::SpeakerEmbedder>> =
-        match diar::SherpaEmbedder::new(&speaker_model_path_for(&speaker_tag)) {
+        match open_speaker_embedder_for(&speaker_tag) {
             Ok(e) => Some(Box::new(e)),
             Err(e) => {
                 eprintln!("重转写:声纹模型不可用,归属降级为纯继承: {e}");
@@ -4773,9 +4771,7 @@ fn spawn_confirmed_sample(
             }
             if reinforce {
                 // 确认段回灌质心(模型门禁/账本/黑名单照过)。
-                let expected = current_speaker_model(&app);
-                let library_model = vp_store.load().embedding_model.clone();
-                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&expected))?;
+                let mut embedder = open_speaker_embedder(&app)?;
                 let mut needs_rebuild = false;
                 let now = chrono::Local::now().to_rfc3339();
                 let seqs: std::collections::BTreeSet<u64> = picks.iter().map(|s| s.seq).collect();
@@ -4785,8 +4781,6 @@ fn spawn_confirmed_sample(
                     &feedback::SegFilter::Seqs(seqs),
                     &person_id,
                     &vp_store,
-                    &library_model,
-                    &expected,
                     &mut embedder,
                     &now,
                     None,
@@ -5329,9 +5323,9 @@ fn run_baseline_reset(
         }
     }
     let r = (|| -> Result<(), String> {
-        let tag = current_speaker_model(app);
-        let mut e = diar::SherpaEmbedder::new(&speaker_model_path_for(&tag))
+        let mut e = open_speaker_embedder(app)
             .map_err(|e| tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e))?;
+        let tag = e.model().to_string();
         for pid in &op.affected_persons {
             vp_store.rebuild_person_from_samples(pid, &mut e, &tag).map_err(|e| e.to_string())?;
         }
@@ -5521,9 +5515,9 @@ async fn suggest_split_groups(app: AppHandle, op_id: String) -> Result<SplitSugg
         }
         let _fb = FEEDBACK_GATE.lock().unwrap();
         // 标签、权重、种子同源(同一次设置读取)。
-        let tag = current_speaker_model(&app);
-        let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&tag))
+        let mut embedder = open_speaker_embedder(&app)
             .map_err(|e| tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e))?;
+        let tag = embedder.model().to_string();
         // 进度事件:大簇逐段嵌入要数分钟,前端横幅靠它区分「在算」与「卡死」。
         // 每 10 段发一次 + 首尾各一次,避免事件风暴。
         let note_id_ev = op.note_id.clone();
@@ -5862,9 +5856,7 @@ async fn commit_split(
                 op.plan_groups.iter().filter(|g| g.dest_kind == "person").collect();
             if !person_groups.is_empty() {
                 let _fb = FEEDBACK_GATE.lock().unwrap();
-                let expected = current_speaker_model(&app);
-                let library_model = vp_store.load().embedding_model.clone();
-                match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
+                match open_speaker_embedder(&app) {
                     Ok(mut embedder) => {
                         let note = nstore.load(&op.note_id).map_err(|e| e.to_string())?;
                         for g in person_groups {
@@ -5877,8 +5869,6 @@ async fn commit_split(
                                 &feedback::SegFilter::Seqs(seqs),
                                 pid,
                                 &vp_store,
-                                &library_model,
-                                &expected,
                                 &mut embedder,
                                 &now,
                                 Some(&op.op_id),
@@ -6393,7 +6383,7 @@ fn rebuild_once(
         if tag.is_empty() {
             return false;
         }
-        match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
+        match open_speaker_embedder_for(&tag) {
             Ok(mut e) => {
                 // 加载模型可能耗时;这中间用户完全可能又切了一次。此时这份嵌入器
                 // 已经不是当前选型,写库与入常驻槽都会把错的东西留下来。
@@ -6421,7 +6411,7 @@ fn rebuild_once(
                 // 进去,下一场录制整场用错空间嵌入。
                 if current_speaker_model(&app2) == tag {
                     // 标签就是这次重建用的 tag,与权重路径同源(见 rebuild_once 开头)。
-                    stash_model(&cache, Some(Box::new(diar::TaggedEmbedder::new(&tag, Box::new(e)))));
+                    stash_model(&cache, Some(Box::new(e)));
                 }
                 return ok;
             }
@@ -6533,24 +6523,13 @@ fn spawn_feedback(
                 }
                 feedback::FeedbackAction::Reinforce => {
                     let note_dir = notes_dir(&app)?.join(&note_id);
-                    let expected = app
-                        .path()
-                        .app_data_dir()
-                        .map(|d| settings::load(&d).speaker_model)
-                        .unwrap_or_default();
-                    let library_model = vp.load().embedding_model.clone();
-                    // **标签与权重必须来自同一份快照**:用 speaker_model_path(&app) 会
-                    // 再读一次设置,切换发生在两次读取之间时,就会用 B 的权重算、以 A 的
-                    // 标签写库,而库若仍是 A,门禁会错误放行(codex review 实现轮 P1)。
-                    let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&expected))?;
+                    let mut embedder = open_speaker_embedder(&app)?;
                     let r = feedback::reinforce_person(
                         &note_dir,
                         &segs,
                         &filter,
                         &target,
                         &vp,
-                        &library_model,
-                        &expected,
                         &mut embedder,
                         &now,
                         None,
@@ -7395,7 +7374,7 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
                 }
                 // 权重取自决定 acoustic_enabled 的那份设置快照(s),不重读:重读的话
                 // 中途切模型会拿 B 的向量去比快照里 A 的质心(codex review 实现轮五 P1)。
-                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&s.speaker_model))?;
+                let mut embedder = open_speaker_embedder_for(&s.speaker_model)?;
                 for (speaker, seqs) in &members {
                     let segs: Vec<&store::SegmentRecord> =
                         note.segments.iter().filter(|sg| seqs.contains(&sg.seq)).collect();
@@ -7982,9 +7961,7 @@ fn spawn_ack_reinforce(
                     eprintln!("回执确认回灌放弃:说话人现关联({cur:?})已不是 {target}");
                     return Ok(());
                 }
-                let expected = current_speaker_model(&app);
-                let library_model = vp_store.load().embedding_model.clone();
-                match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
+                match open_speaker_embedder(&app) {
                     Ok(mut embedder) => {
                         let mut needs_rebuild = false;
                         let r = feedback::reinforce_person(
@@ -7993,8 +7970,6 @@ fn spawn_ack_reinforce(
                             &feedback::SegFilter::Seqs(seqs.clone()),
                             &target,
                             &vp_store,
-                            &library_model,
-                            &expected,
                             &mut embedder,
                             &now,
                             Some(&op_id),
@@ -9337,8 +9312,8 @@ fn rebuild_person_blocking(app: &AppHandle, id: &str) -> Result<(), String> {
     let cached = cache.lock().unwrap().take().filter(|te| te.model() == tag);
     let (mut embedder, from_cache): (Box<dyn diar::SpeakerEmbedder>, bool) = match cached {
         Some(te) => (te.into_inner(), true),
-        None => match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
-            Ok(e) => (Box::new(e), false),
+        None => match open_speaker_embedder_for(&tag) {
+            Ok(e) => (e.into_inner(), false),
             Err(e) => {
                 let _ctl = REBUILD_CTL.lock().unwrap();
                 REBUILD_RUNNING.store(false, Ordering::SeqCst);
@@ -10232,9 +10207,8 @@ fn preload_models(
             // 标签与权重路径必须出自**同一次**设置读取。分两次读的话,用户在两次之间
             // 切了模型就会造出"A 权重、B 标签"的实例;它被 B 会话取走后,写侧门禁看
             // 标签放行,A 空间的向量就进了 B 库(codex review 实现轮二 P1)。
-            let tag = current_speaker_model(&app);
-            match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
-                Ok(e) => *eslot = Some(Box::new(diar::TaggedEmbedder::new(tag, Box::new(e)))),
+            match open_speaker_embedder(&app) {
+                Ok(e) => *eslot = Some(Box::new(e)),
                 Err(e) => {
                     eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}");
                     telemetry::report_error(

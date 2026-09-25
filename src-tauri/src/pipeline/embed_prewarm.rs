@@ -84,7 +84,7 @@ pub fn drain(note_dir: &std::path::Path, timeout: Duration) {
 
 fn worker(app: tauri::AppHandle, rx: crossbeam_channel::Receiver<Msg>) {
     // (模型标签, 嵌入器):标签变了重建。模型加载贵,worker 生命周期内复用。
-    let mut embedder: Option<(String, crate::diar::SherpaEmbedder)> = None;
+    let mut embedder: Option<crate::diar::TaggedEmbedder> = None;
     // 待写批:按 (note_dir, model) 攒;正常一场只有一个键。
     let mut pending: HashMap<(PathBuf, String), Vec<EmbedCacheEntry>> = HashMap::new();
     // 音频未落齐推迟重试的段:(job, 已试次数, 到期时刻)。
@@ -170,7 +170,7 @@ fn handle(
     app: &tauri::AppHandle,
     job: Job,
     tries: u8,
-    embedder: &mut Option<(String, crate::diar::SherpaEmbedder)>,
+    embedder: &mut Option<crate::diar::TaggedEmbedder>,
     pending: &mut HashMap<(PathBuf, String), Vec<EmbedCacheEntry>>,
     deferred: &mut Vec<(Job, u8, std::time::Instant)>,
 ) {
@@ -184,16 +184,16 @@ fn handle(
     if tag.is_empty() {
         return;
     }
-    if embedder.as_ref().map(|(t, _)| t != &tag).unwrap_or(true) {
-        match crate::diar::SherpaEmbedder::new(&crate::speaker_model_path_for(&tag)) {
-            Ok(e) => *embedder = Some((tag.clone(), e)),
+    if embedder.as_ref().map(|e| e.model() != tag).unwrap_or(true) {
+        match crate::open_speaker_embedder_for(&tag) {
+            Ok(e) => *embedder = Some(e),
             Err(e) => {
                 eprintln!("预热嵌入器加载失败(本段放弃): {e}");
                 return;
             }
         }
     }
-    let computed = compute_one(&job, &mut embedder.as_mut().expect("上面刚置 Some").1);
+    let computed = compute_one(&job, embedder.as_mut().expect("上面刚置 Some"));
     // WAV 尚未被写盘线程建出来(final 先于建档是可能的时序):等同音频未落齐,
     // 推迟重试而不是当永久失败(codex 三轮)。
     let computed = match computed {
