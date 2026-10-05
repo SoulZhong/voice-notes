@@ -89,6 +89,9 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 系统识别引擎要 macOS 26 SDK 才编得进去;runner 的 Xcode 太旧时让构建失败,
+          # 而不是悄悄发出一个少了该引擎的版本(见 src-tauri/build.rs build_apple_asr)。
+          VN_REQUIRE_APPLE_ASR: ${{ matrix.platform == 'macos-latest' && '1' || '' }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "voice-notes ${{ github.ref_name }}"

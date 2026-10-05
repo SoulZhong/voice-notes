@@ -28,5 +28,65 @@ fn main() {
     }
     barrier.compile("sherpa_barrier");
     println!("cargo:rerun-if-changed=cxx/sherpa_barrier.cc");
+    build_apple_asr();
     tauri_build::build()
+}
+
+/// Apple SpeechTranscriber 桥(swift/apple_asr.swift)。编它要 macOS 26 SDK;SDK 更老
+/// (旧 Xcode 的 CI 机)时不编,也不发 cfg,Rust 侧 asr::apple 落到「系统不支持」桩,
+/// 构建照常通过。部署目标仍是 13.0:新 API 全在 #available 后面,旧系统运行不受影响。
+fn build_apple_asr() {
+    println!("cargo:rustc-check-cfg=cfg(apple_asr)");
+    println!("cargo:rerun-if-changed=swift/apple_asr.swift");
+    println!("cargo:rerun-if-env-changed=VN_NO_APPLE_ASR");
+    println!("cargo:rerun-if-env-changed=VN_REQUIRE_APPLE_ASR");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") || std::env::var_os("VN_NO_APPLE_ASR").is_some() {
+        return;
+    }
+    let xcrun = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("xcrun").args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let sdk_major = xcrun(&["--sdk", "macosx", "--show-sdk-version"])
+        .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()))
+        .unwrap_or(0);
+    if sdk_major < 26 {
+        // 发版构建设 VN_REQUIRE_APPLE_ASR=1:宁可构建失败,也不能悄悄发出一个少了省电引擎的版本。
+        let required = std::env::var("VN_REQUIRE_APPLE_ASR").is_ok_and(|v| !v.is_empty());
+        assert!(!required, "VN_REQUIRE_APPLE_ASR:需要 macOS 26 SDK(Xcode 26+),当前 SDK {sdk_major}");
+        println!("cargo:warning=macOS SDK {sdk_major} < 26,跳过 Apple 语音识别桥(该引擎在本构建中不可用)");
+        return;
+    }
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        Ok("x86_64") => "x86_64",
+        other => panic!("apple_asr: 不支持的架构 {other:?}"),
+    };
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let lib = out_dir.join("libapple_asr.a");
+    let status = std::process::Command::new("xcrun")
+        .args(["--sdk", "macosx", "swiftc", "-emit-library", "-static", "-parse-as-library", "-O"])
+        .args(["-swift-version", "5", "-module-name", "AppleAsr"])
+        .args(["-target", &format!("{arch}-apple-macos13.0")])
+        .arg("-o")
+        .arg(&lib)
+        .arg("swift/apple_asr.swift")
+        .status()
+        .expect("apple_asr: 无法启动 swiftc");
+    assert!(status.success(), "apple_asr: swiftc 编译失败");
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=apple_asr");
+    for fw in ["Speech", "AVFoundation", "CoreMedia", "Foundation"] {
+        println!("cargo:rustc-link-lib=framework={fw}");
+    }
+    // Swift 静态库引用的运行时(含为旧部署目标准备的兼容垫片库)要能被链接器找到。
+    if let Some(sdk) = xcrun(&["--sdk", "macosx", "--show-sdk-path"]) {
+        println!("cargo:rustc-link-search=native={sdk}/usr/lib/swift");
+    }
+    if let Some(swiftc) = xcrun(&["--find", "swiftc"]) {
+        let toolchain = std::path::Path::new(&swiftc).parent().and_then(|p| p.parent()).unwrap();
+        println!("cargo:rustc-link-search=native={}/lib/swift/macosx", toolchain.display());
+    }
+    println!("cargo:rustc-cfg=apple_asr");
 }

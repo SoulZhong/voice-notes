@@ -1377,6 +1377,8 @@ pub fn new_recognizer(
         Ok(Box::new(asr::qwen3::Qwen3Recognizer::new(&dir, provider, hotwords)?) as Box<dyn asr::Recognizer>)
     } else if asr_model == settings::ASR_FIRERED {
         Ok(Box::new(asr::fire_red::FireRedRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
+    } else if asr_model == settings::ASR_APPLE {
+        Ok(Box::new(asr::apple::AppleRecognizer::new()?) as Box<dyn asr::Recognizer>)
     } else {
         Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     }
@@ -3542,6 +3544,7 @@ pub(crate) fn do_retranscribe(
             settings::ASR_PARAFORMER,
             settings::ASR_QWEN3,
             settings::ASR_FIRERED,
+            settings::ASR_APPLE,
         ];
         if !known.contains(&e) {
             return Err(tr!("未知识别引擎: {e}", "Unknown ASR engine: {e}", e = e));
@@ -7880,6 +7883,28 @@ fn models_status(app: AppHandle) -> models::ModelsStatus {
     current_models_status(&app)
 }
 
+/// 系统语音识别(Apple SpeechTranscriber)的可用状态:设置页据此决定是否展示该选项、
+/// 是否需要先装语言包。查系统要过 XPC,放阻塞线程池,不占主线程。
+#[tauri::command]
+async fn apple_asr_status() -> asr::apple::AppleAsrStatus {
+    tauri::async_runtime::spawn_blocking(asr::apple::status).await.unwrap_or(asr::apple::AppleAsrStatus::Unsupported)
+}
+
+/// 下载安装系统中文语音识别包。装好后若当前选型就是系统识别,补一次预载,
+/// 让下次开录直接拿到常驻识别器。
+#[tauri::command]
+async fn install_apple_asr(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(asr::apple::install)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    if current_asr(&app) == settings::ASR_APPLE {
+        let state = app.state::<AppState>();
+        preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    }
+    Ok(())
+}
+
 /// 在系统文件管理器中打开模型存储目录(设置页「语音模型」区路径点击)。
 /// 走 Rust 侧 opener:能直接打开目录本身,且不依赖前端 opener 权限的路径白名单。
 #[tauri::command]
@@ -9247,6 +9272,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            apple_asr_status,
+            install_apple_asr,
             start_recording,
             resume_recording,
             stop_recording,

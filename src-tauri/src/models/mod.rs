@@ -321,6 +321,7 @@ pub fn required_now(id: &str, asr_model: &str) -> bool {
                 && asr_model != crate::settings::ASR_PARAFORMER
                 && asr_model != crate::settings::ASR_QWEN3
                 && asr_model != crate::settings::ASR_FIRERED
+                && asr_model != crate::settings::ASR_APPLE
         }
         "whisper" => asr_model == crate::settings::ASR_WHISPER,
         "paraformer" => asr_model == crate::settings::ASR_PARAFORMER,
@@ -375,8 +376,12 @@ pub fn status(asr_model: &str) -> ModelsStatus {
             url: a.url.into(),
         })
         .collect();
+    // 系统识别不走工件下载:除 vad 外,就绪看系统语言包是否装好。
+    let engine_ready = asr_model != crate::settings::ASR_APPLE
+        || crate::asr::apple::status() == crate::asr::apple::AppleAsrStatus::Ready;
     ModelsStatus {
-        recording_ready: artifacts.iter().filter(|s| s.required_for_recording).all(|s| s.present),
+        recording_ready: engine_ready
+            && artifacts.iter().filter(|s| s.required_for_recording).all(|s| s.present),
         diarization_ready: artifacts.iter().find(|s| s.id == "speaker").map(|s| s.present).unwrap_or(false),
         artifacts,
         root: root.display().to_string(),
@@ -480,6 +485,8 @@ mod tests {
         assert!(required_now("qwen3", crate::settings::ASR_QWEN3));
         assert!(!required_now("qwen3", crate::settings::ASR_SENSE_VOICE));
         assert!(!required_now("asr", crate::settings::ASR_QWEN3), "选 qwen3 时不需要 SenseVoice 工件");
+        assert!(!required_now("asr", crate::settings::ASR_APPLE), "系统识别不走工件下载");
+        assert!(required_now("vad", crate::settings::ASR_APPLE), "系统识别仍要 vad 切段");
         assert!(required_now("vad", crate::settings::ASR_QWEN3), "vad 恒需");
     }
 

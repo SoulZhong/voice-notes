@@ -296,7 +296,7 @@ struct RetranscribeParams {
     /// 音频来源:"dual"(双轨,默认)| "mixed"(成品轨)
     input: Option<String>,
     /// 强制这一次使用的本地识别引擎:"firered" | "sense_voice" | "paraformer" |
-    /// "whisper" | "qwen3"。缺省按应用设置决策。用途:某些段被默认引擎解成一两个字
+    /// "whisper" | "qwen3" | "apple"(macOS 26+ 系统识别)。缺省按应用设置决策。用途:某些段被默认引擎解成一两个字
     /// (实测 14.6 秒只出一个句号)时换更强的引擎救回来,而不改用户的默认选择。
     engine: Option<String>,
 }

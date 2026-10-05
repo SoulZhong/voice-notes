@@ -5,6 +5,7 @@ pub mod paraformer;
 pub mod qwen3;
 pub mod fire_red;
 pub mod cloud;
+pub mod apple;
 
 /// 一次识别的结果文本。
 #[derive(Debug, Clone, Default)]

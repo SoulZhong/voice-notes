@@ -22,6 +22,9 @@
     onModelDownload,
     cancelModelsDownload,
     openModelsDir,
+    appleAsrStatus,
+    installAppleAsr,
+    type AppleAsrStatus,
     testMirror,
     testCloudAsr,
     calendarPermission,
@@ -121,14 +124,22 @@
    * 选中移到新项——本地 state 显式改回旧值必触发 DOM 对齐,天然回弹。
    */
   let asrChoice = $state("sense_voice");
-  /** asr_model 后端值 → radio 本地 value 的五态映射(whisper/paraformer/qwen3/firered/sense_voice)。 */
+  /** asr_model 后端值 → radio 本地 value 的六态映射(whisper/paraformer/qwen3/firered/apple/sense_voice)。 */
   function asrModelToChoice(m: string | undefined): string {
     return m === "whisper" ? "whisper"
       : m === "paraformer" ? "paraformer"
       : m === "qwen3" ? "qwen3"
       : m === "firered" ? "firered"
+      : m === "apple" ? "apple"
       : "sense_voice";
   }
+  /** 系统语音识别可用状态;旧系统/Windows 恒 unsupported,选项不展示。 */
+  let appleAsr = $state<AppleAsrStatus>("unsupported");
+  let installingAppleAsr = $state(false);
+  // 已选中系统识别的设置即使挪到不支持的机器上也要露出选项,否则用户看不到当前选的是什么。
+  const showAppleAsr = $derived(
+    appleAsr === "ready" || appleAsr === "needs_download" || settings?.asr_model === "apple",
+  );
   /** danger 横幅：迁移/删除/切型/下载的错误统一在此显示。 */
   let error = $state("");
 
@@ -213,7 +224,9 @@
       : "asr",
   );
   const asrModelMissing = $derived(
-    !!status && !status.artifacts.find((a) => a.id === asrArtifactId)?.present,
+    settings?.asr_model === "apple"
+      ? appleAsr !== "ready"
+      : !!status && !status.artifacts.find((a) => a.id === asrArtifactId)?.present,
   );
 
   // 会后 AI 就绪状态徽标:开关已开但配置未齐备(openai 档缺 base_url/model/api_key,
@@ -344,6 +357,20 @@
       status = await modelsStatus();
     } catch (e) {
       error = t("settings.models.statusFailed", { e });
+    }
+    appleAsr = await appleAsrStatus().catch(() => "unsupported" as const);
+  }
+
+  async function doInstallAppleAsr() {
+    installingAppleAsr = true;
+    error = "";
+    try {
+      await installAppleAsr();
+    } catch (e) {
+      error = t("settings.asr.appleInstallFailed", { e });
+    } finally {
+      installingAppleAsr = false;
+      await refreshStatus();
     }
   }
 
@@ -1141,7 +1168,9 @@
                     ? t("settings.asr.qwen3Desc")
                     : asrChoice === "firered"
                       ? t("settings.asr.fireredDesc")
-                      : t("settings.asr.senseVoiceDesc")}
+                      : asrChoice === "apple"
+                        ? t("settings.asr.appleDesc")
+                        : t("settings.asr.senseVoiceDesc")}
             </span>
           </div>
           <div class="seg" class:disabled={recording.isLive}>
@@ -1195,8 +1224,31 @@
                 onchange={() => changeAsr("firered")}
               />FireRed
             </label>
+            {#if showAppleAsr}
+              <label class="seg-item">
+                <input
+                  type="radio"
+                  name="asr"
+                  value="apple"
+                  bind:group={asrChoice}
+                  disabled={recording.isLive || !settings}
+                  onchange={() => changeAsr("apple")}
+                />{t("settings.asr.appleLabel")}
+              </label>
+            {/if}
           </div>
         </div>
+        {#if asrChoice === "apple" && appleAsr === "needs_download"}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("settings.asr.appleInstallLabel")}</span>
+              <span class="row-desc">{t("settings.asr.appleInstallDesc")}</span>
+            </div>
+            <button class="btn-secondary" onclick={doInstallAppleAsr} disabled={installingAppleAsr}>
+              {installingAppleAsr ? t("settings.asr.appleInstalling") : t("settings.asr.appleInstall")}
+            </button>
+          </div>
+        {/if}
         {#if asrChoice === "qwen3"}
           <div class="row">
             <div class="row-info">
