@@ -43,6 +43,30 @@ const FRAME_MS: u64 = 110;
 /// 无需 join。全局单托盘，单计数器即可。
 static ANIM_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// 保活最近换下的托盘菜单份数(含当前这份)。
+const MENU_KEEPALIVE: usize = 8;
+
+thread_local! {
+    /// 换下来的托盘菜单不立刻释放(2026-10-05 崩溃,#249):muda 在每个原生菜单项里
+    /// 存的是指向 Rust 侧 MenuChild 的**裸指针**,点击时直接解引用。菜单整份重建
+    /// (set_menu)会释放旧菜单——若此刻用户正开着它,屏幕上那份 NSMenu 的条目就指向
+    /// 已释放内存,点下去读到垃圾,被当成「关于」项去生成图标,宽度 0 → panic,且发生
+    /// 在不可展开的 AppKit 回调里,整个应用 abort。实测现场:停录收尾触发菜单重建的
+    /// 同时点了「打开主窗口」。菜单只在状态边沿重建(一场录音几次),留最近几份的
+    /// 开销可以忽略。只在主线程读写(setup / set_menu_on_main 都在主线程)。
+    static RETAINED_MENUS: std::cell::RefCell<Vec<Menu<tauri::Wry>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 记下一份刚交给托盘的菜单,超出保活份数时才释放最旧的那份。
+fn retain_menu(menu: &Menu<tauri::Wry>) {
+    RETAINED_MENUS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.push(menu.clone());
+        let excess = m.len().saturating_sub(MENU_KEEPALIVE);
+        m.drain(..excess);
+    });
+}
+
 /// 读 settings.tray_enabled（读不到 app_data_dir → 回落默认 true，与 Settings::default 一致）。
 fn tray_enabled(app: &AppHandle) -> bool {
     app.path()
@@ -209,6 +233,7 @@ pub fn setup(app: &AppHandle) {
         eprintln!("托盘创建失败，跳过托盘（不影响应用）: {e}");
         return;
     }
+    retain_menu(&menu);
     // 冷启动即在录制中（设置里现开托盘，或崩溃恢复）：立即进入抖动动画，
     // 否则要等到下一次状态迁移才动。Aing 态冷启动不可达，无需处理。
     if recording {
@@ -245,6 +270,7 @@ fn set_menu_on_main(app: &AppHandle, recording: bool) {
     };
     match build_menu(app, recording) {
         Ok(menu) => {
+            retain_menu(&menu);
             if let Err(e) = tray.set_menu(Some(menu)) {
                 eprintln!("托盘菜单更新失败（不影响录制）: {e}");
             }
