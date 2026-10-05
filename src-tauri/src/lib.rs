@@ -2971,6 +2971,24 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     { *state.generation.lock().unwrap() += 1; }
     let sess = state.session.lock().unwrap().take();
     let s = sess?;
+    // 立即停止:下面 handle.stop() 第一步就关采集,之后的数秒只是排干最后几段的识别与
+    // 段内换人切分(每段 2.5-4s)。这段收尾期对外一律按「已停止」呈现——先发 stopping
+    // (托盘/快捷键/MCP 发起的停止也让前端立刻切走「录制中」),托盘菜单与图标也同步
+    // 复位;收尾完成后的 stopped 照旧由 do_stop_tail 发出。两者都是 fire-and-forget
+    // 派发,不在 actor 线程上同步等主线程(死锁注记③)。
+    let _ = app.emit(
+        "status",
+        ipc::StatusEvent {
+            state: "stopping".into(),
+            system_audio: String::new(),
+            note_id: s.note_id.clone(),
+            diarization: String::new(),
+            elapsed_ms: s.elapsed_ms(),
+            input_override: String::new(),
+        },
+    );
+    tray::set_recording(app, false);
+    tray::set_anim_paused(app, true);
     // 埋点先取时长:下面 s.handle.stop() 起会逐字段搬空 s,搬空后不能再整体借用取
     // elapsed_ms(&self)(partial move 借用检查会拒绝),故须在任何字段搬走之前算好。
     // 续录笔记 elapsed_ms 含 base_ms(历史累计)——上报的是笔记累计时长而非本次会话时长,看板解读以此为准。

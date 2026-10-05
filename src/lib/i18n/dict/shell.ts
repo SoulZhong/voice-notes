@@ -12,6 +12,7 @@ export const zh = {
 
   // ── 侧栏:录制按钮 ──
   "shell.record.stopping": "正在停止…",
+  "shell.record.finishingHint": "已停止,正在整理最后几句,几秒后可开始新录音",
   "shell.record.paused": "已暂停",
   "shell.record.stop": "停止录制",
   "shell.record.start": "开始录制",
@@ -203,6 +204,7 @@ export const en = {
   "shell.tab.settings": "Settings",
 
   "shell.record.stopping": "Stopping…",
+  "shell.record.finishingHint": "Stopped; finishing the last few lines. You can start a new recording in a few seconds.",
   "shell.record.paused": "Paused",
   "shell.record.stop": "Stop recording",
   "shell.record.start": "Start recording",

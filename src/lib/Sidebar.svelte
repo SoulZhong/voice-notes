@@ -413,9 +413,10 @@
     class:recording={recording.isLive}
     onclick={toggleRecording}
     disabled={recording.pending || recording.stopping}
+    title={recording.stopping ? t("shell.record.finishingHint") : undefined}
   >
     <span class="rec-dot" class:square={recording.isLive}></span>
-    {recording.stopping ? t("shell.record.stopping") : recording.isLive ? (recording.paused ? t("shell.record.paused") : t("shell.record.stop")) : t("shell.record.start")}
+    {recording.stopping ? t("shell.record.start") : recording.isLive ? (recording.paused ? t("shell.record.paused") : t("shell.record.stop")) : t("shell.record.start")}
   </button>
 
   <!-- 导入已有录音:录制的次级入口,常驻在录制药丸下方。刻意带文字而非纯图标——

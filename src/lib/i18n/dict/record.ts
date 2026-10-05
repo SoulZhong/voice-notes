@@ -11,6 +11,7 @@ export const zh = {
 
   // 控制钮
   "record.btn.stopping": "正在停止…",
+  "record.status.finishing": "已停止 · 正在整理最后几句",
   "record.btn.start": "开始录制",
   "record.btn.resume": "恢复",
   "record.btn.pause": "暂停",
@@ -108,6 +109,7 @@ export const en = {
   "record.status.paused": "Paused",
 
   "record.btn.stopping": "Stopping…",
+  "record.status.finishing": "Stopped · finishing the last few lines",
   "record.btn.start": "Start Recording",
   "record.btn.resume": "Resume",
   "record.btn.pause": "Pause",

@@ -172,6 +172,17 @@ export const recording = {
         tickAnchor = null;
         partialMic = "";
         partialSystem = "";
+      } else if (e.state === "stopping") {
+        // 后端已关采集、进入收尾(托盘/快捷键/MCP 发起的停止也走这里):按「已停止」
+        // 呈现——计时定格在后端给的时长,电平与临时字幕清零;本地 stop() 已置过的
+        // 再置一遍无害。收尾完成后照常收到 stopped。
+        status = "stopping";
+        paused = false;
+        elapsedBaseMs = e.elapsed_ms;
+        tickAnchor = null;
+        levels = { mic: 0, system: 0 };
+        partialMic = "";
+        partialSystem = "";
       } else if (e.state === "stopped" || e.state.startsWith("error:")) {
         status = e.state;
         systemAudio = e.system_audio;
