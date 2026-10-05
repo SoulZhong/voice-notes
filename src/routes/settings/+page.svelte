@@ -130,16 +130,14 @@
       : m === "paraformer" ? "paraformer"
       : m === "qwen3" ? "qwen3"
       : m === "firered" ? "firered"
-      : m === "apple" ? "apple"
+      : m === "apple" && showAppleAsr ? "apple"
       : "sense_voice";
   }
-  /** 系统语音识别可用状态;旧系统/Windows 恒 unsupported,选项不展示。 */
+  /** Apple 原生识别可用状态;旧系统/Windows 恒 unsupported,选项不展示。 */
   let appleAsr = $state<AppleAsrStatus>("unsupported");
   let installingAppleAsr = $state(false);
-  // 已选中系统识别的设置即使挪到不支持的机器上也要露出选项,否则用户看不到当前选的是什么。
-  const showAppleAsr = $derived(
-    appleAsr === "ready" || appleAsr === "needs_download" || settings?.asr_model === "apple",
-  );
+  // 只在 macOS 26+ 露出;不支持的机器上即使设置里残留 apple,后端也按 SenseVoice 跑(见 current_asr)。
+  const showAppleAsr = $derived(appleAsr === "ready" || appleAsr === "needs_download");
   /** danger 横幅：迁移/删除/切型/下载的错误统一在此显示。 */
   let error = $state("");
 
@@ -224,7 +222,7 @@
       : "asr",
   );
   const asrModelMissing = $derived(
-    settings?.asr_model === "apple"
+    settings?.asr_model === "apple" && showAppleAsr
       ? appleAsr !== "ready"
       : !!status && !status.artifacts.find((a) => a.id === asrArtifactId)?.present,
   );
@@ -359,6 +357,8 @@
       error = t("settings.models.statusFailed", { e });
     }
     appleAsr = await appleAsrStatus().catch(() => "unsupported" as const);
+    // 选项显隐依赖 appleAsr,它晚于设置回填:回填时 apple 被临时映射成 sense_voice,这里对齐回来。
+    if (settings) asrChoice = asrModelToChoice(settings.asr_model);
   }
 
   async function doInstallAppleAsr() {
@@ -1174,6 +1174,18 @@
             </span>
           </div>
           <div class="seg" class:disabled={recording.isLive}>
+            {#if showAppleAsr}
+              <label class="seg-item">
+                <input
+                  type="radio"
+                  name="asr"
+                  value="apple"
+                  bind:group={asrChoice}
+                  disabled={recording.isLive || !settings}
+                  onchange={() => changeAsr("apple")}
+                />{t("settings.asr.appleLabel")}
+              </label>
+            {/if}
             <label class="seg-item">
               <input
                 type="radio"
@@ -1224,18 +1236,6 @@
                 onchange={() => changeAsr("firered")}
               />FireRed
             </label>
-            {#if showAppleAsr}
-              <label class="seg-item">
-                <input
-                  type="radio"
-                  name="asr"
-                  value="apple"
-                  bind:group={asrChoice}
-                  disabled={recording.isLive || !settings}
-                  onchange={() => changeAsr("apple")}
-                />{t("settings.asr.appleLabel")}
-              </label>
-            {/if}
           </div>
         </div>
         {#if asrChoice === "apple" && appleAsr === "needs_download"}
