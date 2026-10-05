@@ -370,7 +370,7 @@
       不含出错:出错时 isLive/stopping 都是 false,整簇根本不挂载,错误由下方专门的
       红色详情行(.status.error)承担——在这里写一条出错分支是永远走不到的死代码(Codex P2)。 */
   const clockNote = $derived(
-    recording.stopping ? t("record.btn.stopping") : recording.paused ? t("record.status.paused") : "",
+    recording.stopping ? t("record.status.finishing") : recording.paused ? t("record.status.paused") : "",
   );
 
   // 硬承诺双轨(拒录引导卡):Fix A 拆除路径把分类 token 塞进开录失败的错误串——
@@ -702,8 +702,11 @@
              ——录制中的两个动作高频且语义强(暂停/停止),图标比文字按钮更省横向、更耐看。 -->
         <div class="ctl-group">
           {#if recording.stopping}
-            <button class="iconbtn rec" disabled aria-label={t("record.btn.stopping")} title={t("record.btn.stopping")}>
-              {@render icoStop()}
+            <!-- 立即停止:采集在点下停止的瞬间就已关掉,剩下的只是把最后几句转完、落盘。
+                 这几秒按「已停止」呈现(开始钮复位、计时定格),只是暂不可点——开录命令
+                 会排在收尾之后,与其让人点了干等,不如明说在收尾。 -->
+            <button class="ctl primary" disabled title={t("record.status.finishing")}>
+              <span class="sym dot on-blue"></span>{t("record.btn.start")}
             </button>
           {:else if !recording.isLive}
             <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
