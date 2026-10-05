@@ -1377,6 +1377,8 @@ pub fn new_recognizer(
         Ok(Box::new(asr::qwen3::Qwen3Recognizer::new(&dir, provider, hotwords)?) as Box<dyn asr::Recognizer>)
     } else if asr_model == settings::ASR_FIRERED {
         Ok(Box::new(asr::fire_red::FireRedRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
+    } else if asr_model == settings::ASR_APPLE {
+        Ok(Box::new(asr::apple::AppleRecognizer::new()?) as Box<dyn asr::Recognizer>)
     } else {
         Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     }
@@ -1512,9 +1514,20 @@ fn current_speaker_match(app: &AppHandle) -> String {
 /// 仅本模块内取用（识别器装配 / preload）；托盘就绪判定已改经 current_models_status
 /// （模式感知，云端模式不看本地选型），不再直接依赖这个函数。
 fn current_asr(app: &AppHandle) -> String {
-    match app.path().app_data_dir() {
+    let m = match app.path().app_data_dir() {
         Ok(d) => settings::load(&d).asr_model,
         Err(_) => settings::ASR_SENSE_VOICE.into(),
+    };
+    effective_asr(m)
+}
+
+/// 设置里是 apple、但本机根本没有 Apple 原生识别(Windows / macOS < 26 / 旧 SDK 构建,
+/// 比如设置文件从别的机器带过来)→ 按 SenseVoice 跑,不让用户卡在一个看不见的选项上。
+fn effective_asr(m: String) -> String {
+    if m == settings::ASR_APPLE && asr::apple::status() == asr::apple::AppleAsrStatus::Unsupported {
+        settings::ASR_SENSE_VOICE.into()
+    } else {
+        m
     }
 }
 
@@ -3542,6 +3555,7 @@ pub(crate) fn do_retranscribe(
             settings::ASR_PARAFORMER,
             settings::ASR_QWEN3,
             settings::ASR_FIRERED,
+            settings::ASR_APPLE,
         ];
         if !known.contains(&e) {
             return Err(tr!("未知识别引擎: {e}", "Unknown ASR engine: {e}", e = e));
@@ -7852,7 +7866,7 @@ fn preload_models(
 pub(crate) fn current_models_status(app: &AppHandle) -> models::ModelsStatus {
     let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
     models::status_for(
-        &s.asr_model,
+        &effective_asr(s.asr_model.clone()),
         s.asr_mode == settings::ASR_MODE_CLOUD,
         settings::cloud_creds_ok(&s),
     )
@@ -7878,6 +7892,28 @@ pub(crate) fn recording_not_ready_msg(app: &AppHandle) -> String {
 #[tauri::command]
 fn models_status(app: AppHandle) -> models::ModelsStatus {
     current_models_status(&app)
+}
+
+/// 系统语音识别(Apple SpeechTranscriber)的可用状态:设置页据此决定是否展示该选项、
+/// 是否需要先装语言包。查系统要过 XPC,放阻塞线程池,不占主线程。
+#[tauri::command]
+async fn apple_asr_status() -> asr::apple::AppleAsrStatus {
+    tauri::async_runtime::spawn_blocking(asr::apple::status).await.unwrap_or(asr::apple::AppleAsrStatus::Unsupported)
+}
+
+/// 下载安装系统中文语音识别包。装好后若当前选型就是系统识别,补一次预载,
+/// 让下次开录直接拿到常驻识别器。
+#[tauri::command]
+async fn install_apple_asr(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(asr::apple::install)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    if current_asr(&app) == settings::ASR_APPLE {
+        let state = app.state::<AppState>();
+        preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    }
+    Ok(())
 }
 
 /// 在系统文件管理器中打开模型存储目录(设置页「语音模型」区路径点击)。
@@ -7962,7 +7998,7 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
         // 两者都保 ARTIFACTS 原顺序(过滤而非按传入顺序),下载/进度次序稳定。
         let want: Vec<&str> = match &ids {
             Some(ids) => ids.iter().map(|s| s.as_str()).collect(),
-            None => default_download_ids(&s.asr_model),
+            None => default_download_ids(&effective_asr(s.asr_model.clone())),
         };
         let selected: Vec<&models::Artifact> = models::ARTIFACTS
             .iter()
@@ -8027,6 +8063,34 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
                 });
             }
         });
+        // 默认下载集且选型为 Apple 原生识别:系统中文语言包也在这一步装,首装用户点一次
+        // 「下载」即可开录,不必再去设置页找第二个按钮。显式 ids(单件下载)不顺带。
+        if ids.is_none()
+            && !cancel.load(Ordering::SeqCst)
+            && s.asr_model == settings::ASR_APPLE
+            && asr::apple::status() == asr::apple::AppleAsrStatus::NeedsDownload
+        {
+            let ev = |phase: &str, message: &str| {
+                let _ = app_done.emit(
+                    "model_download",
+                    ipc::ModelDownloadEvent {
+                        artifact: "apple_asr".into(),
+                        phase: phase.into(),
+                        received_bytes: 0,
+                        total_bytes: 0,
+                        message: message.into(),
+                    },
+                );
+            };
+            ev("downloading", "");
+            match asr::apple::install() {
+                Ok(()) => ev("done", ""),
+                Err(e) => {
+                    ev("error", &e.to_string());
+                    all_ok.store(false, Ordering::SeqCst);
+                }
+            }
+        }
         drop(guard); // 复位先于 done 事件,保持"收到 done 即可再次下载"的时序
         if all_ok.load(Ordering::SeqCst) {
             let _ = app_done.emit(
@@ -9069,6 +9133,21 @@ pub fn run() {
             // 当 `s` 用——那一次 `load` 就是产出尸检文件的唯一一次,不再另起一次探测性 load。
             // 探测为 false(全新安装/已是干净新格式)则直接 `load`,全程不落盘也不产生尸体。
             // `update` 失败(权限/IO 等极端情况)保底退回纯 `load`,行为不劣于旧代码。
+            // 全新安装(还没有 settings.json):macOS 26+ 默认用 Apple 原生识别(省电档),
+            // 其余平台照旧 SenseVoice。只在首装落一次盘,老用户的既有选择一律不动。
+            if let Some(dir) = &app_data {
+                if !dir.join("settings.json").exists()
+                    && matches!(
+                        asr::apple::status(),
+                        asr::apple::AppleAsrStatus::Ready | asr::apple::AppleAsrStatus::NeedsDownload
+                    )
+                {
+                    let fresh = settings::Settings { asr_model: settings::ASR_APPLE.into(), ..Default::default() };
+                    if let Err(e) = settings::save(dir, &fresh) {
+                        eprintln!("首装默认识别引擎落盘失败(沿用 SenseVoice): {e}");
+                    }
+                }
+            }
             let s = match &app_data {
                 Some(dir) if settings::needs_heal(dir) => settings::update(dir, |_| {})
                     .unwrap_or_else(|_| settings::load(dir)),
@@ -9247,6 +9326,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            apple_asr_status,
+            install_apple_asr,
             start_recording,
             resume_recording,
             stop_recording,

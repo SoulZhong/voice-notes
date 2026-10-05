@@ -111,6 +111,12 @@ export type MigrateEvent = { kind: "data" | "models"; phase: "copying" | "done" 
 
 export const modelsStatus = () => invoke<ModelsStatus>("models_status");
 export const openModelsDir = () => invoke<void>("open_models_dir");
+/** 系统语音识别(Apple SpeechTranscriber,macOS 26+)的可用状态。
+ * unsupported/no_chinese 时设置页不展示该选项;needs_download 时要先装系统中文语言包。 */
+export type AppleAsrStatus = "unsupported" | "no_chinese" | "needs_download" | "ready";
+export const appleAsrStatus = () => invoke<AppleAsrStatus>("apple_asr_status");
+/** 下载安装系统中文语言包,阻塞到装完(可能需要几分钟)。 */
+export const installAppleAsr = () => invoke<void>("install_apple_asr");
 /** 硬承诺双轨的拒录引导卡「打开系统设置」按钮:跳转屏幕录制隐私页(macOS)。
  * Windows 无对应页面,后端返回 Err(引导卡在 unavailable 分支不渲染该按钮)。 */
 export const openScreenCaptureSettings = () => invoke<void>("open_screen_capture_settings");

@@ -19,6 +19,8 @@ pub const ASR_PARAFORMER: &str = "paraformer";
 pub const ASR_QWEN3: &str = "qwen3";
 /// FireRedASR2-AED int8(2026-08-11 调研接入:中文精度天花板,带 token 时间戳)。
 pub const ASR_FIRERED: &str = "firered";
+/// macOS 26+ 系统自带 SpeechTranscriber(省电档,跑神经网络引擎;见 asr::apple)。
+pub const ASR_APPLE: &str = "apple";
 /// 识别方式:本地模型 / 云端 API(spec 2026-07-29-cloud-asr-design)。
 pub const ASR_MODE_LOCAL: &str = "local";
 pub const ASR_MODE_CLOUD: &str = "cloud";
