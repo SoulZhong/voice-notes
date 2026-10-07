@@ -9366,6 +9366,8 @@ pub fn run() {
             device::device_repair,
             device::device_forget,
             device::device_submit_pin,
+            device::device_open_accessibility,
+            device::device_grant_speech,
             device::list_dictation_notes,
             device::get_dictation_note,
             device::delete_dictation_note,

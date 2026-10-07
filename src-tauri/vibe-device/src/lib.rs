@@ -20,6 +20,7 @@ pub mod orca;
 pub mod protocol;
 pub mod runtime;
 pub mod session;
+pub mod sim;
 
 #[cfg(target_os = "macos")]
 pub mod inject_macos;

@@ -2,6 +2,7 @@
   // 设置页「设备听写」区。默认开但不激活:没点过「连接设备」之前后端什么都不做
   // (不扫蓝牙、不要权限、不下模型),所以这里第一次点连接时才扫描、才下载。
   import { onMount } from "svelte";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { t } from "$lib/i18n/index.svelte";
   import Segmented from "$lib/Segmented.svelte";
@@ -13,6 +14,8 @@
     deviceReconnect,
     deviceRepair,
     deviceScan,
+    deviceGrantSpeech,
+    deviceOpenAccessibility,
     deviceStatus,
     onDeviceState,
     type DeviceStatus,
@@ -33,6 +36,9 @@
   let busy = $state(false);
 
   // 连接对话框
+  const AI_PASSPORT_URL = "https://ai-passport.folotoy.cn/";
+  const VIBEVOICE_URL = "https://ai-passport.folotoy.cn/plays/965/?v=2126-2";
+
   let picking = $state(false);
   let scanning = $state(false);
   let found = $state<FoundDevice[]>([]);
@@ -58,6 +64,7 @@
     const k = linkTextKey(status.link, status.platform);
     return t(k.key, k.params);
   });
+  const connectedName = $derived(status?.link.state?.kind === "connected" ? status.link.state.name : null);
   const help = $derived(
     status ? endedHelp(status.link.ended, status.platform, status.device_name ?? "") : null,
   );
@@ -104,6 +111,40 @@
       }),
     ];
     return () => subs.forEach((p) => p.then((u) => u()));
+  });
+
+  // 辅助功能授权:点「去授权」后系统设置在前台,用户拨完开关回来时不会有任何事件,
+  // 所以缺权限期间低频轮询授权状态,拿到即收起提示。
+  let axWaiting = $state(false);
+  async function grantAccessibility() {
+    try {
+      if (await deviceOpenAccessibility()) await refresh();
+      else axWaiting = true;
+    } catch (e) {
+      error = t("device.actionFailed", { e });
+    }
+  }
+  // 只依赖这个布尔量:status 整体会随链路事件频繁替换,不能让轮询跟着反复重建。
+  const needAx = $derived(!!status?.device_name && status.platform === "macos" && !status.accessibility);
+  async function grantSpeech() {
+    try {
+      const s = await deviceGrantSpeech();
+      if (status) status = { ...status, speech_permission: s };
+      await refresh();
+    } catch (e) {
+      error = t("device.actionFailed", { e });
+    }
+  }
+  $effect(() => {
+    if (!needAx) {
+      axWaiting = false;
+      return;
+    }
+    const timer = setInterval(async () => {
+      const s = await deviceStatus().catch(() => null);
+      if (s?.accessibility && status) status = { ...status, accessibility: true };
+    }, 2000);
+    return () => clearInterval(timer);
   });
 
   async function run(f: () => Promise<DeviceStatus>) {
@@ -176,7 +217,13 @@
 
 <section>
   <h2 class="section-title">{t("device.section")}</h2>
-  <p class="intro">{t("device.desc")}</p>
+  <!-- 多数人没听过 AI Passport / VibeVoice:两个名字都给链接,点开在浏览器里看 -->
+  <p class="intro">
+    {t("device.desc.before")}<button class="link" onclick={() => openUrl(AI_PASSPORT_URL)}>AI Passport</button>{t("device.desc.mid")}<button
+      class="link"
+      onclick={() => openUrl(VIBEVOICE_URL)}>VibeVoice</button
+    >{t("device.desc.after")}
+  </p>
   <div class="rows">
     <label class="row">
       <div class="row-info">
@@ -198,7 +245,8 @@
           <span class="row-label">{t("device.current")}</span>
           {#if status.device_name}
             <span class="row-desc device-line">
-              <span class="name">{status.device_name}</span>
+              <span class="name">{status.sim ? t("device.simName") : status.device_name}</span>
+              {#if status.sim}<span class="sim-tag">{t("device.simTag")}</span>{/if}
               <span class="dot" class:on={status.link.state?.kind === "connected"}></span>
               {linkText}
               {#if status.link.firmware}<span class="fw">· {t("device.firmware", { fw: status.link.firmware })}</span>{/if}
@@ -231,10 +279,16 @@
         <div class="notice">{t("device.mismatch.deviceNewer")}</div>
       {/if}
       {#if status.device_name && isMac && !status.accessibility}
-        <div class="notice">{t("device.perm.accessibility")}</div>
+        <div class="notice notice-action">
+          <span>{axWaiting ? t("device.perm.waiting") : t("device.perm.accessibility")}</span>
+          <button class="btn" onclick={grantAccessibility}>{t("device.perm.grant")}</button>
+        </div>
       {/if}
-      {#if status.device_name && isMac && status.speech_permission !== "authorized" && status.speech_permission !== "not determined"}
-        <div class="notice">{t("device.perm.speech")}</div>
+      {#if status.device_name && isMac && status.speech_permission !== "authorized"}
+        <div class="notice notice-action">
+          <span>{status.speech_permission === "not determined" ? t("device.perm.speechAsk") : t("device.perm.speech")}</span>
+          <button class="btn" onclick={grantSpeech}>{t("device.perm.grant")}</button>
+        </div>
       {/if}
       {#if status.device_name && status.missing_models.length > 0}
         <div class="row">
@@ -336,7 +390,16 @@
       <p class="hint">{t("device.scan.empty")}</p>
     {/if}
     <ul>
-      {#each found as d (d.name)}
+      <!-- 连着的设备不再广播,搜索里永远找不到它:单列一行,免得以为它不见了 -->
+      {#if connectedName}
+        <li>
+          <div>
+            <span class="name">{connectedName}</span>
+            <span class="meta">{t("device.scan.current")}</span>
+          </div>
+        </li>
+      {/if}
+      {#each found.filter((d) => d.name !== connectedName) as d (d.name)}
         <li>
           <div>
             <span class="name">{d.name}</span>
@@ -365,6 +428,23 @@
 <style>
   section { margin-top: 1.3rem; }
   .section-title { font-size: 0.82rem; font-weight: 500; color: var(--ink-secondary); margin: 0 0 0.45rem; }
+  .link {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .sim-tag {
+    font-size: 0.72rem;
+    padding: 0 0.35rem;
+    border-radius: 4px;
+    background: var(--warning-tint);
+    color: var(--warning-ink);
+  }
   .intro { margin: 0 0 0.5rem; font-size: 0.8rem; color: var(--ink-faint); line-height: 1.5; }
   .rows { background: var(--surface); border-radius: var(--radius-lg); overflow: hidden; }
   .row {
@@ -394,6 +474,12 @@
     color: var(--warning-ink);
     font-size: 0.8rem;
     line-height: 1.5;
+  }
+  .notice-action {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
   }
   .err { color: var(--danger); font-size: 0.8rem; }
   .btn {

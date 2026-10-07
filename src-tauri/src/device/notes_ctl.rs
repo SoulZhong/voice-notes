@@ -31,7 +31,14 @@ fn risk_kinds(v: &serde_json::Value) -> Vec<String> {
 
 impl VoiceNotesApi for InProcessNotes {
     fn status(&mut self) -> Result<NotesStatus, NotesError> {
-        Ok(parse_status(&crate::recording_ctl::status(&self.app)))
+        use tauri::Manager;
+        let mut st = parse_status(&crate::recording_ctl::status(&self.app));
+        // 会话还没入槽但录制已在启动(模型加载中,或卡在麦克风/录屏授权框上):
+        // 报「启动中」,不能报空闲——否则设备再按一次会重复开录,只得到「已在录制」。
+        if st.phase == NotesPhase::Idle && *self.app.state::<crate::AppState>().running.lock().unwrap() {
+            st.phase = NotesPhase::Starting;
+        }
+        Ok(st)
     }
 
     fn start(&mut self) -> Result<Vec<String>, NotesError> {

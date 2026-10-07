@@ -61,6 +61,9 @@ pub struct RuntimeConfig {
     /// Where the Target is persisted.
     pub target_store: PathBuf,
     pub link: LinkOptions,
+    /// Play a simulated Device from this directory instead of Bluetooth
+    /// (end-to-end tests; see [`crate::sim`]).
+    pub sim: Option<PathBuf>,
 }
 
 enum CoreEvent {
@@ -98,6 +101,7 @@ impl Runtime {
             let link_tx = core_tx.clone();
             let host = host.clone();
             let opts = cfg.link.clone();
+            let sim = cfg.sim.clone();
             std::thread::Builder::new()
                 .name("device-ble".into())
                 .spawn(move || {
@@ -126,8 +130,14 @@ impl Runtime {
                         }
                     });
                     let end = rt.block_on(async move {
+                        let link = async move {
+                            match sim {
+                                Some(dir) => crate::sim::run(dir, out_rx, events, state).await,
+                                None => ble::run(out_rx, opts, events, state).await,
+                            }
+                        };
                         tokio::select! {
-                            end = ble::run(out_rx, opts, events, state) => end,
+                            end = link => end,
                             _ = stop_rx => LinkEnd::Stopped,
                         }
                     });
@@ -154,10 +164,11 @@ impl Runtime {
         {
             let self_tx = core_tx.clone();
             let host = host.clone();
+            let pinned = cfg.sim.is_some();
             std::thread::Builder::new()
                 .name("device-core".into())
                 .spawn(move || {
-                    core_loop(cfg.target_store, core_rx, self_tx, out_tx, recognizer, notes, host, linked)
+                    core_loop(cfg.target_store, core_rx, self_tx, out_tx, recognizer, notes, host, linked, pinned)
                 })?;
         }
 
@@ -227,6 +238,7 @@ fn core_loop(
     notes_api: impl VoiceNotesApi + 'static,
     host: Arc<dyn Host>,
     linked: Arc<AtomicBool>,
+    pinned: bool,
 ) {
     let notes_tx = self_tx.clone();
     let recognizer = make_recognizer(Arc::new(move |e| {
@@ -241,6 +253,9 @@ fn core_loop(
     let target = StoredTarget::load(&store);
     log::info!("device: stored Target {target:?}");
     let mut c = Companion::new(SystemInjector, recognizer, orca, target, Some(store));
+    if pinned {
+        c.pin_target();
+    }
     let mut connected = false;
     let mut deadline: Option<Instant> = None;
     let mut next_health = Instant::now() + HEALTH_INTERVAL;

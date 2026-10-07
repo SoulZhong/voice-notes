@@ -52,6 +52,8 @@
           ? "hooks"
           : $page.url.pathname.startsWith("/ai")
             ? "ai"
+            : $page.url.pathname === "/device" || $page.url.pathname.startsWith("/dictations")
+              ? "device"
             : $page.url.pathname === "/settings"
               ? "settings"
               : "notes",
@@ -218,7 +220,8 @@
   /** 两种笔记合成一列:按时间倒序(会议看开始时间,听写看最后一次听写)。 */
   const rows = $derived.by<Row[]>(() => {
     const all: Row[] = [
-      ...filtered.map((n) => ({ kind: "note" as const, at: n.started_at, n })),
+      // 设备页签只列听写笔记;录音页签两类同列(按时间穿插)。
+      ...(tab === "device" ? [] : filtered.map((n) => ({ kind: "note" as const, at: n.started_at, n }))),
       ...filteredDictations.map((d) => ({ kind: "dictation" as const, at: d.updated_at, d })),
     ];
     return all.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
@@ -451,6 +454,11 @@
     >
     <button
       class="vtab"
+      class:active={tab === "device"}
+      onclick={() => { if ($page.url.pathname !== "/device") goto("/device"); }}>{t("shell.tab.device")}</button
+    >
+    <button
+      class="vtab"
       class:active={tab === "settings"}
       onclick={() => { if ($page.url.pathname !== "/settings") goto("/settings"); }}>{t("shell.tab.settings")}</button
     >
@@ -659,7 +667,11 @@
   {/if}
 
   {#if rows.length === 0}
-    <p class="hint">{notes.length + dictations.length === 0 ? t("shell.notes.empty") : t("shell.notes.noMatch")}</p>
+    <p class="hint">
+      {tab === "device"
+        ? dictations.length === 0 ? t("device.notes.empty") : t("shell.notes.noMatch")
+        : notes.length + dictations.length === 0 ? t("shell.notes.empty") : t("shell.notes.noMatch")}
+    </p>
   {/if}
 
   <ul class="list">

@@ -40,6 +40,8 @@ export type DeviceStatus = {
   /** macOS 语音识别授权("authorized"/"denied"/"restricted"/"not determined");其它平台 "n/a"。 */
   speech_permission: string;
   platform: "macos" | "windows" | string;
+  /** 端到端测试用的模拟设备(环境变量 VN_DEVICE_SIM),平时恒 false。 */
+  sim: boolean;
 };
 
 export type FoundDevice = { name: string; rssi: number | null; paired: boolean | null };
@@ -76,6 +78,10 @@ export const deviceConnect = (name: string) => invoke<DeviceStatus>("device_conn
 export const deviceReconnect = () => invoke<DeviceStatus>("device_reconnect");
 export const deviceRepair = () => invoke<DeviceStatus>("device_repair");
 export const deviceForget = () => invoke<DeviceStatus>("device_forget");
+/** macOS:把 Voice Notes 登记进「辅助功能」列表并打开那一页;返回是否已授权。 */
+export const deviceOpenAccessibility = () => invoke<boolean>("device_open_accessibility");
+/** macOS:申请语音识别授权(没问过则弹系统框,被拒过则打开系统设置);返回授权状态名。 */
+export const deviceGrantSpeech = () => invoke<string>("device_grant_speech");
 export const deviceSubmitPin = (pin: string | null) => invoke<void>("device_submit_pin", { pin });
 
 export const listDictationNotes = () => invoke<DictationSummary[]>("list_dictation_notes");

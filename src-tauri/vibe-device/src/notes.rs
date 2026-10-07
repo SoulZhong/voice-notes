@@ -16,6 +16,9 @@ pub const RISK_BLUETOOTH_MIC: &str = "bluetooth_mic";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotesPhase {
     Idle,
+    /// A Recording is being set up and not live yet (models loading, or a
+    /// permission prompt waiting for the user). Pressing again starts nothing.
+    Starting,
     Recording,
     Paused,
 }

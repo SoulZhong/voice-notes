@@ -36,7 +36,8 @@ extern "C" {
 /// 流式模型目录(models::ARTIFACTS 的 "dictation_stream")。
 pub use crate::models::STREAM_DIR;
 const STREAM_ENCODER: &str = "encoder-epoch-99-avg-1.int8.onnx";
-const STREAM_DECODER: &str = "decoder-epoch-99-avg-1.int8.onnx";
+// 解码器用 fp32:int8 解码器让流式结果叠字(「构构构建脚脚脚脚本」),2026-10-07 实测。
+const STREAM_DECODER: &str = "decoder-epoch-99-avg-1.onnx";
 const STREAM_JOINER: &str = "joiner-epoch-99-avg-1.int8.onnx";
 const STREAM_TOKENS: &str = "tokens.txt";
 /// 说完补一段静音再收尾,流式模型末字不被吞(与 Apple 那边同理)。
@@ -356,6 +357,26 @@ mod tests {
     fn result_text_reads_json_and_lowercases_bpe() {
         assert_eq!(result_text(r#"{"text":" 把 FUNCTION 改成异步 ","tokens":[]}"#), "把 function 改成异步");
         assert_eq!(result_text("not json"), "");
+    }
+
+    /// 手动实验:VN_STREAM_WAV=<16k 单声道 wav> cargo test stream_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn stream_probe() {
+        let wav = std::env::var("VN_STREAM_WAV").expect("VN_STREAM_WAV");
+        let pcm = vibe_device::sim::read_wav(std::path::Path::new(&wav)).unwrap();
+        let engine = OnlineEngine::new(&stream_dir(&crate::models::root())).unwrap();
+        let mut st = engine.stream().unwrap();
+        let mut last = String::new();
+        for chunk in pcm.chunks(320) {
+            let f: Vec<f32> = chunk.iter().map(|s| *s as f32 / 32768.0).collect();
+            let t = st.feed(&f, false).unwrap();
+            if t != last {
+                println!("partial: {t}");
+                last = t;
+            }
+        }
+        println!("final: {}", st.feed(&vec![0f32; TAIL_SILENCE], true).unwrap());
     }
 
     #[test]

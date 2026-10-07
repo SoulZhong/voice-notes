@@ -287,7 +287,9 @@ pub const ARTIFACTS: &[Artifact] = &[
         approx_mb: 488,
         prune: &[
             "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/encoder-epoch-99-avg-1.onnx",
-            "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/decoder-epoch-99-avg-1.onnx",
+            // 解码器反过来:留 fp32、剪 int8——int8 解码器实测让实时字幕叠字
+            // (「构构构建脚脚脚脚本」),fp32 只大 0.8MB。
+            "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/decoder-epoch-99-avg-1.int8.onnx",
             "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/joiner-epoch-99-avg-1.onnx",
             "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/test_wavs",
         ],
@@ -298,9 +300,9 @@ pub const ARTIFACTS: &[Artifact] = &[
                 sha256: "8fa764187a261844f859d7143ebaa563af5d10adfece4c18a8f414c88cba2a9b",
             },
             FinalFile {
-                rel_path: "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/decoder-epoch-99-avg-1.int8.onnx",
-                bytes: 13_091_040,
-                sha256: "1a70c593d71e53f023f5f55b0b4cfff5055abb786ee3992e5f63dc2e273cc4fa",
+                rel_path: "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/decoder-epoch-99-avg-1.onnx",
+                bytes: 13_876_452,
+                sha256: "2e3b5ec371f8899ee6acd829fd753ba45772df57a91bdf37cde3136354e7db7d",
             },
             FinalFile {
                 rel_path: "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/joiner-epoch-99-avg-1.int8.onnx",

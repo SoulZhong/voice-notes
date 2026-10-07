@@ -5,7 +5,11 @@ import type { Dict, Msg } from "../types";
 export const zh = {
   // —— 设置区 ——
   "device.section": "设备听写",
-  "device.desc": "用佩戴式 AI Passport 设备说话,文字插入到 Orca、ChatGPT(Codex)、微信、企业微信当前的会话里。",
+  "device.desc.before": "给 ",
+  "device.desc.mid": " 设备刷入 ",
+  "device.desc.after": " 后,对着设备说话,文字直接插入到 Orca、ChatGPT(Codex)、微信、企业微信当前的会话里。",
+  "device.simName": "模拟设备",
+  "device.simTag": "测试模式:未连接真实设备",
   "device.enabled.label": "启用设备听写",
   "device.enabled.desc": "关闭后不再连接设备;已保存的听写笔记不受影响",
   "device.current": "当前设备",
@@ -26,6 +30,7 @@ export const zh = {
   "device.scan.empty": "附近没有找到设备。",
   "device.scan.rescan": "重新搜索",
   "device.scan.paired": "已配对",
+  "device.scan.current": "当前已连接",
   "device.scan.signal": "信号 {rssi} dBm",
   "device.scan.choose": "连接",
   "device.scan.failed": "搜索失败: {e}",
@@ -51,7 +56,11 @@ export const zh = {
   "device.firmware": "固件 {fw}",
 
   // —— 权限与模型 ——
-  "device.perm.accessibility": "需要辅助功能权限才能把文字插入其它应用:系统设置 › 隐私与安全性 › 辅助功能,勾选 Voice Notes。",
+  "device.perm.accessibility": "需要辅助功能权限才能把文字插入其它应用。",
+  "device.perm.grant": "去授权",
+  "device.perm.speechAsk": "听写用 Apple 语音识别(带热词),需要你允许 Voice Notes 使用语音识别。",
+  "device.page.title": "设备",
+  "device.perm.waiting": "已打开系统设置:在「辅助功能」列表里打开 Voice Notes 的开关,授权后这里会自动消失。",
   "device.perm.speech": "没有语音识别权限,听写会改用本机模型(需要下载)。可在系统设置 › 隐私与安全性 › 语音识别里允许 Voice Notes。",
   "device.models.missing": "听写需要下载识别模型(约 {mb} MB)",
   "device.models.download": "下载",
@@ -80,6 +89,7 @@ export const zh = {
   "device.pin.cancel": "取消",
 
   // —— 听写笔记 ——
+  "device.notes.empty": "还没有听写笔记",
   "device.note.kind": "听写",
   "device.note.count": "{n} 句",
   "device.note.subtitle": "{app} · 往这个会话说过的话",
@@ -99,7 +109,11 @@ export const zh = {
 
 export const en = {
   "device.section": "Device dictation",
-  "device.desc": "Speak into the wearable AI Passport; the text lands in the current conversation of Orca, ChatGPT (Codex), WeChat or WeCom.",
+  "device.desc.before": "Flash ",
+  "device.desc.mid": " with ",
+  "device.desc.after": ", then speak into it: the text lands in the current conversation of Orca, ChatGPT (Codex), WeChat or WeCom.",
+  "device.simName": "Simulated device",
+  "device.simTag": "Test mode: no real device connected",
   "device.enabled.label": "Enable device dictation",
   "device.enabled.desc": "When off, the device is not connected; saved dictation notes stay",
   "device.current": "Device",
@@ -119,6 +133,7 @@ export const en = {
   "device.scan.empty": "No device found nearby.",
   "device.scan.rescan": "Search again",
   "device.scan.paired": "Paired",
+  "device.scan.current": "Connected now",
   "device.scan.signal": "Signal {rssi} dBm",
   "device.scan.choose": "Connect",
   "device.scan.failed": "Search failed: {e}",
@@ -141,7 +156,11 @@ export const en = {
   "device.mismatch.deviceOlder": "The device firmware is older than this Voice Notes expects; some features may not work. Flash the latest firmware onto the device.",
   "device.mismatch.deviceNewer": "The device firmware is newer than this Voice Notes; some features may not work. Update Voice Notes to the latest version.",
   "device.firmware": "Firmware {fw}",
-  "device.perm.accessibility": "Accessibility permission is needed to insert text into other apps: System Settings › Privacy & Security › Accessibility, enable Voice Notes.",
+  "device.perm.accessibility": "Accessibility permission is needed to insert text into other apps.",
+  "device.perm.grant": "Grant access",
+  "device.perm.speechAsk": "Dictation uses Apple Speech (with hotwords); allow Voice Notes to use speech recognition.",
+  "device.page.title": "Device",
+  "device.perm.waiting": "System Settings is open: turn on Voice Notes in the Accessibility list. This notice disappears once access is granted.",
   "device.perm.speech": "Without speech recognition permission, dictation uses the on-device model (download needed). Allow Voice Notes in System Settings › Privacy & Security › Speech Recognition.",
   "device.models.missing": "Dictation needs a recognition model download (about {mb} MB)",
   "device.models.download": "Download",
@@ -167,6 +186,7 @@ export const en = {
   "device.pin.ok": "Pair",
   "device.pin.cancel": "Cancel",
 
+  "device.notes.empty": "No dictation notes yet",
   "device.note.kind": "Dictation",
   "device.note.count": (p) => (p.n === 1 ? "1 entry" : `${p.n} entries`),
   "device.note.subtitle": "{app} · what you said into this conversation",

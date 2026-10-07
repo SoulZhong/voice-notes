@@ -176,6 +176,8 @@ struct Dictation {
     best: String,
     sent_partial: String,
     last_partial_at: Option<Instant>,
+    /// When the recognizer last reported a Partial (not throttled).
+    last_raw_at: Option<Instant>,
     partial_pending: bool,
     /// The decoded audio, for the dictation note.
     pcm: Vec<i16>,
@@ -267,6 +269,10 @@ fn end_sentence(text: &str) -> String {
     if last.is_ascii() && !chinese { format!("{t}. ") } else { format!("{t}。") }
 }
 
+
+/// Speech goes quiet at least this long before it starts over after a pause;
+/// revisions while speaking come every few hundred milliseconds.
+const RESTART_GAP: Duration = Duration::from_millis(800);
 
 /// Whether `new` starts a different utterance rather than revising `prev`.
 /// Revisions keep a common prefix; a restart after a pause shares almost none
@@ -406,6 +412,9 @@ pub struct Companion<I: Injector, R: Recognizer, O: OrcaApi> {
     events: Vec<DictationEvent>,
     notes: Notes,
     alerts: AlertTracker,
+    /// Follow the focused Supported App. Off only for the simulated Device,
+    /// whose tests must not type into whatever the user is working in.
+    follow_focus: bool,
 }
 
 impl<I: Injector, R: Recognizer, O: OrcaApi> Companion<I, R, O> {
@@ -434,7 +443,13 @@ impl<I: Injector, R: Recognizer, O: OrcaApi> Companion<I, R, O> {
             events: Vec::new(),
             notes: Notes::new(),
             alerts: AlertTracker::default(),
+            follow_focus: true,
         }
+    }
+
+    /// Keep the stored Target instead of following focus (simulated Device).
+    pub fn pin_target(&mut self) {
+        self.follow_focus = false;
     }
 
     /// Frames to write to the Device, in order.
@@ -563,6 +578,7 @@ impl<I: Injector, R: Recognizer, O: OrcaApi> Companion<I, R, O> {
             best: String::new(),
             sent_partial: String::new(),
             last_partial_at: None,
+            last_raw_at: None,
             partial_pending: false,
             pcm: Vec::new(),
         });
@@ -630,9 +646,17 @@ impl<I: Injector, R: Recognizer, O: OrcaApi> Companion<I, R, O> {
             RecogEvent::Partial { text, .. } => {
                 // After a long pause Speech may start a fresh transcription
                 // without finalizing: keep what was said before.
-                if restarted_utterance(&d.raw, &text) {
+                // A restart only follows a pause, when Speech has gone quiet.
+                // Mid-speech it rewrites hard (English through the zh-CN
+                // model: "Please round…" -> "Peace"), and taking that for a
+                // restart doubled the sentence.
+                let paused = d
+                    .last_raw_at
+                    .is_some_and(|t| now.saturating_duration_since(t) >= RESTART_GAP);
+                if paused && restarted_utterance(&d.raw, &text) {
                     d.committed = join_utterances(&d.committed, &d.raw);
                 }
+                d.last_raw_at = Some(now);
                 d.raw = text;
                 d.best = join_utterances(&d.committed, &d.raw);
                 d.partial_pending = d.best != d.sent_partial;
@@ -1003,6 +1027,9 @@ impl<I: Injector, R: Recognizer, O: OrcaApi> Companion<I, R, O> {
     /// Mac focus on a Supported App sets the Target to its Current
     /// Conversation; focus elsewhere leaves it unchanged.
     fn follow_focus(&mut self, need: Need, now: Instant) {
+        if !self.follow_focus {
+            return;
+        }
         let Some(i) = self
             .injector
             .frontmost_bundle_id()
@@ -1134,7 +1161,8 @@ impl<I: Injector, R: Recognizer, O: OrcaApi> Companion<I, R, O> {
                     .iter()
                     .find(|s| !leaf_id.is_empty() && s.leaf_id == leaf_id)
             })
-            .or_else(|| snap.current())
+            // Pinned (simulated Device): never drift into the user's own session.
+            .or_else(|| if self.follow_focus { snap.current() } else { None })
             .cloned();
         match found {
             Some(s) => {
@@ -1562,6 +1590,7 @@ impl<I: Injector, R: Recognizer, O: OrcaApi> Companion<I, R, O> {
     fn apply_notes_status(&mut self, st: NotesStatus, now: Instant) {
         let state = match st.phase {
             NotesPhase::Idle => NotesState::Idle,
+            NotesPhase::Starting => NotesState::Starting,
             NotesPhase::Recording => NotesState::Recording,
             NotesPhase::Paused => NotesState::Paused,
         };
@@ -1944,9 +1973,10 @@ mod tests {
         partial(&mut c, 1, "把这个函数", t0);
         partial(&mut c, 1, "把这个函数改成异步", t0);
         // Long pause: Speech starts over with only the new sentence.
-        partial(&mut c, 1, "然后", t0);
-        partial(&mut c, 1, "然后加测试", t0);
-        c.handle_frame(DeviceFrame::DictStop { dict: 1 }, t0);
+        let t1 = t0 + Duration::from_secs(2);
+        partial(&mut c, 1, "然后", t1);
+        partial(&mut c, 1, "然后加测试", t1);
+        c.handle_frame(DeviceFrame::DictStop { dict: 1 }, t1);
         c.handle_recog(
             RecogEvent::Final {
                 dict: 1,
@@ -1958,6 +1988,22 @@ mod tests {
             c.injector.log,
             [format!("insert {WECHAT} 把这个函数改成异步。然后加测试。")]
         );
+    }
+
+    #[test]
+    fn a_hard_rewrite_while_speaking_is_not_a_restart() {
+        let mut c = companion();
+        let t0 = Instant::now();
+        c.handle_frame(DeviceFrame::DictStart { dict: 1 }, t0);
+        partial(&mut c, 1, "Please round unite unite saga.", t0);
+        partial(&mut c, 1, "Peace", t0 + Duration::from_millis(200));
+        partial(&mut c, 1, "Please run the unit tests", t0 + Duration::from_millis(400));
+        c.handle_frame(DeviceFrame::DictStop { dict: 1 }, t0 + Duration::from_millis(500));
+        c.handle_recog(
+            RecogEvent::Final { dict: 1, text: "Please run the unit tests again.".into() },
+            t0 + Duration::from_millis(600),
+        );
+        assert_eq!(c.injector.log, [format!("insert {WECHAT} Please run the unit tests again. ")]);
     }
 
     #[test]
@@ -3029,6 +3075,22 @@ mod tests {
             c.take_outbox(),
             [notes(NotesState::Idle, 0, NotesNotice::None)]
         );
+    }
+
+    #[test]
+    fn a_recording_still_starting_is_shown_and_not_started_again() {
+        let mut c = companion();
+        let t0 = Instant::now();
+        hello(&mut c, t0);
+        c.take_notes_ops();
+        // Started elsewhere, stuck before going live (a permission prompt).
+        c.handle_notes(
+            NotesReply::Status(Ok(NotesStatus { phase: NotesPhase::Starting, elapsed_ms: 0 })),
+            t0,
+        );
+        assert_eq!(c.take_outbox(), [notes(NotesState::Starting, 0, NotesNotice::None)]);
+        c.handle_frame(DeviceFrame::NotesToggle, t0);
+        assert!(c.take_notes_ops().is_empty(), "no second Start while one is starting");
     }
 
     #[test]

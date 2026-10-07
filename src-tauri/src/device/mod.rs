@@ -69,6 +69,8 @@ pub struct DeviceStatus {
     pub missing_models: Vec<&'static str>,
     /// macOS:辅助功能是否已授权(插入文字必需);其它平台恒 true。
     pub accessibility: bool,
+    /// 端到端测试的模拟设备在跑(VN_DEVICE_SIM),界面据此标明「没连真设备」。
+    pub sim: bool,
     /// macOS:语音识别授权状态("authorized" / "denied" / …);其它平台 "n/a"。
     pub speech_permission: String,
     /// 平台:"macos" / "windows" / 其它。决定配对与权限的界面文案。
@@ -283,6 +285,15 @@ fn restart_runtime(app: &AppHandle) {
         set_view(app, |v| v.ended = Some("standalone_running"));
         return;
     }
+    // 已激活的设备在启动时直接连上,不经过「连接设备」:语音识别还没问过就在这里问,
+    // 否则第一次听写只会在设备上报「需要语音识别权限」而系统从不弹框。
+    #[cfg(target_os = "macos")]
+    if vibe_device::speech_apple::status_name(vibe_device::speech_apple::authorization_status()) == "not determined" {
+        std::thread::spawn(|| {
+            let s = vibe_device::speech_apple::request_authorization(Duration::from_secs(600));
+            eprintln!("设备: 语音识别权限 {}", vibe_device::speech_apple::status_name(s));
+        });
+    }
     let Ok(app_data) = app.path().app_data_dir() else { return };
     let hotwords: Vec<String> = crate::qwen3_hotwords(app)
         .map(|h| h.split(',').map(str::to_owned).collect())
@@ -294,6 +305,7 @@ fn restart_runtime(app: &AppHandle) {
             wanted: s.device_name.clone(),
             pins: Some(Arc::new(UiPins { app: app.clone() }) as Arc<dyn PinProvider>),
         },
+        sim: sim_dir(),
     };
     let host = Arc::new(VnHost { app: app.clone() });
     let notes = notes_ctl::InProcessNotes { app: app.clone() };
@@ -320,8 +332,41 @@ fn request_permissions() {
     });
 }
 
+/// vibe-device 走 `log` 打日志(连接、扫描、注入、识别的来龙去脉都在里面),而
+/// Voice Notes 没有装 logger——不桥接这些日志会全部丢掉,Windows 上「靠日志定位」
+/// 就成了空话。只放行 vibe_device 自己的 info 及以上,写进 stderr(即 logs/stderr.log)。
+fn install_logger() {
+    struct DeviceLog;
+    impl log::Log for DeviceLog {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.level() <= log::Level::Info && m.target().starts_with("vibe_device")
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                eprintln!(
+                    "{} 设备[{}] {}",
+                    chrono::Local::now().format("%H:%M:%S%.3f"),
+                    r.level(),
+                    r.args()
+                );
+            }
+        }
+        fn flush(&self) {}
+    }
+    static LOGGER: DeviceLog = DeviceLog;
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
+/// 模拟设备目录(端到端测试):设了环境变量 VN_DEVICE_SIM 才有,平时恒为 None。
+fn sim_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("VN_DEVICE_SIM").filter(|v| !v.is_empty()).map(Into::into)
+}
+
 /// 启动时调用:注册状态;已激活则自动连;顺手清理过期的听写音频。
 pub fn init(app: &AppHandle) {
+    install_logger();
     app.manage(DeviceState::default());
     let s = load_settings(app);
     if s.device_enabled && s.device_name.is_some() {
@@ -367,6 +412,7 @@ fn current_status(app: &AppHandle) -> DeviceStatus {
         accessibility,
         speech_permission,
         platform: platform(),
+        sim: sim_dir().is_some(),
     }
 }
 
@@ -380,9 +426,24 @@ pub fn device_status(app: AppHandle) -> DeviceStatus {
 /// 扫描附近的设备(「连接设备」对话框)。第一次调用会触发系统的蓝牙权限申请。
 #[tauri::command]
 pub async fn device_scan() -> Result<Vec<FoundDevice>, String> {
-    ble::scan(Duration::from_secs(4))
-        .await
-        .map_err(|e| crate::tr!("扫描设备失败: {e}", "Scanning for devices failed: {e}"))
+    if sim_dir().is_some() {
+        return Ok(vec![FoundDevice { name: vibe_device::sim::device_name(), rssi: Some(-40), paired: None }]);
+    }
+    let t = std::time::Instant::now();
+    // 蓝牙栈偶尔卡在取适配器上:给整个扫描一个上限,对话框不至于一直转圈。
+    let r = match tokio::time::timeout(Duration::from_secs(15), ble::scan(Duration::from_secs(4))).await {
+        Ok(r) => r,
+        Err(_) => Err("timeout".to_owned()),
+    };
+    match &r {
+        Ok(found) => eprintln!(
+            "设备: 扫描 {:.1}s 找到 {:?}",
+            t.elapsed().as_secs_f32(),
+            found.iter().map(|d| d.name.as_str()).collect::<Vec<_>>()
+        ),
+        Err(e) => eprintln!("设备: 扫描 {:.1}s 失败: {e}", t.elapsed().as_secs_f32()),
+    }
+    r.map_err(|e| crate::tr!("扫描设备失败: {e}", "Scanning for devices failed: {e}"))
 }
 
 /// 连接(并记住)这台设备。返回连接后的状态;缺模型时前端据 missing_models 发起下载。
@@ -471,6 +532,62 @@ pub fn device_submit_pin(app: AppHandle, pin: Option<String>) -> Result<(), Stri
             .send(pin)
             .map_err(|_| crate::tr!("配对已超时,请重新连接", "Pairing timed out; reconnect to try again")),
         None => Err(crate::tr!("没有等待中的配对", "No pairing is waiting")),
+    }
+}
+
+/// macOS 辅助功能授权引导:带 prompt 查一次授权,让系统把 Voice Notes 自动登记进
+/// 「辅助功能」列表(用户只需拨开关,不必手动 + 或拖入),再直接打开那一页。
+/// 返回当前是否已授权;界面随后轮询 device_status 等开关拨开。
+#[tauri::command]
+pub fn device_open_accessibility(app: AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        if vibe_device::inject_macos::accessibility_trusted(true) {
+            return Ok(true);
+        }
+        app.opener()
+            .open_url(
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                None::<&str>,
+            )
+            .map_err(|e| crate::tr!("打开系统设置失败: {e}", "Failed to open System Settings: {e}"))?;
+        Ok(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(true)
+    }
+}
+
+/// macOS 语音识别授权引导:还没问过就当场弹系统授权框;问过被拒则打开系统设置
+/// 的「语音识别」页。返回授权后的状态名(与 DeviceStatus.speech_permission 同口径)。
+#[tauri::command]
+pub async fn device_grant_speech(app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        use vibe_device::speech_apple as sp;
+        let s = tauri::async_runtime::spawn_blocking(|| sp::request_authorization(Duration::from_secs(120)))
+            .await
+            .map_err(|e| e.to_string())?;
+        let name = sp::status_name(s).to_owned();
+        eprintln!("设备: 语音识别授权 {name}");
+        if name == "denied" || name == "restricted" {
+            app.opener()
+                .open_url(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition",
+                    None::<&str>,
+                )
+                .map_err(|e| crate::tr!("打开系统设置失败: {e}", "Failed to open System Settings: {e}"))?;
+        }
+        Ok(name)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok("n/a".to_owned())
     }
 }
 

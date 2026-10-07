@@ -47,6 +47,7 @@ hound = "3.5"
 sherpa-onnx = "1.13.4"
 sherpa-onnx-sys = "1.13.4"
 chrono = "0.4"
+log = "0.4"
 # 实体规范名/别名/关系端点统一使用 Unicode full default case folding（如 ß == SS）。
 unicode-casefold = "0.2"
 ureq = "2"

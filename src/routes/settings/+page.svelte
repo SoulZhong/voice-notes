@@ -41,7 +41,6 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
   import Segmented from "$lib/Segmented.svelte";
-  import DeviceSettings from "$lib/DeviceSettings.svelte";
   import { applyTelemetrySetting, reportError } from "$lib/analytics";
   import type { SegmentedItem } from "$lib/segmented";
 
@@ -1379,7 +1378,6 @@
 
   <!-- —— 语音模型 —— -->
   <!-- —— 设备听写(AI Passport)—— -->
-  <DeviceSettings {settings} save={saveSetting} />
 
   <section>
     <h2 class="section-title">{t("settings.section.models")}</h2>

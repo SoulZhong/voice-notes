@@ -6585,6 +6585,7 @@ dependencies = [
  "hex",
  "hound",
  "libc",
+ "log",
  "memmap2",
  "objc2",
  "objc2-event-kit",
