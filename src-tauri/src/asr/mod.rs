@@ -6,6 +6,7 @@ pub mod qwen3;
 pub mod fire_red;
 pub mod cloud;
 pub mod apple;
+pub mod streaming;
 
 /// 一次识别的结果文本。
 #[derive(Debug, Clone, Default)]

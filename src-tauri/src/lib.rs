@@ -1534,11 +1534,17 @@ fn effective_asr(m: String) -> String {
 }
 
 /// 默认下载集：遍历 ARTIFACTS 保序收集「当前选型录制必需」或声纹（speaker，增值但默认装）。
-/// 与旧行为等价：vad + 选中 ASR + speaker。download_models 的 None 分支用它。
+/// vad + 选中 ASR + speaker;选型不是 Apple 时再加流式模型(dictation_stream):本机
+/// sherpa 引擎的实时字幕靠它省电(录音时 CPU 约降到 1/4,见 pipeline::live_caption),
+/// Windows 默认 SenseVoice 正是这种情况。download_models 的 None 分支用它。
 fn default_download_ids(asr_model: &str) -> Vec<&'static str> {
     models::ARTIFACTS
         .iter()
-        .filter(|a| models::required_now(a.id, asr_model) || a.id == "speaker")
+        .filter(|a| {
+            models::required_now(a.id, asr_model)
+                || a.id == "speaker"
+                || (a.id == "dictation_stream" && asr_model != settings::ASR_APPLE)
+        })
         .map(|a| a.id)
         .collect()
 }
@@ -2379,6 +2385,7 @@ fn spawn_session(
         if let Err(e) = writer.set_asr_engine(&engine) {
             eprintln!("引擎身份写入失败(不影响录制): {e}");
         }
+        let partial_mode = live_caption_mode(&engine);
         // —— 移交前一次性读完全部元信息(note_id/dir/base_ms/registry 快照):writer
         // 即将整体移交 lifecycle actor(单写者),此后本线程不得再持它的任何引用,
         // 一切写经信箱。——
@@ -2542,7 +2549,7 @@ fn spawn_session(
             std::time::Duration::from_millis(session::ECHO_HOLD_MS),
             language_filter,
             16000,
-            16000,
+            partial_mode,
             audio_sinks,
             aec_roles,
             move |src, text, start_ms, end_ms, spk, rms| {
@@ -8898,6 +8905,21 @@ fn parse_input_volume(stdout: &str) -> Option<u8> {
     Some(v.min(100) as u8)
 }
 
+/// 录音时实时字幕的出法(见 pipeline::live_caption)。本机 sherpa 引擎且装了流式
+/// 模型 → 流式(实测同段 CPU 为整句重识别的 1/5);Apple 引擎跑在神经网络引擎上,
+/// 重识别本就便宜,保持原样;云端自带流式预览,传什么都不用。
+fn live_caption_mode(engine_id: &str) -> session::PartialMode {
+    let root = models::root();
+    if engine_id != settings::ASR_APPLE
+        && !engine_id.starts_with("cloud:")
+        && asr::streaming::stream_model_present(&root)
+    {
+        session::PartialMode::Stream(asr::streaming::stream_dir(&root))
+    } else {
+        session::PartialMode::Resample(16000)
+    }
+}
+
 /// 主窗口当前是否可见(前端按 visibilitychange 上报)。藏到托盘/最小化时为 false,
 /// 只服务界面的高频推送(电平)据此停发。默认 true:前端还没报之前照常发。
 static UI_VISIBLE: AtomicBool = AtomicBool::new(true);
@@ -9994,10 +10016,13 @@ mod tests {
     #[test]
     fn download_selection_defaults_to_required_plus_speaker() {
         use super::default_download_ids;
+        // 本机 sherpa 选型:附带流式模型(实时字幕省电)。
         let ids = default_download_ids("sense_voice");
-        assert_eq!(ids, vec!["vad", "speaker", "asr"]);
+        assert_eq!(ids, vec!["vad", "speaker", "asr", "dictation_stream"]);
         let ids = default_download_ids("whisper");
-        assert_eq!(ids, vec!["vad", "speaker", "whisper"]);
+        assert_eq!(ids, vec!["vad", "speaker", "whisper", "dictation_stream"]);
+        // Apple 选型:实时字幕不走流式,不多下。
+        assert!(!default_download_ids(crate::settings::ASR_APPLE).contains(&"dictation_stream"));
     }
 
     #[test]

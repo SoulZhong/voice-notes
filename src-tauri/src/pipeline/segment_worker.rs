@@ -1,10 +1,14 @@
 use crate::audio::{resample::StreamResampler, to_mono, AudioFrame, Source};
+use crate::pipeline::live_caption::CaptionFeed;
 use crate::pipeline::segmenter::Segmenter;
 use crate::session::{FinalJob, PartialJob};
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// 实时字幕开口补偿:判定开口时往前补的音频(0.4s @16kHz)。
+const CAPTION_PREROLL: usize = 6400;
 
 /// 电平上报节流窗口：1600 样本 = 100ms @16kHz。
 pub const LEVEL_INTERVAL_SAMPLES: usize = 1600;
@@ -122,11 +126,19 @@ fn emit_finished(
     finals_tx: &Sender<FinalJob>,
     source: Source,
     target_rate: u32,
+    caption: Option<&CaptionFeed>,
 ) -> usize {
     let ms = |samples: usize| samples as u64 * 1000 / target_rate as u64;
     let mut n = 0;
     for seg in segmenter.take_finished() {
-        *partial_slot.lock().unwrap() = None;
+        {
+            // 清预览与句号 +1 在同一把槽锁里:字幕线程据此丢掉已定稿句子的迟到预览。
+            let mut slot = partial_slot.lock().unwrap();
+            *slot = None;
+            if let Some(c) = caption {
+                c.epoch.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let (start_ms, end_ms) = (ms(seg.start), ms(seg.start + seg.samples.len()));
         if finals_tx
             .send(FinalJob { source, samples: seg.samples, start_ms, end_ms })
@@ -135,6 +147,11 @@ fn emit_finished(
             eprintln!("segment_worker: finals 通道已关闭，一段完成句被丢弃 ({source:?})");
         }
         n += 1;
+    }
+    if n > 0 {
+        if let Some(c) = caption {
+            c.reset(source);
+        }
     }
     n
 }
@@ -151,8 +168,40 @@ fn emit_finished(
 /// aec（软件回声消除,capture_path=aec 路径）:system 路 Render 喂远端参考(样本不变),
 /// mic 路 Capture 消回声——sink 与 accept 收到的都是消除后的干净样本,录音回放与
 /// 转写一致。电平表在 AEC 之前:反映麦克风真实听到的(含外放),供确认设备存活。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn run_segment_worker(
+    source: Source,
+    frame_rx: Receiver<AudioFrame>,
+    target_rate: u32,
+    partial_interval_samples: usize,
+    finals_tx: Sender<FinalJob>,
+    partial_slot: Arc<Mutex<Option<PartialJob>>>,
+    segmenter: Box<dyn Segmenter>,
+    paused: Arc<AtomicBool>,
+    on_level: Option<Box<dyn Fn(f32) + Send>>,
+    audio_sink: Option<Box<dyn FnMut(&[f32]) + Send>>,
+    aec: Option<crate::audio::aec::AecRole>,
+) {
+    run_segment_worker_with_caption(
+        source,
+        frame_rx,
+        target_rate,
+        partial_interval_samples,
+        finals_tx,
+        partial_slot,
+        segmenter,
+        paused,
+        on_level,
+        audio_sink,
+        aec,
+        None,
+    )
+}
+
+/// 同 [`run_segment_worker`],另带实时字幕的喂料端(见 pipeline::live_caption)。
+/// `caption` 为 Some 时不再按 `partial_interval_samples` 交整句重识别。
+#[allow(clippy::too_many_arguments)]
+pub fn run_segment_worker_with_caption(
     source: Source,
     frame_rx: Receiver<AudioFrame>,
     target_rate: u32,
@@ -164,8 +213,14 @@ pub fn run_segment_worker(
     on_level: Option<Box<dyn Fn(f32) + Send>>,
     mut audio_sink: Option<Box<dyn FnMut(&[f32]) + Send>>,
     mut aec: Option<crate::audio::aec::AecRole>,
+    caption: Option<CaptionFeed>,
 ) {
     let mut since_partial: usize = 0;
+    // 实时字幕(流式):说话期间把音频喂给字幕线程;有它就不再按间隔交整句重识别。
+    let mut caption_in_speech = false;
+    // 最近一小段音频:VAD 判定「开口」总晚半拍,开口时把判定点之前的这段一并补给
+    // 字幕,不然每句开头的字会被吞(定稿那边靠 pad_segment 补,同理)。
+    let mut preroll: std::collections::VecDeque<f32> = std::collections::VecDeque::new();
     let mut was_paused = false;
     let mut level_sumsq: f64 = 0.0;
     let mut level_count: usize = 0;
@@ -202,9 +257,10 @@ pub fn run_segment_worker(
                 was_paused = true;
                 // 暂停跳变：在途语句立刻定稿（不丢已说的话），清预览。
                 segmenter.flush();
-                emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate);
+                emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate, caption.as_ref());
                 *partial_slot.lock().unwrap() = None;
                 since_partial = 0;
+                caption_in_speech = false;
             }
             // 暂停跳变那一帧要做 flush + 定稿,同样能阻塞 worker;记进 vad 档,
             // 免得成为账本盲区(Codex review P2)。
@@ -242,13 +298,35 @@ pub fn run_segment_worker(
         let stage_t = std::time::Instant::now();
         since_partial += resampled.len();
         segmenter.accept(&resampled);
-        if emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate) > 0 {
+        if emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate, caption.as_ref()) > 0 {
             since_partial = 0;
+            caption_in_speech = false;
         }
-        if since_partial >= partial_interval_samples {
+        if let Some(c) = &caption {
+            preroll.extend(resampled.iter().copied());
+            let keep = CAPTION_PREROLL + target_rate as usize * 2;
+            if preroll.len() > keep {
+                preroll.drain(..preroll.len() - keep);
+            }
+            if segmenter.in_speech() {
+                if caption_in_speech {
+                    c.audio(source, &resampled);
+                } else if let Some(cur) = segmenter.current_partial() {
+                    // 刚开口:判定点之前的一小段 + 分段器已攒下的这句开头(含本帧)一次补给字幕。
+                    let before = preroll.len().saturating_sub(cur.len());
+                    let from = before.saturating_sub(CAPTION_PREROLL);
+                    let mut onset: Vec<f32> = preroll.range(from..before).copied().collect();
+                    onset.extend_from_slice(&cur);
+                    c.audio(source, &onset);
+                    caption_in_speech = true;
+                }
+            } else {
+                caption_in_speech = false;
+            }
+        } else if since_partial >= partial_interval_samples {
             since_partial = 0;
             *partial_slot.lock().unwrap() =
-                segmenter.current_partial().map(|cur| PartialJob { source, samples: cur });
+                segmenter.current_partial().map(|cur| PartialJob { source, samples: cur, text: None });
         }
         clock.frame(t_resample, t_level, t_aec, t_sink, stage_t.elapsed());
     }
@@ -269,7 +347,7 @@ pub fn run_segment_worker(
         }
     }
     segmenter.flush();
-    emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate);
+    emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate, caption.as_ref());
 }
 
 #[cfg(test)]
@@ -452,6 +530,64 @@ mod tests {
 
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn with_captions_speech_goes_to_the_caption_thread_not_the_recognizer() {
+        use crate::pipeline::live_caption::{test_feed, CaptionMsg};
+        let (ftx, frx) = crossbeam_channel::bounded::<AudioFrame>(256);
+        let (final_tx, final_rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let slot = Arc::new(Mutex::new(None));
+        let slot2 = slot.clone();
+        let (feed, cap_rx) = test_feed();
+        let epoch = feed.epoch.clone();
+        let worker = std::thread::spawn(move || {
+            run_segment_worker_with_caption(
+                Source::Mic,
+                frx,
+                16000,
+                100, // 旧做法下几乎每帧都会交整句重识别
+                final_tx,
+                slot2,
+                Box::new(MockSegmenter::new(2000)),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                None,
+                None,
+                Some(feed),
+            );
+        });
+        for _ in 0..5 {
+            ftx.send(AudioFrame {
+                samples: vec![0.1; 500],
+                sample_rate: 16000,
+                channels: 1,
+                host_time_ns: None,
+                synthetic: false,
+            })
+            .unwrap();
+        }
+        drop(ftx);
+        worker.join().unwrap();
+        // 2500 样本:定稿一句(2000),尾段 flush 再定稿一句。
+        assert_eq!(final_rx.try_iter().count(), 2);
+        let msgs: Vec<CaptionMsg> = cap_rx.try_iter().collect();
+        let audio: usize = msgs
+            .iter()
+            .map(|m| match m {
+                CaptionMsg::Audio(_, a) => a.len(),
+                CaptionMsg::Reset(..) => 0,
+            })
+            .sum();
+        assert!(audio > 0, "说话中的音频应交给字幕线程");
+        let resets: Vec<u64> = msgs
+            .iter()
+            .filter_map(|m| if let CaptionMsg::Reset(_, e) = m { Some(*e) } else { None })
+            .collect();
+        assert_eq!(resets, [1, 2], "每句定稿换新流,句号递增");
+        assert_eq!(epoch.load(Ordering::SeqCst), 2);
+        // 不再有整句重识别的预览任务。
+        assert!(slot.lock().unwrap().is_none());
+    }
 
     #[test]
     fn pause_flushes_inflight_drops_frames_and_unpause_resumes_monotonic() {

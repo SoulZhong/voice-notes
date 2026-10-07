@@ -278,10 +278,11 @@ pub const ARTIFACTS: &[Artifact] = &[
     },
     // 设备听写的实时字幕(流式 zipformer 中英双语,int8)。终稿用已有的 SenseVoice。
     // 上游只发整包(fp32+int8 共 511MB),装好后剪掉 fp32 与测试音频,留 int8 约 190MB。
-    // 不是录制必需:只在用户第一次连接设备时按需下载(device 模块发起)。
+    // 不是录制必需:设备第一次连接时按需下载(device 模块发起),也可在模型页手动下。
     Artifact {
         id: "dictation_stream",
-        label: "设备听写实时字幕（流式识别）",
+        // 录音时的实时字幕也用它(pipeline::live_caption):装了就省电,不装退回整句重识别。
+        label: "实时字幕（流式识别，录音与设备听写共用，更省电）",
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.tar.bz2",
         kind: ArtifactKind::TarBz2 { dest_dir: STREAM_DIR },
         approx_mb: 488,

@@ -15,6 +15,10 @@ pub trait Segmenter: Send {
     fn take_finished(&mut self) -> Vec<Segment>;
     /// 当前正在说、尚未定稿的语句音频；静音/无内容时返回 None。
     fn current_partial(&mut self) -> Option<Vec<f32>>;
+    /// 此刻是否在一句话里(有尚未定稿的语音)。不拷贝音频,供实时字幕判断要不要喂流式识别。
+    fn in_speech(&self) -> bool {
+        false
+    }
     /// 收尾：把尾部残留语句也切成完成段（录制结束时调用）。
     fn flush(&mut self);
 }
@@ -39,6 +43,10 @@ impl MockSegmenter {
 }
 
 impl Segmenter for MockSegmenter {
+    fn in_speech(&self) -> bool {
+        !self.current.is_empty()
+    }
+
     fn accept(&mut self, samples: &[f32]) {
         self.current.extend_from_slice(samples);
         while self.current.len() >= self.utterance_len {

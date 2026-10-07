@@ -6,7 +6,7 @@ use crate::diar::split::{
     SPLIT_WIN_MS,
 };
 use crate::diar::SpeakerEmbedder;
-use crate::pipeline::segment_worker::run_segment_worker;
+use crate::pipeline::segment_worker::run_segment_worker_with_caption;
 use crate::pipeline::segmenter::Segmenter;
 use crossbeam_channel::Receiver;
 use std::collections::VecDeque;
@@ -554,6 +554,24 @@ pub struct FinalJob {
 pub struct PartialJob {
     pub source: Source,
     pub samples: Vec<f32>,
+    /// 已由流式字幕识别好的预览文字(pipeline::live_caption):有它就直接显示,
+    /// 不再交识别器;此时 samples 为空。
+    pub text: Option<String>,
+}
+
+/// 录音时实时字幕怎么出(见 pipeline::live_caption)。
+pub enum PartialMode {
+    /// 每攒够这么多样本,把当前整句交本机识别器重识别一遍(旧做法;Apple 引擎与
+    /// 未装流式模型时用)。
+    Resample(usize),
+    /// 流式识别:说话期间一路喂给该目录下的流式模型,每段音频只算一次。
+    Stream(std::path::PathBuf),
+}
+
+impl From<usize> for PartialMode {
+    fn from(n: usize) -> Self {
+        PartialMode::Resample(n)
+    }
 }
 
 /// diarization 侧事件:说话人表变化 / 簇合并(需回写落盘与 UI)/ worker 结束时的质心快照
@@ -1282,6 +1300,11 @@ pub fn run_asr_worker(
                 for (src, slot) in &partial_slots {
                     let job = slot.lock().unwrap().take();
                     if let Some(job) = job {
+                        // 流式字幕已识别好:直接进预览链(回声抑制照旧),不再交识别器。
+                        if let Some(text) = job.text {
+                            sink.push_partial(*src, text);
+                            continue;
+                        }
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             recognizer.recognize(&job.samples)
                         })) {
@@ -2234,7 +2257,7 @@ pub fn start_session(
     // 多语会议可在设置里关闭。
     language_filter: bool,
     target_rate: u32,
-    partial_interval_samples: usize,
+    partial_mode: impl Into<PartialMode>,
     mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)>,
     mut aec_roles: Vec<(Source, crate::audio::aec::AecRole)>,
     on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>) + Send + 'static,
@@ -2253,6 +2276,19 @@ pub fn start_session(
     // 的源(与 slots 同节奏),否则会为一条根本没音频的源白开一次厂商流。
     let cloud_mode = matches!(engine, AsrEngine::Cloud { .. });
     let mut audio_rxs: Vec<(Source, Receiver<Vec<f32>>)> = Vec::new();
+    // 实时字幕:流式模式起一条字幕线程(云端自带流式预览,不用)。模型起不来退回
+    // 整句重识别,间隔放宽到 2s——旧的 1s 节拍在长句上 CPU 占实时一半以上。
+    let (partial_interval_samples, mut caption_feeds, caption_slots) = match partial_mode.into() {
+        PartialMode::Resample(n) => (n, Vec::new(), None),
+        PartialMode::Stream(_) if cloud_mode => (target_rate as usize, Vec::new(), None),
+        PartialMode::Stream(dir) => {
+            let srcs: Vec<Source> = sources.iter().map(|(s, _, _)| *s).collect();
+            match crate::pipeline::live_caption::spawn(dir, &srcs) {
+                Some((feeds, _handle, slots)) => (target_rate as usize, feeds, Some(slots)),
+                None => (target_rate as usize * 2, Vec::new(), None),
+            }
+        }
+    };
 
     for (source, mut capture, segmenter) in sources {
         let (ftx, frx) = crossbeam_channel::bounded::<AudioFrame>(256);
@@ -2267,6 +2303,13 @@ pub fn start_session(
         };
         let slot = Arc::new(Mutex::new(None));
         let slot_for_worker = slot.clone();
+        let caption = caption_feeds
+            .iter()
+            .position(|(s, _)| *s == source)
+            .map(|i| caption_feeds.swap_remove(i).1);
+        if let (Some(_), Some(reg)) = (&caption, &caption_slots) {
+            reg.lock().unwrap().push((source, slot.clone()));
+        }
         let final_tx = finals_tx.clone();
         // 先起 worker（消费者），再启动 capture：兼容同步灌帧的 MockCapture，
         // 且若 capture 启动失败，ftx 在 start 内被 drop → frx 关闭 → worker 立即退出。
@@ -2284,7 +2327,7 @@ pub fn start_session(
             .map(|i| aec_roles.swap_remove(i).1);
         let paused_w = paused.clone();
         let w = std::thread::spawn(move || {
-            run_segment_worker(
+            run_segment_worker_with_caption(
                 source,
                 frx,
                 target_rate,
@@ -2296,6 +2339,7 @@ pub fn start_session(
                 level_cb,
                 audio_sink,
                 aec_role,
+                caption,
             );
         });
         match capture.start(ftx) {
@@ -2515,7 +2559,7 @@ mod asr_worker_tests {
     #[test]
     fn services_latest_partial_when_idle() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        let slot = Arc::new(Mutex::new(Some(PartialJob { source: Source::System, samples: vec![0.0; 7] })));
+        let slot = Arc::new(Mutex::new(Some(PartialJob { source: Source::System, samples: vec![0.0; 7], text: None })));
         let partials = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
         let p2 = partials.clone();
         let slot_for_worker = slot.clone();
@@ -2568,7 +2612,7 @@ mod asr_worker_tests {
     #[test]
     fn mic_partial_echoing_system_partial_is_suppressed_in_preview() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        let sys_slot = Arc::new(Mutex::new(Some(PartialJob { source: Source::System, samples: vec![0.0; 7] })));
+        let sys_slot = Arc::new(Mutex::new(Some(PartialJob { source: Source::System, samples: vec![0.0; 7], text: None })));
         let mic_slot = Arc::new(Mutex::new(None::<PartialJob>));
         let partials = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
         let (p2, sys2, mic2) = (partials.clone(), sys_slot.clone(), mic_slot.clone());
@@ -2594,7 +2638,7 @@ mod asr_worker_tests {
             "system 预览应被服务"
         );
         // 2) mic 预览同文本("len=7")→ 判回声,压成空串。
-        *mic_slot.lock().unwrap() = Some(PartialJob { source: Source::Mic, samples: vec![0.0; 7] });
+        *mic_slot.lock().unwrap() = Some(PartialJob { source: Source::Mic, samples: vec![0.0; 7], text: None });
         assert!(
             poll_until(|| partials.lock().unwrap().contains(&(Source::Mic, String::new()))),
             "同文本 mic 预览应被压成空串"
@@ -2604,7 +2648,7 @@ mod asr_worker_tests {
             "被抑制的 mic 预览文本不得透出"
         );
         // 3) mic 预览不相似("len=1234" vs "len=7",编辑距离分 0.5 < 0.6)→ 原样透传。
-        *mic_slot.lock().unwrap() = Some(PartialJob { source: Source::Mic, samples: vec![0.0; 1234] });
+        *mic_slot.lock().unwrap() = Some(PartialJob { source: Source::Mic, samples: vec![0.0; 1234], text: None });
         assert!(
             poll_until(|| partials.lock().unwrap().contains(&(Source::Mic, "len=1234".into()))),
             "不相似的 mic 预览应原样透传"
@@ -2729,7 +2773,7 @@ mod asr_worker_tests {
     #[test]
     fn pending_mic_hold_extends_while_system_partial_in_flight() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        let sys_slot = Arc::new(Mutex::new(Some(PartialJob { source: Source::System, samples: vec![0.0; 7] })));
+        let sys_slot = Arc::new(Mutex::new(Some(PartialJob { source: Source::System, samples: vec![0.0; 7], text: None })));
         let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
         let partials = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
         let (f2, p2, sys2) = (finals.clone(), partials.clone(), sys_slot.clone());
@@ -2810,7 +2854,7 @@ mod asr_worker_tests {
             "system 段应先定稿"
         );
         // mic 预览同文本 → 被 recent_system 判据压掉。
-        *mic_slot.lock().unwrap() = Some(PartialJob { source: Source::Mic, samples: vec![0.0; 4000] });
+        *mic_slot.lock().unwrap() = Some(PartialJob { source: Source::Mic, samples: vec![0.0; 4000], text: None });
         assert!(
             poll_until(|| partials.lock().unwrap().contains(&(Source::Mic, String::new()))),
             "与最近 system 定稿同文本的 mic 预览应被压掉"
@@ -3867,6 +3911,102 @@ mod session_tests {
         }
         fn stop(&mut self) {
             self.stop_tx = None;
+        }
+    }
+
+    /// 手动端到端:真实 Silero 分段 + SenseVoice 定稿,按实时节奏灌一段录音,对比两种实时字幕
+    /// 的 CPU 与界面上实际出现的预览。
+    /// VN_STREAM_WAV=<16k wav> VN_CAPTION_MODE=stream|resample cargo test live_caption_e2e -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_caption_e2e() {
+        struct PacedCapture {
+            frames: Vec<AudioFrame>,
+        }
+        impl AudioCapture for PacedCapture {
+            fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()> {
+                let frames = std::mem::take(&mut self.frames);
+                std::thread::spawn(move || {
+                    let t0 = std::time::Instant::now();
+                    for (i, f) in frames.into_iter().enumerate() {
+                        let due = std::time::Duration::from_millis(20 * (i as u64 + 1));
+                        if let Some(w) = due.checked_sub(t0.elapsed()) {
+                            std::thread::sleep(w);
+                        }
+                        if sink.send(f).is_err() {
+                            return;
+                        }
+                    }
+                });
+                Ok(())
+            }
+            fn stop(&mut self) {}
+        }
+        fn cpu() -> f64 {
+            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            let t = |v: libc::timeval| v.tv_sec as f64 + v.tv_usec as f64 / 1e6;
+            t(u.ru_utime) + t(u.ru_stime)
+        }
+        let wav = std::env::var("VN_STREAM_WAV").expect("VN_STREAM_WAV");
+        let mode = std::env::var("VN_CAPTION_MODE").unwrap_or_else(|_| "stream".into());
+        let root = crate::models::root();
+        let pcm: Vec<f32> = vibe_device::sim::read_wav(std::path::Path::new(&wav))
+            .unwrap()
+            .iter()
+            .map(|s| *s as f32 / 32768.0)
+            .collect();
+        let secs = pcm.len() as f64 / 16000.0;
+        // 末尾补 2s 静音,让最后一句被 VAD 收尾。
+        let mut padded = pcm.clone();
+        padded.extend(std::iter::repeat_n(0.0, 32000));
+        let frames: Vec<AudioFrame> = padded
+            .chunks(320)
+            .map(|c| AudioFrame { samples: c.to_vec(), sample_rate: 16000, channels: 1, host_time_ns: None, synthetic: false })
+            .collect();
+        let seg = crate::pipeline::silero::SileroSegmenter::new(&root.join("silero_vad.onnx")).unwrap();
+        let rec = crate::asr::sense_voice::SenseVoiceRecognizer::new(&crate::models::asr_model_dir("sense_voice"), None).unwrap();
+        let partial_mode = if mode == "stream" {
+            PartialMode::Stream(crate::asr::streaming::stream_dir(&root))
+        } else {
+            PartialMode::Resample(16000)
+        };
+        let partials = Arc::new(Mutex::new(Vec::<(f64, String)>::new()));
+        let finals = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (p2, f2) = (partials.clone(), finals.clone());
+        let t0 = std::time::Instant::now();
+        let c0 = cpu();
+        let start = start_session(
+            vec![(Source::Mic, Box::new(PacedCapture { frames }) as Box<dyn AudioCapture>, Box::new(seg) as Box<dyn Segmenter>)],
+            AsrEngine::Local(Box::new(rec)),
+            None,
+            SpeakerRegistry::new(),
+            TEST_ECHO_HOLD,
+            false,
+            16000,
+            partial_mode,
+            vec![],
+            vec![],
+            move |_, t, _, _, _, _| f2.lock().unwrap().push(t),
+            move |_, t| {
+                if !t.is_empty() {
+                    p2.lock().unwrap().push((t0.elapsed().as_secs_f64(), t));
+                }
+            },
+            |_| {},
+            None,
+        )
+        .expect("start_session");
+        std::thread::sleep(std::time::Duration::from_secs_f64(secs + 4.0));
+        let _ = start.handle.stop();
+        let used = cpu() - c0;
+        let p = partials.lock().unwrap();
+        println!("== 模式 {mode}:音频 {secs:.1}s,整场 CPU {used:.2}s({:.0}% 实时),预览 {} 版", used / secs * 100.0, p.len());
+        for (t, x) in p.iter().step_by((p.len() / 12).max(1)) {
+            println!("  {t:5.1}s 预览: {x}");
+        }
+        for f in finals.lock().unwrap().iter() {
+            println!("  定稿: {f}");
         }
     }
 
