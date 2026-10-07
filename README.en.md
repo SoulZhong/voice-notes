@@ -28,6 +28,7 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 - **Never lose a sentence**: every finalized segment is flushed to disk as it happens. Crashes, power loss, or accidental quits don't lose transcribed content, and interrupted meetings can be resumed with seamless timeline and speaker numbering.
 - **Playback & verification**: original audio is kept per track (auto-compressed to AAC, ~14 MB/hour/source). Click any sentence's timestamp to listen from there, with the playhead followed lyrics-style.
 - **WYSIWYG Markdown notes**: raw and refined transcripts share a Milkdown editor. Raw transcripts keep their sentence structure; refined transcripts support Markdown headings, lists, quotes, emphasis, and more, with save-on-pause or blur. You can also reassign speakers, rename notes, and export Markdown / plain text.
+- **Device dictation (AI Passport)**: speak into the wearable AI Passport and the text lands in the current conversation of Orca, ChatGPT (Codex), WeChat or WeCom, ready to send or undo; the device alerts you when an agent is waiting for you. macOS uses Apple Speech; Windows uses an on-device streaming model for live text plus a second pass over the whole utterance. Every insert is filed per conversation as a "dictation note" next to your meeting notes. On by default, but nothing happens (no Bluetooth scan, no permission prompts, no model download) until you click Connect device.
 - **Native system integration**: menu bar tray, global shortcut for start/stop, launch at login, light & dark themes.
 - **Bilingual interface**: switch between 中文 / English / follow-system in Settings; the UI and the menu bar update immediately, no restart needed.
 - **Tuned for Chinese-centric meetings**: SenseVoice (zh/en/ja/ko/yue) by default with optional Whisper, plus a language-hallucination filter that drops garbage output on silence.
@@ -103,9 +104,11 @@ Works out of the box — every setting has a sensible default. Adjust as needed 
 git clone https://github.com/SoulZhong/voice-notes.git
 cd voice-notes
 npm install
-npm run tauri dev      # development
+npm run dev:app        # development (separate identifier com.teemo.voice-notes.dev)
 npm run tauri build    # build the .app + .dmg
 ```
+
+`npm run dev:app` runs the development build under its own app identifier: data directory, system permissions and the device link stay apart from your installed copy, so hot reloads never touch a recording in progress there. `npm run tauri dev` shares data with the installed app.
 
 On Windows, run the same commands in “Developer PowerShell for VS 2022”; `npm run tauri build` produces the Windows installer. If PowerShell blocks `npm.ps1`, use `npm.cmd run tauri dev` / `npm.cmd run tauri build`.
 

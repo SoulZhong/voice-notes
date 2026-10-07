@@ -25,6 +25,7 @@
   import ContextGuide from "$lib/ContextGuide.svelte";
   import MiniPlayer from "$lib/MiniPlayer.svelte";
   import RecordRiskDialog from "$lib/RecordRiskDialog.svelte";
+  import DevicePinDialog from "$lib/DevicePinDialog.svelte";
   import { playback, shouldShowMiniPlayer, startPlaybackSubscriptions } from "$lib/playback.svelte";
   import { gapStorm, startGapStormSubscription } from "$lib/gapStorm.svelte";
   import { initAnalytics } from "$lib/analytics";
@@ -164,6 +165,7 @@
   <Sidebar />
   <!-- 开录前风险确认:两个开录入口共用,挂一处。 -->
   <RecordRiskDialog />
+  <DevicePinDialog />
   <main class="main" class:with-orb-safearea={showMiniPlayer}>
     {#if update}
       <div class="update-banner">

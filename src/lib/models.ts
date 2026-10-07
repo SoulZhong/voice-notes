@@ -99,6 +99,15 @@ export type Settings = {
   audio_scheme: "a" | "ab" | "b";
   calendar_match_enabled: boolean;
   identify_auto_apply: boolean;
+  /** 设备听写总开关(默认开;未连过设备前不扫蓝牙、不要权限、不下模型)。 */
+  device_enabled: boolean;
+  /** 连过的设备名;只归设备连接流程写,set_settings 会保留后端值。 */
+  device_name?: string | null;
+  /** 听写识别引擎:"auto" / "apple" / "sherpa"。 */
+  dictation_engine: string;
+  dictation_save_text: boolean;
+  dictation_save_audio: boolean;
+  dictation_ai_access: boolean;
 };
 export type ModelDownloadEvent = {
   artifact: string;
