@@ -572,8 +572,10 @@ impl TranscodeQueue {
         std::thread::spawn(move || loop {
             // 录制中让路:转码要抢 CPU,录制阶段优先保采集不卡顿,所以录制中只 sleep 不出队。
             // 用短睡眠轮询而非 cv:`running` 不归本锁管(是 AppState 的),没法在它变化时被
-            // notify;停录属低频事件,2s 的让路延迟无感。
-            if *running.lock().unwrap() {
+            // notify;停录属低频事件,2s 的让路延迟无感。只在**有活排着**时才这样轮询
+            // (省电,2026-10-07):没活就落到下面无超时地等 enqueue 的 notify。
+            let recording = *running.lock().unwrap();
+            if recording && !me.state.lock().unwrap().queue.is_empty() {
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
@@ -581,10 +583,11 @@ impl TranscodeQueue {
             let next = {
                 let mut st = me.state.lock().unwrap();
                 if st.paused || st.queue.is_empty() {
-                    // 无活可做:带 2s 超时挂起。超时是为了周期性回到外层重判 `running`
-                    //(它不受本 cv 管,只能靠超时轮询);被 enqueue/unpause 的 notify 提前
-                    // 唤醒则更及时。无论哪种唤醒,都 continue 回外层从头重判所有条件。
-                    let _ = me.cv.wait_timeout(st, Duration::from_secs(2)).unwrap();
+                    // 无活可做(或迁移暂停中):挂起到 enqueue/unpause 的 notify。旧做法带 2s
+                    // 超时,只为回外层重判 `running`——但没活时 running 无关紧要,有活时外层
+                    // 自己会轮询;超时等于让应用一辈子每 2s 醒一次(省电,2026-10-07)。
+                    // 无论哪种唤醒,都 continue 回外层从头重判所有条件。
+                    drop(me.cv.wait(st).unwrap());
                     continue;
                 }
                 let dir = st.queue.pop_front().unwrap();

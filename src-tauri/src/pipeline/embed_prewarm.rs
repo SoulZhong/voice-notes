@@ -27,6 +27,8 @@ pub struct Job {
     pub end_ms: u64,
 }
 
+/// 空闲多久放掉预热用的声纹模型(录音间隙短于它时不必反复加载)。
+const IDLE_RELEASE: Duration = Duration::from_secs(300);
 /// 攒批阈值:每满 8 条合并写一次 embeddings.json,避免逐段整写 O(n²) 磁盘量。
 const FLUSH_EVERY: usize = 8;
 /// 音频未落齐的段最多重试次数。
@@ -90,9 +92,24 @@ fn worker(app: tauri::AppHandle, rx: crossbeam_channel::Receiver<Msg>) {
     // 音频未落齐推迟重试的段:(job, 已试次数, 到期时刻)。
     let mut deferred: Vec<(Job, u8, std::time::Instant)> = Vec::new();
     loop {
-        let msg = match rx.recv_timeout(Duration::from_secs(10)) {
+        // 省电(2026-10-07):手上有攒批/推迟项才按 10s 节拍醒;全清空后再等
+        // IDLE_RELEASE 无活就放掉声纹模型(它与共享模型是两份),之后无超时地等下一段——
+        // 旧做法首场录音后每 10s 醒一次、模型常驻到退出。
+        let idle = pending.is_empty() && deferred.is_empty();
+        let wait = if idle { IDLE_RELEASE } else { Duration::from_secs(10) };
+        let got = if idle && embedder.is_none() {
+            rx.recv().map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)
+        } else {
+            rx.recv_timeout(wait)
+        };
+        let msg = match got {
             Ok(m) => Some(m),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if idle {
+                    embedder = None;
+                }
+                None
+            }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 flush_all(&mut pending);
                 return;

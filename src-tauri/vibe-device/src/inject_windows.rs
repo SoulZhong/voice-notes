@@ -89,6 +89,11 @@ fn matches(ids: &[String], exe: &str) -> bool {
 }
 
 /// Whether an app with this id (or an alias) is running.
+/// Not tracked on Windows: polling keeps its awake pace.
+pub fn display_asleep() -> bool {
+    false
+}
+
 pub fn app_running(id: &str) -> bool {
     let ids = app_ids(id);
     processes().iter().any(|(_, exe)| matches(&ids, exe))

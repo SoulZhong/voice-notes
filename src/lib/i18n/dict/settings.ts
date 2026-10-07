@@ -27,6 +27,8 @@ export const zh = {
   "settings.autostart.saveFailed": "开机自启设置失败: {e}",
   "settings.tray.label": "菜单栏常驻",
   "settings.tray.desc": "关闭窗口只隐藏到菜单栏,录制不中断",
+  "settings.device.label": "设备",
+  "settings.device.desc": "用 AI Passport 设备听写;关闭后隐藏左侧「设备」菜单并断开设备,已保存的听写笔记不受影响",
 
   // —— 存储 ——
   "settings.section.store": "存储",
@@ -250,6 +252,8 @@ export const en = {
   "settings.autostart.saveFailed": "Failed to set launch at login: {e}",
   "settings.tray.label": "Keep in menu bar",
   "settings.tray.desc": "Closing the window hides it to the menu bar; recording continues",
+  "settings.device.label": "Device",
+  "settings.device.desc": "Dictate with an AI Passport device; when off, the Device menu is hidden and the device disconnected (saved dictation notes stay)",
 
   "settings.section.store": "Storage",
   "settings.store.dataDir": "Data directory",

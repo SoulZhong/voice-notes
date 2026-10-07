@@ -51,6 +51,19 @@ pub fn app_running(bundle_id: &str) -> bool {
     running_app(bundle_id).is_some()
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsAsleep(display: u32) -> u32;
+}
+
+/// The main display is asleep: nobody is looking, background polling can
+/// slow right down.
+pub fn display_asleep() -> bool {
+    // SAFETY: plain CoreGraphics queries without arguments to keep alive.
+    unsafe { CGDisplayIsAsleep(CGMainDisplayID()) != 0 }
+}
+
 fn frontmost_app() -> Option<Retained<NSRunningApplication>> {
     NSWorkspace::sharedWorkspace().frontmostApplication()
 }

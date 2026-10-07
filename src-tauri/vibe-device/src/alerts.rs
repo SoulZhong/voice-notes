@@ -387,6 +387,11 @@ pub struct TurnWatch {
 }
 
 impl TurnWatch {
+    /// Some agent session is mid-turn, so its end should be noticed soon.
+    pub fn any_working(&self) -> bool {
+        self.last.values().any(|s| *s == AgentState::Working)
+    }
+
     pub fn turned_waiting(&mut self, sessions: &[OrcaSession]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashMap::new();

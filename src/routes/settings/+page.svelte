@@ -38,6 +38,7 @@
   import { refineReady } from "$lib/refineReady";
   import EditableField from "$lib/EditableField.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { deviceMenu } from "$lib/deviceMenu.svelte";
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
   import Segmented from "$lib/Segmented.svelte";
@@ -904,6 +905,24 @@
           bind:checked={trayEnabled}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.tray_enabled = trayEnabled))}
+        />
+      </label>
+      <!-- 设备(AI Passport 听写)总开关:关掉即隐藏左侧「设备」菜单并断开设备 -->
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.device.label")}</span>
+          <span class="row-desc">{t("settings.device.desc")}</span>
+        </div>
+        <input
+          type="checkbox"
+          class="ctl switch"
+          checked={settings?.device_enabled ?? true}
+          disabled={!settings}
+          onchange={async (e) => {
+            const on = (e.target as HTMLInputElement).checked;
+            await saveSetting((s) => (s.device_enabled = on));
+            deviceMenu.visible = settings?.device_enabled !== false;
+          }}
         />
       </label>
       <!-- 隐私:欢迎页文案承诺了这个开关的存在(shell.welcome.telemetryHint),

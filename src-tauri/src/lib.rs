@@ -2626,7 +2626,22 @@ fn spawn_session(
             },
             {
                 let app_l = app.clone();
+                // 省电(2026-10-07):电平只给录制页的波形与指示灯用。窗口藏起来时
+                // 一条都不发;可见时每路限到 5Hz(源头 10Hz,每源一份,两路即 20 条/秒)。
+                let last_emit = std::sync::Mutex::new(std::collections::HashMap::<&'static str, std::time::Instant>::new());
                 Some(std::sync::Arc::new(move |source: crate::audio::Source, rms: f32| {
+                    if !UI_VISIBLE.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let now = std::time::Instant::now();
+                    {
+                        let mut last = last_emit.lock().unwrap_or_else(|e| e.into_inner());
+                        let key = source.as_str();
+                        if last.get(key).is_some_and(|t| now.duration_since(*t) < LEVEL_EMIT_MIN) {
+                            return;
+                        }
+                        last.insert(key, now);
+                    }
                     let _ = app_l.emit("level", ipc::LevelEvent { source: source.as_str().into(), rms });
                 }) as std::sync::Arc<dyn Fn(crate::audio::Source, f32) + Send + Sync>)
             },
@@ -8876,9 +8891,22 @@ fn open_screen_capture_settings(app: AppHandle) -> Result<(), String> {
 
 /// 解析 `osascript -e 'input volume of (get volume settings)'` 的 stdout(0..100)。
 /// trim 后按十进制解析,越界截到 100,空/非数字 → None。
+/// 线上已改走 CoreAudio;保留给下面的对照测试,核对两条路读数一致。
+#[cfg(test)]
 fn parse_input_volume(stdout: &str) -> Option<u8> {
     let v: u32 = stdout.trim().parse().ok()?;
     Some(v.min(100) as u8)
+}
+
+/// 主窗口当前是否可见(前端按 visibilitychange 上报)。藏到托盘/最小化时为 false,
+/// 只服务界面的高频推送(电平)据此停发。默认 true:前端还没报之前照常发。
+static UI_VISIBLE: AtomicBool = AtomicBool::new(true);
+/// 同一路电平两次推送的最小间隔(5Hz)。
+const LEVEL_EMIT_MIN: std::time::Duration = std::time::Duration::from_millis(190);
+
+#[tauri::command]
+fn set_ui_visible(visible: bool) {
+    UI_VISIBLE.store(visible, Ordering::Relaxed);
 }
 
 /// 读取 macOS 系统输入音量(0..100)。非 macOS / 读取失败 → None。录制页据此在普通
@@ -8889,14 +8917,8 @@ fn input_volume() -> Option<u8> {
     return None;
     #[cfg(target_os = "macos")]
     {
-        let out = std::process::Command::new("osascript")
-            .args(["-e", "input volume of (get volume settings)"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        parse_input_volume(&String::from_utf8_lossy(&out.stdout))
+        // 直接问 CoreAudio:旧做法每次起一个 osascript 进程,录制页每 4 秒一次。
+        audio::actual_rate::input_volume_scalar().map(|v| (v * 100.0).round() as u8)
     }
 }
 
@@ -9367,6 +9389,7 @@ pub fn run() {
             device::device_forget,
             device::device_submit_pin,
             device::device_open_accessibility,
+            set_ui_visible,
             device::device_grant_speech,
             device::list_dictation_notes,
             device::get_dictation_note,
@@ -10927,5 +10950,18 @@ mod input_volume_parse_tests {
         assert_eq!(parse_input_volume(""), None);
         assert_eq!(parse_input_volume("abc"), None);
         assert_eq!(parse_input_volume("missing value"), None); // 无输入设备时 osascript 的输出
+    }
+
+    /// 真机对照:CoreAudio 读数与 osascript 一致(cargo test … -- --ignored)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn core_audio_matches_osascript() {
+        let out = std::process::Command::new("osascript")
+            .args(["-e", "input volume of (get volume settings)"])
+            .output()
+            .unwrap();
+        let script = parse_input_volume(&String::from_utf8_lossy(&out.stdout));
+        assert_eq!(super::input_volume(), script);
     }
 }

@@ -136,6 +136,11 @@
     // 内部做了 try/catch,失败不影响后续任何初始化。
     void initAnalytics();
     recording.init();
+    // 窗口可见性报给后端:藏到托盘/最小化时后端停发只给界面看的高频事件(电平)。
+    const reportVisible = () =>
+      void invoke("set_ui_visible", { visible: document.visibilityState === "visible" }).catch(() => {});
+    reportVisible();
+    document.addEventListener("visibilitychange", reportVisible);
     // identify(P2a)完成即刷新收件箱:身份建议卡在 Aing 结束后自动出现,
     // 不等下一次 peopleVersion 变化。layout 常驻,不必解绑。
     const unIdentify = listen("identify_done", () => void tidy.refresh());

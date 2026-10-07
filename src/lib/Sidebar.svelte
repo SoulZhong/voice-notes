@@ -28,6 +28,7 @@
   import { graphFilter } from "$lib/graphFilter.svelte";
   import { noteGraphState } from "$lib/noteGraph.svelte";
   import { i18n, t } from "$lib/i18n/index.svelte";
+  import { deviceMenu, loadDeviceMenu } from "$lib/deviceMenu.svelte";
   import {
     listDictationNotes,
     deleteDictationNote,
@@ -237,6 +238,11 @@
       error = t("common.loadFailed", { e });
     }
   }
+
+  // 「设备」菜单是否显示:挂载时按设置对齐一次(之后由设置页开关直接改)。
+  $effect(() => {
+    loadDeviceMenu();
+  });
 
   // 设备听写写下新句子/撤销时后端发事件:列表上的计数与排序随之更新。
   $effect(() => {
@@ -452,11 +458,13 @@
       class:active={tab === "ai"}
       href="/ai">AI</a
     >
-    <button
-      class="vtab"
-      class:active={tab === "device"}
-      onclick={() => { if ($page.url.pathname !== "/device") goto("/device"); }}>{t("shell.tab.device")}</button
-    >
+    {#if deviceMenu.visible}
+      <button
+        class="vtab"
+        class:active={tab === "device"}
+        onclick={() => { if ($page.url.pathname !== "/device") goto("/device"); }}>{t("shell.tab.device")}</button
+      >
+    {/if}
     <button
       class="vtab"
       class:active={tab === "settings"}

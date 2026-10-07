@@ -35,19 +35,23 @@ pub mod pair_windows;
 /// Platform glue the runtime needs without knowing the platform.
 pub mod platform {
     #[cfg(target_os = "macos")]
-    pub use crate::inject_macos::{MacInjector as SystemInjector, app_running};
+    pub use crate::inject_macos::{MacInjector as SystemInjector, app_running, display_asleep};
 
     #[cfg(windows)]
-    pub use crate::inject_windows::{WinInjector as SystemInjector, app_running};
+    pub use crate::inject_windows::{WinInjector as SystemInjector, app_running, display_asleep};
 
     #[cfg(not(any(target_os = "macos", windows)))]
-    pub use self::unsupported::{SystemInjector, app_running};
+    pub use self::unsupported::{SystemInjector, app_running, display_asleep};
 
     #[cfg(not(any(target_os = "macos", windows)))]
     mod unsupported {
         use crate::session::{InjectError, Injector};
 
         pub fn app_running(_: &str) -> bool {
+            false
+        }
+
+        pub fn display_asleep() -> bool {
             false
         }
 
