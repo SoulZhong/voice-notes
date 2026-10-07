@@ -96,6 +96,8 @@ const SV_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
 pub const PF_DIR: &str = "sherpa-onnx-paraformer-zh-2023-09-14";
 pub const FR_DIR: &str = "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26";
 pub const QWEN3_DIR: &str = "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25";
+/// 设备听写流式模型目录(与 device::sherpa_stream::STREAM_DIR 同值)。
+pub const STREAM_DIR: &str = "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20";
 
 pub const ARTIFACTS: &[Artifact] = &[
     Artifact {
@@ -274,6 +276,44 @@ pub const ARTIFACTS: &[Artifact] = &[
             },
         ],
     },
+    // 设备听写的实时字幕(流式 zipformer 中英双语,int8)。终稿用已有的 SenseVoice。
+    // 上游只发整包(fp32+int8 共 511MB),装好后剪掉 fp32 与测试音频,留 int8 约 190MB。
+    // 不是录制必需:只在用户第一次连接设备时按需下载(device 模块发起)。
+    Artifact {
+        id: "dictation_stream",
+        label: "设备听写实时字幕（流式识别）",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.tar.bz2",
+        kind: ArtifactKind::TarBz2 { dest_dir: STREAM_DIR },
+        approx_mb: 488,
+        prune: &[
+            "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/encoder-epoch-99-avg-1.onnx",
+            "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/decoder-epoch-99-avg-1.onnx",
+            "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/joiner-epoch-99-avg-1.onnx",
+            "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/test_wavs",
+        ],
+        files: &[
+            FinalFile {
+                rel_path: "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/encoder-epoch-99-avg-1.int8.onnx",
+                bytes: 181_895_032,
+                sha256: "8fa764187a261844f859d7143ebaa563af5d10adfece4c18a8f414c88cba2a9b",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/decoder-epoch-99-avg-1.int8.onnx",
+                bytes: 13_091_040,
+                sha256: "1a70c593d71e53f023f5f55b0b4cfff5055abb786ee3992e5f63dc2e273cc4fa",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/joiner-epoch-99-avg-1.int8.onnx",
+                bytes: 3_228_404,
+                sha256: "1ed689c5ed19dbaa725d9d191bb4822b5f4855a39e1ffd28cbc1f340d25b2ee0",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/tokens.txt",
+                bytes: 56_317,
+                sha256: "a8e0e4ec53810e433789b54a5c0134a7eaa2ffca595a6334d54c00da858841d3",
+            },
+        ],
+    },
     // DTLN-aec 256 档：增值层神经残余回声消除。两个裸 onnx 工件（非压缩包），
     // 各自独立 URL/哈希，形状照抄 vad/speaker 的单文件 Artifact（File kind 一 url 一 file，
     // TarBz2 不适用——非压缩包）。not required_for_recording：模型不在场时清洗管线
@@ -447,15 +487,20 @@ mod tests {
     }
 
     #[test]
-    fn manifest_covers_ten_artifacts_with_qwen3_firered_whisper_paraformer_and_dtln_aec() {
+    fn manifest_covers_eleven_artifacts_with_qwen3_firered_whisper_paraformer_dictation_and_dtln_aec() {
         let ids: Vec<&str> = ARTIFACTS.iter().map(|a| a.id).collect();
         assert_eq!(
             ids,
             vec![
                 "vad", "speaker", "speaker-eres2netv2", "asr", "whisper", "paraformer",
-                "qwen3", "firered", "dtln_aec_256_1", "dtln_aec_256_2",
+                "qwen3", "firered", "dictation_stream", "dtln_aec_256_1", "dtln_aec_256_2",
             ]
         );
+        let d = ARTIFACTS.iter().find(|a| a.id == "dictation_stream").unwrap();
+        assert!(matches!(d.kind, ArtifactKind::TarBz2 { dest_dir: STREAM_DIR }));
+        assert_eq!(d.files.len(), 4, "int8 encoder/decoder/joiner + tokens");
+        assert!(d.prune.len() >= 3, "fp32 三件装好即删");
+        assert!(!required_now("dictation_stream", crate::settings::ASR_SENSE_VOICE), "听写模型不是录制必需");
         let w = ARTIFACTS.iter().find(|a| a.id == "whisper").unwrap();
         assert!(matches!(w.kind, ArtifactKind::TarBz2 { dest_dir: "sherpa-onnx-whisper-base" }));
         assert_eq!(w.files.len(), 3);

@@ -11,7 +11,8 @@
     "test": "vitest run --passWithNoTests",
     "check:macos-entitlements": "python3 scripts/check_macos_entitlements.py",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "dev:app": "tauri dev --config src-tauri/tauri.dev.conf.json"
   },
   "license": "AGPL-3.0-only",
   "dependencies": {

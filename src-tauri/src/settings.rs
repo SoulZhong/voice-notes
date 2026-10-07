@@ -259,7 +259,28 @@ pub struct Settings {
     /// 开启门槛是评测数据达标(spec:≥20 场标注、high 档 ≥50 样本误认 ≤1%),
     /// 由用户在设置页自行拨开。
     pub identify_auto_apply: bool,
+    /// 设备听写(AI Passport)总开关。默认开,但「开」只代表入口可用:用户第一次点
+    /// 「连接设备」之前不扫蓝牙、不申请权限、不下载模型(device_name 为 None 即未激活)。
+    pub device_enabled: bool,
+    /// 连过的设备名(`VibeVoice-XXXX`)。Some = 已激活:启动时自动去连。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    /// 听写识别引擎:"auto"(macOS 用 Apple 语音识别,不可用时退回 sherpa;Windows 用
+    /// sherpa)/ "apple" / "sherpa"(流式 zipformer 出实时字 + SenseVoice 出终稿)。
+    /// 与会议录制的 asr_model 分开设置:听写要快,录会要准。
+    pub dictation_engine: String,
+    /// 听写笔记:保存听写文字(默认开)/ 附带音频(默认关,保留 30 天)。
+    pub dictation_save_text: bool,
+    pub dictation_save_audio: bool,
+    /// 允许 MCP(AI 助手)读取听写笔记。默认关:听写里多是随口说的话和正在下给
+    /// Agent 的指令,被别的 Agent 读到可能引发意外连锁操作。
+    pub dictation_ai_access: bool,
 }
+
+/// 听写识别引擎档位(settings.dictation_engine)。
+pub const DICTATION_AUTO: &str = "auto";
+pub const DICTATION_APPLE: &str = "apple";
+pub const DICTATION_SHERPA: &str = "sherpa";
 
 /// `Settings` 反序列化的中间表征:逐字段镜像 `Settings`,携带解析期需要的默认值/重命名
 /// 属性(原本挂在 `Settings` 字段上的那些 `#[serde(default = ...)]`/`rename` 全部搬到这里)。
@@ -369,6 +390,18 @@ struct SettingsRepr {
     calendar_match_enabled: bool,
     #[serde(default)]
     identify_auto_apply: bool,
+    #[serde(default = "default_true")]
+    device_enabled: bool,
+    #[serde(default)]
+    device_name: Option<String>,
+    #[serde(default = "default_dictation_engine")]
+    dictation_engine: String,
+    #[serde(default = "default_true")]
+    dictation_save_text: bool,
+    #[serde(default)]
+    dictation_save_audio: bool,
+    #[serde(default)]
+    dictation_ai_access: bool,
 }
 
 impl From<SettingsRepr> for Settings {
@@ -458,6 +491,12 @@ impl From<SettingsRepr> for Settings {
             audio_retention: r.audio_retention,
             calendar_match_enabled: r.calendar_match_enabled,
             identify_auto_apply: r.identify_auto_apply,
+            device_enabled: r.device_enabled,
+            device_name: r.device_name.filter(|n| !n.trim().is_empty()),
+            dictation_engine: r.dictation_engine,
+            dictation_save_text: r.dictation_save_text,
+            dictation_save_audio: r.dictation_save_audio,
+            dictation_ai_access: r.dictation_ai_access,
         }
     }
 }
@@ -546,6 +585,7 @@ fn default_refine_agent() -> String {
 }
 
 fn default_asr_mode() -> String { ASR_MODE_LOCAL.into() }
+fn default_dictation_engine() -> String { DICTATION_AUTO.into() }
 fn default_cloud_provider() -> String { CLOUD_VOLCANO.into() }
 
 /// 当前选中厂商的凭证是否齐全(云端模式录制就绪的必要条件)。
@@ -602,6 +642,12 @@ impl Default for Settings {
             audio_retention: AudioRetention::Forever,
             calendar_match_enabled: true,
             identify_auto_apply: false,
+            device_enabled: true,
+            device_name: None,
+            dictation_engine: default_dictation_engine(),
+            dictation_save_text: true,
+            dictation_save_audio: false,
+            dictation_ai_access: false,
         }
     }
 }
