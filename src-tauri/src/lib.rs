@@ -1534,11 +1534,17 @@ fn effective_asr(m: String) -> String {
 }
 
 /// 默认下载集：遍历 ARTIFACTS 保序收集「当前选型录制必需」或声纹（speaker，增值但默认装）。
-/// 与旧行为等价：vad + 选中 ASR + speaker。download_models 的 None 分支用它。
+/// vad + 选中 ASR + speaker;选型不是 Apple 时再加流式模型(dictation_stream):本机
+/// sherpa 引擎的实时字幕靠它省电(录音时 CPU 约降到 1/4,见 pipeline::live_caption),
+/// Windows 默认 SenseVoice 正是这种情况。download_models 的 None 分支用它。
 fn default_download_ids(asr_model: &str) -> Vec<&'static str> {
     models::ARTIFACTS
         .iter()
-        .filter(|a| models::required_now(a.id, asr_model) || a.id == "speaker")
+        .filter(|a| {
+            models::required_now(a.id, asr_model)
+                || a.id == "speaker"
+                || (a.id == "dictation_stream" && asr_model != settings::ASR_APPLE)
+        })
         .map(|a| a.id)
         .collect()
 }
@@ -10010,10 +10016,13 @@ mod tests {
     #[test]
     fn download_selection_defaults_to_required_plus_speaker() {
         use super::default_download_ids;
+        // 本机 sherpa 选型:附带流式模型(实时字幕省电)。
         let ids = default_download_ids("sense_voice");
-        assert_eq!(ids, vec!["vad", "speaker", "asr"]);
+        assert_eq!(ids, vec!["vad", "speaker", "asr", "dictation_stream"]);
         let ids = default_download_ids("whisper");
-        assert_eq!(ids, vec!["vad", "speaker", "whisper"]);
+        assert_eq!(ids, vec!["vad", "speaker", "whisper", "dictation_stream"]);
+        // Apple 选型:实时字幕不走流式,不多下。
+        assert!(!default_download_ids(crate::settings::ASR_APPLE).contains(&"dictation_stream"));
     }
 
     #[test]
