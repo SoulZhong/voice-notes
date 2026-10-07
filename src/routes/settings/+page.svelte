@@ -1377,6 +1377,8 @@
   </section>
 
   <!-- —— 语音模型 —— -->
+  <!-- —— 设备听写(AI Passport)—— -->
+
   <section>
     <h2 class="section-title">{t("settings.section.models")}</h2>
     {#if status}

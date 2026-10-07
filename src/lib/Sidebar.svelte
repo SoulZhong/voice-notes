@@ -28,8 +28,16 @@
   import { graphFilter } from "$lib/graphFilter.svelte";
   import { noteGraphState } from "$lib/noteGraph.svelte";
   import { i18n, t } from "$lib/i18n/index.svelte";
+  import {
+    listDictationNotes,
+    deleteDictationNote,
+    onDictationNotesChanged,
+    type DictationSummary,
+  } from "$lib/device";
 
   let notes = $state<NoteSummary[]>([]);
+  /** 听写笔记(设备听写按会话归档):与会议笔记同列,按最后一次听写的时间插入。 */
+  let dictations = $state<DictationSummary[]>([]);
   let query = $state("");
   let error = $state("");
 
@@ -44,6 +52,8 @@
           ? "hooks"
           : $page.url.pathname.startsWith("/ai")
             ? "ai"
+            : $page.url.pathname === "/device" || $page.url.pathname.startsWith("/dictations")
+              ? "device"
             : $page.url.pathname === "/settings"
               ? "settings"
               : "notes",
@@ -200,13 +210,63 @@
   const filtered = $derived(
     query.trim() ? notes.filter((n) => n.title.toLowerCase().includes(query.trim().toLowerCase())) : notes,
   );
+  // 听写笔记按标签与句子文字过滤(笔记搜索搜得到听写内容)。
+  const filteredDictations = $derived(
+    query.trim()
+      ? dictations.filter((d) => d.search_text.toLowerCase().includes(query.trim().toLowerCase()))
+      : dictations,
+  );
+  type Row = { kind: "note"; at: string; n: NoteSummary } | { kind: "dictation"; at: string; d: DictationSummary };
+  /** 两种笔记合成一列:按时间倒序(会议看开始时间,听写看最后一次听写)。 */
+  const rows = $derived.by<Row[]>(() => {
+    const all: Row[] = [
+      // 设备页签只列听写笔记;录音页签两类同列(按时间穿插)。
+      ...(tab === "device" ? [] : filtered.map((n) => ({ kind: "note" as const, at: n.started_at, n }))),
+      ...filteredDictations.map((d) => ({ kind: "dictation" as const, at: d.updated_at, d })),
+    ];
+    return all.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+  });
 
   async function refresh() {
     try {
-      notes = await listNotes();
+      const [n, d] = await Promise.all([listNotes(), listDictationNotes().catch(() => [])]);
+      notes = n;
+      dictations = d;
       error = "";
     } catch (e) {
       error = t("common.loadFailed", { e });
+    }
+  }
+
+  // 设备听写写下新句子/撤销时后端发事件:列表上的计数与排序随之更新。
+  $effect(() => {
+    let un: (() => void) | null = null;
+    let disposed = false;
+    onDictationNotesChanged(() => refresh()).then((u) => {
+      if (disposed) u();
+      else un = u;
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  });
+
+  /** 听写笔记右键只有删除(标签跟随会话标题,不在这里改名)。 */
+  async function confirmDeleteDictation(d: DictationSummary) {
+    const yes = await ask(t("device.note.deleteConfirm.message", { label: d.label }), {
+      title: t("device.note.deleteConfirm.title"),
+      kind: "warning",
+      okLabel: t("device.note.deleteConfirm.ok"),
+      cancelLabel: t("shell.deleteConfirm.cancel"),
+    });
+    if (!yes) return;
+    try {
+      await deleteDictationNote(d.id);
+      await refresh();
+      if ($page.url.pathname === `/dictations/${d.id}`) goto("/");
+    } catch (e) {
+      error = t("common.deleteFailed", { e });
     }
   }
 
@@ -391,6 +451,11 @@
       class:vtab-upright={i18n.locale === "zh"}
       class:active={tab === "ai"}
       href="/ai">AI</a
+    >
+    <button
+      class="vtab"
+      class:active={tab === "device"}
+      onclick={() => { if ($page.url.pathname !== "/device") goto("/device"); }}>{t("shell.tab.device")}</button
     >
     <button
       class="vtab"
@@ -601,12 +666,41 @@
     <div class="banner">{error}</div>
   {/if}
 
-  {#if filtered.length === 0}
-    <p class="hint">{notes.length === 0 ? t("shell.notes.empty") : t("shell.notes.noMatch")}</p>
+  {#if rows.length === 0}
+    <p class="hint">
+      {tab === "device"
+        ? dictations.length === 0 ? t("device.notes.empty") : t("shell.notes.noMatch")
+        : notes.length + dictations.length === 0 ? t("shell.notes.empty") : t("shell.notes.noMatch")}
+    </p>
   {/if}
 
   <ul class="list">
-    {#each filtered as n (n.id)}
+    {#each rows as row (row.kind === "note" ? row.n.id : row.d.id)}
+      {#if row.kind === "dictation"}
+        {@const d = row.d}
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+        <li
+          class="item dictation"
+          class:current={$page.url.pathname === `/dictations/${d.id}`}
+          onclick={(e) => {
+            if ((e.target as HTMLElement).closest("button, input, a")) return;
+            goto(`/dictations/${d.id}`);
+          }}
+          oncontextmenu={(e) => {
+            e.preventDefault();
+            confirmDeleteDictation(d);
+          }}
+        >
+          <div class="main-line">
+            <a class="title" href="/dictations/{d.id}">
+              {d.label}
+              <span class="state dictation-tag">{t("device.note.kind")}</span>
+            </a>
+            <span class="meta">{formatDate(d.updated_at)} · {d.app} · {t("device.note.count", { n: d.count })}</span>
+          </div>
+        </li>
+      {:else}
+      {@const n = row.n}
       <!-- 行内 .title 锚点已提供键盘路径(Tab+Enter),li 的 onclick 是指针便利层 -->
       <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
       <li
@@ -647,6 +741,7 @@
           <span class="meta">{formatDate(n.started_at)} · {formatDuration(n.duration_secs)}</span>
         </div>
       </li>
+      {/if}
     {/each}
   </ul>
   {/if}
@@ -1116,6 +1211,11 @@
   .state.paused {
     background: var(--surface-press);
     color: var(--ink-secondary);
+  }
+  /* 听写笔记:天蓝浅色调标签,与会议笔记一眼区分(不是状态,是种类)。 */
+  .state.dictation-tag {
+    background: var(--tint-sky);
+    color: var(--tint-sky-ink);
   }
   /* 右键菜单:popover 规范(surface-press 底 + hairline + shadow-popover);
      暗色下 canvas 比承载面更黑,浮层若用 canvas 会成"洞",故底走 surface-press。

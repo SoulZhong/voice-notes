@@ -39,6 +39,8 @@ mod voice_env;
 mod speaker_link;
 mod identify_actions;
 mod hooks_external;
+mod device; // 设备听写(AI Passport),见 docs/adr/0001
+mod recording_ctl; // 程序化录制控制(MCP 控制面与设备共用)
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8343,13 +8345,24 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     // 锁内读-改-写(update):整体取前端新值,但 data_dir/models_dir 一律保留磁盘最新值
     //(迁移专管这两指针)——防止本次写把并发迁移刚提交的目录指针覆盖回旧值,随后迁移
     // 删旧 → 笔记"凭空消失"。这正是 update 的 WRITE_LOCK 要串行掉的 load-modify-save 竞态。
+    // 设备听写:总开关/引擎变更要重启设备运行时(落盘后由 device::on_settings_changed 处理)。
+    let device_changed = old.device_enabled != new_settings.device_enabled
+        || old.dictation_engine != new_settings.dictation_engine
+        || old.asr_hotwords != new_settings.asr_hotwords;
     settings::update(&d, |s| {
         let data_dir = s.data_dir.clone();
         let models_dir = s.models_dir.clone();
+        // device_name 只归设备连接流程写(连接/忘记设备):设置页手里的快照可能早于
+        // 连上设备那一刻,整体替换会把刚记住的设备名抹掉。
+        let device_name = s.device_name.clone();
         *s = new_settings;
         s.data_dir = data_dir;
         s.models_dir = models_dir;
+        s.device_name = device_name;
     }).map_err(|e| e.to_string())?;
+    if device_changed {
+        device::on_settings_changed(&app);
+    }
     if asr_changed || hotwords_changed {
         *state.recognizer_cache.lock().unwrap() = None;
         preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
@@ -9257,6 +9270,8 @@ pub fn run() {
             }
             // 菜单栏托盘：tray_enabled 时建（内部读设置判定）。增值层，一切失败只降级。
             tray::setup(&handle);
+            // 设备听写:已激活(连过设备)才自动去连;未激活什么都不做(不扫蓝牙、不要权限)。
+            device::init(&handle);
             // MCP 注册路径自愈:App 被移动/换装后,各 Agent 配置里的 command 指向旧路径,
             // Agent spawn 会失败。启动时静默改正;开发态二进制(target/)在 heal 内部跳过。
             std::thread::spawn(|| {
@@ -9344,6 +9359,19 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            device::device_status,
+            device::device_scan,
+            device::device_connect,
+            device::device_reconnect,
+            device::device_repair,
+            device::device_forget,
+            device::device_submit_pin,
+            device::device_open_accessibility,
+            device::device_grant_speech,
+            device::list_dictation_notes,
+            device::get_dictation_note,
+            device::delete_dictation_note,
+            device::delete_dictation_record,
             apple_asr_status,
             install_apple_asr,
             start_recording,

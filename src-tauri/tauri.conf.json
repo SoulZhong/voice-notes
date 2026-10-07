@@ -26,7 +26,8 @@
         "scope": [
           "$APPDATA/notes/**",
           "$APPDATA/voiceprints/**",
-          "$APPDATA/merge_journal/**"
+          "$APPDATA/merge_journal/**",
+          "$APPDATA/dictations/**"
         ]
       }
     }

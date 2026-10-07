@@ -76,8 +76,71 @@ pub fn list_notes(
     serde_json::json!({ "total": total, "notes": page })
 }
 
+/// 听写笔记是否开放给 AI(settings.dictation_ai_access,默认关)。每次调用现读:
+/// 用户可能刚在设置页拨了开关。
+fn dictation_access(roots: &DataRoots) -> bool {
+    settings::load(&roots.app_data).dictation_ai_access
+}
+
+/// 关着时 get_note 拿到听写笔记 id 的回答:告诉 Agent 为什么、去哪开,而不是假装不存在。
+const DICTATION_DENIED: &str =
+    "这是一篇听写笔记,用户没有开放给 AI 读取(Voice Notes 设置 › 设备听写 › 允许 AI 读取听写笔记)";
+
+/// 听写笔记里的命中(未撤销的句子)。只在开关打开时调用。
+fn search_dictations(roots: &DataRoots, needle: &str, room: usize) -> Vec<serde_json::Value> {
+    let store = crate::device::dictation_store::DictationStore::new(&roots.data_root);
+    let mut hits = Vec::new();
+    for summary in store.list() {
+        let Ok(note) = store.load(&summary.id) else {
+            continue;
+        };
+        for (i, r) in note.records.iter().enumerate() {
+            if r.undone || !r.text.to_lowercase().contains(needle) {
+                continue;
+            }
+            hits.push(serde_json::json!({
+                "kind": "dictation", "note_id": summary.id, "title": summary.label,
+                "app": summary.app, "seq": i, "at": r.at, "text": r.text,
+            }));
+            if hits.len() >= room {
+                return hits;
+            }
+        }
+    }
+    hits
+}
+
+/// 一篇听写笔记的全文(get_note 对听写 id 的回答)。
+fn get_dictation(roots: &DataRoots, id: &str, format: &str) -> anyhow::Result<serde_json::Value> {
+    let store = crate::device::dictation_store::DictationStore::new(&roots.data_root);
+    let note = store.load(id)?;
+    let live: Vec<_> = note.records.iter().filter(|r| !r.undone).collect();
+    match format {
+        "segments" => Ok(serde_json::json!({
+            "id": note.meta.id, "kind": "dictation", "title": note.meta.label, "app": note.meta.app,
+            "started_at": note.meta.created_at, "updated_at": note.meta.updated_at,
+            "records": live.iter().map(|r| serde_json::json!({ "at": r.at, "text": r.text })).collect::<Vec<_>>(),
+        })),
+        "markdown" | "text" => {
+            let mut content = if format == "markdown" {
+                format!("# {}\n\n", note.meta.label)
+            } else {
+                format!("{}\n\n", note.meta.label)
+            };
+            for r in live {
+                content.push_str(&format!("[{}] {}\n", r.at, r.text));
+            }
+            Ok(serde_json::json!({
+                "id": note.meta.id, "kind": "dictation", "title": note.meta.label, "content": content,
+            }))
+        }
+        _ => anyhow::bail!("未知 format: {format}(可用 segments|markdown|text)"),
+    }
+}
+
 /// 全文检索:遍历全部笔记逐段子串匹配(大小写不敏感)。个人量级(百场×百句)
-/// 全扫毫秒级,不建索引(YAGNI,见设计文档 §三)。
+/// 全扫毫秒级,不建索引(YAGNI,见设计文档 §三)。用户开放了听写笔记时一并检索
+/// (命中带 "kind": "dictation";会议笔记的命中带 "kind": "meeting")。
 pub fn search_notes(roots: &DataRoots, query: &str, limit: usize) -> serde_json::Value {
     // 命名为 notes_store 而非 store:后者会遮蔽本文件顶部 `use crate::store` 的
     // 模块导入,函数体内若要用 `store::` 前缀访问模块级函数会撞名。
@@ -95,7 +158,7 @@ pub fn search_notes(roots: &DataRoots, query: &str, limit: usize) -> serde_json:
                 continue;
             }
             hits.push(serde_json::json!({
-                "note_id": summary.id, "title": summary.title,
+                "kind": "meeting", "note_id": summary.id, "title": summary.title,
                 "seq": seg.seq, "speaker": seg.speaker, "start_ms": seg.start_ms,
                 "text": seg.text,
                 "before": if i > 0 { note.segments[i - 1].text.clone() } else { String::new() },
@@ -105,6 +168,10 @@ pub fn search_notes(roots: &DataRoots, query: &str, limit: usize) -> serde_json:
                 break 'outer;
             }
         }
+    }
+    let room = limit.clamp(1, 100).saturating_sub(hits.len());
+    if room > 0 && dictation_access(roots) {
+        hits.extend(search_dictations(roots, &needle, room));
     }
     serde_json::json!({ "scanned_notes": scanned, "hits": hits })
 }
@@ -117,6 +184,10 @@ pub fn get_note(
     format: &str,
     prefer_refined: bool,
 ) -> anyhow::Result<serde_json::Value> {
+    if crate::device::dictation_store::is_note_id(id) {
+        anyhow::ensure!(dictation_access(roots), DICTATION_DENIED);
+        return get_dictation(roots, id, format);
+    }
     let store = NoteStore::new(notes_dir(roots));
     let note = store.load(id)?; // 内含 validate_note_id 防穿越 + 存在性检查
     let refined = if prefer_refined {
@@ -634,6 +705,44 @@ mod tests {
             app_data: tmp.to_path_buf(),
             data_root: tmp.to_path_buf(),
         }
+    }
+
+    fn seed_dictation(tmp: &std::path::Path) -> String {
+        let store = crate::device::dictation_store::DictationStore::new(tmp);
+        let rec = |dict, text| crate::device::dictation_store::NewRecord {
+            key: "orca:leaf",
+            app: "Orca",
+            label: "repo · claude",
+            dict,
+            text,
+            pcm: None,
+        };
+        let a = store.append(rec(1, "把交付日期改到周五。"), chrono::Local::now()).unwrap();
+        let b = store.append(rec(2, "交付日期撤销掉的这句"), chrono::Local::now()).unwrap();
+        store.mark_undone(&b.id, &b.rid).unwrap();
+        a.id
+    }
+
+    #[test]
+    fn dictation_notes_stay_private_until_the_user_opens_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = seed_dictation(tmp.path());
+        // 默认关:检索不到,get_note 明确拒绝并说明去哪开。
+        assert!(search_notes(&roots(tmp.path()), "交付日期", 10)["hits"].as_array().unwrap().is_empty());
+        let e = get_note(&roots(tmp.path()), &id, "segments", true).unwrap_err();
+        assert!(e.to_string().contains("允许 AI 读取听写笔记"), "{e}");
+        // 打开后:命中未撤销的那句,带 kind;get_note 返回逐句记录。
+        let s = settings::Settings { dictation_ai_access: true, ..Default::default() };
+        settings::save(tmp.path(), &s).unwrap();
+        let hits = search_notes(&roots(tmp.path()), "交付日期", 10)["hits"].as_array().unwrap().clone();
+        assert_eq!(hits.len(), 1, "撤销的句子不算: {hits:?}");
+        assert_eq!(hits[0]["kind"], "dictation");
+        assert_eq!(hits[0]["note_id"], id.as_str());
+        let v = get_note(&roots(tmp.path()), &id, "segments", true).unwrap();
+        assert_eq!(v["kind"], "dictation");
+        assert_eq!(v["records"].as_array().unwrap().len(), 1);
+        let md = get_note(&roots(tmp.path()), &id, "markdown", true).unwrap();
+        assert!(md["content"].as_str().unwrap().starts_with("# repo · claude"));
     }
 
     fn graph_doc(text: &str) -> store::RefinedDoc {

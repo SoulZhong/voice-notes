@@ -8,6 +8,7 @@ export const zh = {
   "shell.tab.people": "会议搭子",
   "shell.tab.graph": "图谱",
   "shell.tab.hooks": "钩子",
+  "shell.tab.device": "设备",
   "shell.tab.settings": "设置",
 
   // ── 侧栏:录制按钮 ──
@@ -201,6 +202,7 @@ export const en = {
   "shell.tab.people": "People",
   "shell.tab.graph": "Graph",
   "shell.tab.hooks": "Hooks",
+  "shell.tab.device": "Device",
   "shell.tab.settings": "Settings",
 
   "shell.record.stopping": "Stopping…",

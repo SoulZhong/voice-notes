@@ -28,6 +28,7 @@
 - **一段不丢**：边录边落盘，崩溃、断电、误关都不丢已转写内容；中断的会议可以接着录，时间轴和说话人编号无缝续接。
 - **录音回放与核对**：原始音频按轨保留（自动压缩为 AAC，约 14MB/小时/源），点任意句的时间戳从那里开始听，播放位置歌词式跟随。
 - **所见即所得的 Markdown 笔记**：原始稿与精修稿统一使用 Milkdown 编辑器；原始稿保留逐句结构，精修稿支持标题、列表、引用与强调等 Markdown 块，停顿或失焦自动保存；也可改说话人、笔记改名，导出 Markdown / 纯文本。
+- **设备听写（AI Passport）**：戴着 AI Passport 设备说话，文字直接插入 Orca、ChatGPT（Codex）、微信、企业微信当前的会话，可发送、可撤销；Agent 等你回复时设备上会提醒。macOS 用 Apple 语音识别，Windows 用本机流式模型实时出字、说完再整段识别一遍。每次插入按会话归档成「听写笔记」，和会议笔记同列。默认开启，但第一次点「连接设备」之前不扫描蓝牙、不申请权限、不下载模型。
 - **顺手的系统集成**：菜单栏常驻、全局快捷键一键开录/停录、开机自启、亮暗双主题。
 - **中英双语界面**：设置里一键切换中文 / English / 跟随系统，界面与菜单栏立即生效，无需重启。
 - **中文场景优化**：默认 SenseVoice 模型（中/英/日/韩/粤），可切 Whisper；语言幻觉过滤剔除静音段的乱码输出。
@@ -104,9 +105,11 @@
 git clone https://github.com/SoulZhong/voice-notes.git
 cd voice-notes
 npm install
-npm run tauri dev      # 开发运行
+npm run dev:app        # 开发运行(独立标识 com.teemo.voice-notes.dev,数据与权限和安装版分开)
 npm run tauri build    # 构建 .app + .dmg
 ```
+
+`npm run dev:app` 用独立的应用标识运行开发版:数据目录、系统权限、设备连接都与日常使用的安装版分开,开发时热重载不会碰到安装版里正在进行的录制。需要用真实数据调试时把笔记复制到开发版的数据目录;直接用 `npm run tauri dev` 则与安装版共用同一份数据。
 
 Windows 请在 “Developer PowerShell for VS 2022” 中执行同样命令；`npm run tauri build` 会生成 Windows 安装包。若 PowerShell 执行策略拦截 `npm.ps1`，使用 `npm.cmd run tauri dev` / `npm.cmd run tauri build`。
 

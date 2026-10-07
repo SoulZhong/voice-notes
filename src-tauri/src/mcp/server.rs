@@ -330,7 +330,7 @@ impl VnMcp {
     }
 
     #[tool(
-        description = "全文检索所有会议笔记的转写内容,返回命中句与上下文各一句、说话人与时间戳。"
+        description = "全文检索所有会议笔记的转写内容,返回命中句与上下文各一句、说话人与时间戳。用户开放了听写笔记时也检索设备听写记录(命中带 kind=dictation)。"
     )]
     async fn search_notes(
         &self,
@@ -345,7 +345,7 @@ impl VnMcp {
     }
 
     #[tool(
-        description = "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI 修订稿时默认优先修订稿。"
+        description = "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI 修订稿时默认优先修订稿。听写笔记(id 以 d 开头)需用户在设置里开放后才能读取。"
     )]
     async fn get_note(
         &self,
@@ -535,10 +535,10 @@ impl ServerHandler for VnMcp {
 pub fn catalog() -> serde_json::Value {
     let tools: &[(&str, &str, &str)] = &[
         ("list_notes", "列出会议笔记(倒序分页;from/to 可按时间过滤)。返回 id/标题/开始时间/时长/状态。", "none"),
-        ("search_notes", "全文检索所有会议笔记的转写内容,返回命中句与上下文各一句、说话人与时间戳。", "none"),
+        ("search_notes", "全文检索所有会议笔记的转写内容,返回命中句与上下文各一句、说话人与时间戳。用户开放了听写笔记时也检索设备听写记录(命中带 kind=dictation)。", "none"),
         (
             "get_note",
-            "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI 修订稿时默认优先修订稿。",
+            "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI 修订稿时默认优先修订稿。听写笔记(id 以 d 开头)需用户在设置里开放后才能读取。",
             "none",
         ),
         (

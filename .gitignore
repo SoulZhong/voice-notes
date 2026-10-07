@@ -21,3 +21,4 @@ vite.config.ts.timestamp-*
 .worktrees/
 __pycache__/
 .gstack/
+src-tauri/vibe-device/target/

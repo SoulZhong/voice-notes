@@ -1,0 +1,57 @@
+[package]
+name = "vibe-device"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "AI Passport (Vibe Voice) device support for Voice Notes: BLE link, protocol, dictation session, text injection"
+license = "AGPL-3.0-only"
+publish = false
+
+# 设备电脑端从 vibe-voice-input 仓库 host/vibe-voice 整体搬入(ADR 0001)。
+# 独立成 crate 的理由:与平台/Voice Notes 无关的纯逻辑(协议、会话状态机、Orca、
+# 提醒)可脱离整个 Tauri 应用快速单测(`cargo test --manifest-path vibe-device/Cargo.toml`),
+# 也保留原代码的 edition 2024 写法,不必改写。与 Voice Notes 耦合的部分(识别模型、
+# 录音控制、听写笔记、界面)留在 app_lib 的 device 模块里,经本 crate 的 trait 注入。
+
+[lib]
+name = "vibe_device"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-segmentation = "1"
+uuid = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+btleplug = "0.13"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-speech = "0.3"
+objc2-avf-audio = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-application-services = "0.3"
+
+# 与 btleplug 0.13 自带的 windows 版本对齐,不额外拉第二份。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

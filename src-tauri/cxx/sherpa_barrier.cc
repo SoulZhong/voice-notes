@@ -22,6 +22,18 @@ void SherpaOnnxAcceptWaveformOffline(const void *stream, int32_t sample_rate,
 void SherpaOnnxDecodeOfflineStream(const void *recognizer, const void *stream);
 const char *SherpaOnnxGetOfflineStreamResultAsJson(const void *stream);
 void SherpaOnnxDestroyOfflineStream(const void *stream);
+// 流式(online)识别:设备听写的实时出字(device/sherpa_stream.rs)。
+const void *SherpaOnnxCreateOnlineRecognizer(const void *config);
+const void *SherpaOnnxCreateOnlineStream(const void *recognizer);
+void SherpaOnnxOnlineStreamAcceptWaveform(const void *stream,
+                                          int32_t sample_rate,
+                                          const float *samples, int32_t n);
+void SherpaOnnxOnlineStreamInputFinished(const void *stream);
+int32_t SherpaOnnxIsOnlineStreamReady(const void *recognizer,
+                                      const void *stream);
+void SherpaOnnxDecodeOnlineStream(const void *recognizer, const void *stream);
+const char *SherpaOnnxGetOnlineStreamResultAsJson(const void *recognizer,
+                                                  const void *stream);
 }
 
 namespace {
@@ -80,6 +92,59 @@ int32_t vn_sherpa_transcribe(const void *recognizer, int32_t sample_rate,
     } catch (...) {
       log_caught("transcribe/cleanup", "destroy stream threw");
     }
+  }
+  return -1;
+}
+
+/// 流式识别器创建的屏障版:异常 → null。
+const void *vn_sherpa_create_online_recognizer(const void *config) {
+  try {
+    return SherpaOnnxCreateOnlineRecognizer(config);
+  } catch (const std::exception &e) {
+    log_caught("CreateOnlineRecognizer", e.what());
+  } catch (...) {
+    log_caught("CreateOnlineRecognizer", "non-std exception");
+  }
+  return nullptr;
+}
+
+/// 建流的屏障版:异常 → null。
+const void *vn_sherpa_create_online_stream(const void *recognizer) {
+  try {
+    return SherpaOnnxCreateOnlineStream(recognizer);
+  } catch (const std::exception &e) {
+    log_caught("CreateOnlineStream", e.what());
+  } catch (...) {
+    log_caught("CreateOnlineStream", "non-std exception");
+  }
+  return nullptr;
+}
+
+/// 喂一段波形(n 可为 0),finished 非 0 时标记输入结束,再把能解的帧解完;
+/// 之后取当前结果 JSON 放进 *out_json(调用方用
+/// SherpaOnnxDestroyOnlineStreamResultJson 释放,可能为 null)。
+/// 返回 0 成功;-1 表示 C++ 异常已捕获(流仍归调用方销毁)。
+int32_t vn_sherpa_online_feed(const void *recognizer, const void *stream,
+                              int32_t sample_rate, const float *samples,
+                              int32_t n, int32_t finished,
+                              const char **out_json) {
+  *out_json = nullptr;
+  try {
+    if (n > 0) {
+      SherpaOnnxOnlineStreamAcceptWaveform(stream, sample_rate, samples, n);
+    }
+    if (finished != 0) {
+      SherpaOnnxOnlineStreamInputFinished(stream);
+    }
+    while (SherpaOnnxIsOnlineStreamReady(recognizer, stream) != 0) {
+      SherpaOnnxDecodeOnlineStream(recognizer, stream);
+    }
+    *out_json = SherpaOnnxGetOnlineStreamResultAsJson(recognizer, stream);
+    return 0;
+  } catch (const std::exception &e) {
+    log_caught("online_feed", e.what());
+  } catch (...) {
+    log_caught("online_feed", "non-std exception");
   }
   return -1;
 }

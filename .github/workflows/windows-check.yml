@@ -76,3 +76,10 @@ jobs:
       - name: cargo build (lib, Windows msvc)
         working-directory: src-tauri
         run: cargo build --lib
+
+      # 设备听写 crate(vibe-device)的单测在 Windows 上真跑一遍:Windows 专属的应用表
+      # (进程名而非 bundle id)、WinRT 配对与 SendInput 注入只有这里能真正编译链接。
+      # 独立 Cargo.lock/target(path crate),不碰上面那份缓存。
+      - name: cargo test (vibe-device, Windows)
+        working-directory: src-tauri/vibe-device
+        run: cargo test
