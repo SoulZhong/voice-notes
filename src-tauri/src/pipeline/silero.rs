@@ -169,6 +169,11 @@ fn split_long(samples: Vec<f32>, start: usize) -> Vec<Segment> {
 }
 
 impl Segmenter for SileroSegmenter {
+    fn in_speech(&self) -> bool {
+        // current 只在 VAD 判为说话时累积,静音即清空。
+        !self.current.is_empty()
+    }
+
     fn accept(&mut self, samples: &[f32]) {
         // 非有限值消毒:AEC/AGC/重采样链的数值边界可能产出 NaN/Inf,喂进 ONNX 轻则
         // 概率失真,重则 ORT 报错抛 C++ 异常——sherpa C 接口不接异常,直接 SIGABRT
