@@ -220,6 +220,10 @@ pub struct OrcaSnapshot {
     pub has_current: bool,
     /// The worktree Orca's UI has selected, if any.
     pub active_worktree: Option<String>,
+    /// Whether the Current Conversation was looked up (`worktree ps` plus
+    /// visual layouts). False for the cheaper sessions-only look the Orca
+    /// watch takes while Orca is in the background.
+    pub layout: bool,
 }
 
 impl OrcaSnapshot {
@@ -319,6 +323,7 @@ pub fn parse_snapshot(
             sessions,
             has_current: false,
             active_worktree: None,
+            layout: true,
         });
     };
     let layout_handle = serde_json::from_str::<serde_json::Value>(list_stdout.trim())
@@ -353,6 +358,7 @@ pub fn parse_snapshot(
         sessions: ordered,
         has_current: current.is_some(),
         active_worktree: Some(active),
+        layout: true,
     })
 }
 
@@ -536,6 +542,17 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(3);
 impl<R: CommandRunner> OrcaClient<R> {
     pub fn new(runner: R) -> Self {
         Self { runner }
+    }
+
+    /// Sessions only, in one CLI call and without the Current Conversation:
+    /// all the Alerts need. Each call spawns Orca's CLI (Electron as node,
+    /// ~0.1 s CPU), so the watch takes this one while Orca is not in front.
+    pub fn sessions(&mut self) -> Result<OrcaSnapshot, OrcaError> {
+        let list: Vec<String> = ["terminal", "list", "--limit=500", "--json"].map(String::from).into();
+        let out = self.run_raw(&list, CALL_TIMEOUT)?;
+        let mut snap = parse_snapshot(None, &out.stdout)?;
+        snap.layout = false;
+        Ok(snap)
     }
 
     /// Read-only: the rendered screen of one terminal.

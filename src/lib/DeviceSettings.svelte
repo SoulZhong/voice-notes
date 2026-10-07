@@ -209,10 +209,6 @@
     if (yes) await run(deviceForget);
   }
 
-  async function toggleEnabled(on: boolean) {
-    await save((s) => (s.device_enabled = on));
-    await refresh();
-  }
 </script>
 
 <section>
@@ -225,20 +221,6 @@
     >{t("device.desc.after")}
   </p>
   <div class="rows">
-    <label class="row">
-      <div class="row-info">
-        <span class="row-label">{t("device.enabled.label")}</span>
-        <span class="row-desc">{t("device.enabled.desc")}</span>
-      </div>
-      <input
-        type="checkbox"
-        class="ctl switch"
-        checked={settings?.device_enabled ?? true}
-        disabled={!settings}
-        onchange={(e) => toggleEnabled((e.target as HTMLInputElement).checked)}
-      />
-    </label>
-
     {#if settings?.device_enabled !== false && status}
       <div class="row">
         <div class="row-info">

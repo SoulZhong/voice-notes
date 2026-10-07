@@ -34,6 +34,38 @@ pub fn default_input_device_id() -> Option<u32> {
     }
 }
 
+/// 默认输入设备的系统输入音量(0.0..=1.0),即「系统设置 › 声音 › 输入」那根滑杆。
+/// 先读主声道,设备只按声道给音量时取各声道均值;设备根本没有音量控制 → None。
+/// 替代每次轮询起一个 osascript 进程(省电,2026-10-07)。
+#[cfg(target_os = "macos")]
+pub fn input_volume_scalar() -> Option<f32> {
+    use coreaudio::sys::*;
+    let dev = default_input_device_id()?;
+    let read = |element: u32| -> Option<f32> {
+        unsafe {
+            let mut v: f32 = 0.0;
+            let mut size = std::mem::size_of::<f32>() as u32;
+            let addr = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioObjectPropertyScopeInput,
+                mElement: element,
+            };
+            if AudioObjectHasProperty(dev, &addr) == 0 {
+                return None;
+            }
+            if AudioObjectGetPropertyData(dev, &addr, 0, std::ptr::null(), &mut size, &mut v as *mut _ as *mut _) != 0 {
+                return None;
+            }
+            Some(v.clamp(0.0, 1.0))
+        }
+    };
+    if let Some(v) = read(kAudioObjectPropertyElementMaster) {
+        return Some(v);
+    }
+    let channels: Vec<f32> = (1..=2).filter_map(read).collect();
+    (!channels.is_empty()).then(|| channels.iter().sum::<f32>() / channels.len() as f32)
+}
+
 /// 指定设备的实测采样率。轮询固定用会话起点解析出的设备,不跟随默认设备变化。
 #[cfg(target_os = "macos")]
 pub fn actual_hz_of(dev: u32) -> Option<f64> {

@@ -348,9 +348,13 @@
     };
     window.addEventListener("focus", onFocus);
     // 录制中也检测(会议软件中途拉低输入音量):轮询与录制状态无关,一直跑。
-    const volTimer = setInterval(refreshInputVol, POLL_MS);
+    // 窗口藏起来(托盘)时没人看预警,跳过;切回窗口的 focus 会立即补查一次。
+    const whenVisible = (f: () => void) => () => {
+      if (document.visibilityState === "visible") f();
+    };
+    const volTimer = setInterval(whenVisible(refreshInputVol), POLL_MS);
     // 与输入音量同频轮询:模式可以在录制中途被切换,那之后的音频就开始被削。
-    const micModeTimer = setInterval(refreshMicMode, POLL_MS);
+    const micModeTimer = setInterval(whenVisible(refreshMicMode), POLL_MS);
     const unCloud = onCloudAsrStatus(handleCloudAsrStatus);
     return () => {
       window.removeEventListener("focus", onFocus);
@@ -450,6 +454,8 @@
     // 注意与 liveBarsMic 的区别:已画出的历史要保留(冻结显示),重置的只是这个运行值。
     let envPrev = 0;
     const t = setInterval(() => {
+      // 窗口藏起来时不画(也收不到电平,见后端 UI_VISIBLE)。
+      if (document.visibilityState !== "visible") return;
       envPrev = envelopeStep(envPrev, micPct);
       liveBarsMic = [...liveBarsMic.slice(-(LIVE_BARS - 1)), envPrev];
       // 两路指示灯用同款"带保持"的活跃计数(检出电平充 8 格≈1s,无声逐格衰减),

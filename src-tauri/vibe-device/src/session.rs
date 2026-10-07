@@ -42,8 +42,8 @@ pub const STATE_LABEL_BYTES: usize = 127;
 /// How long the periodic refresh reuses an Orca snapshot while Orca is
 /// frontmost (its tabs can change any moment) and while it is in the
 /// background (only the CLI or a Jump can change them then).
-pub const ORCA_CACHE_FRONT: Duration = Duration::from_secs(2);
-pub const ORCA_CACHE_BACKGROUND: Duration = Duration::from_secs(10);
+pub const ORCA_CACHE_FRONT: Duration = Duration::from_secs(5);
+pub const ORCA_CACHE_BACKGROUND: Duration = Duration::from_secs(15);
 /// Insert, Submit, HELLO, DICT_START, lists and Jumps ask Orca afresh, but
 /// share one answer within an operation.
 pub const ORCA_CACHE_FRESH: Duration = Duration::from_millis(500);
@@ -917,6 +917,7 @@ impl<I: Injector, R: Recognizer, O: OrcaApi> Companion<I, R, O> {
             let s = snap.sessions.remove(i);
             snap.sessions.insert(0, s);
             snap.has_current = true;
+            snap.layout = true;
             *at = now;
         }
         Ok(())
@@ -1195,7 +1196,10 @@ impl<I: Injector, R: Recognizer, O: OrcaApi> Companion<I, R, O> {
                 Need::Refresh => ORCA_CACHE_BACKGROUND,
                 _ => ORCA_CACHE_FRESH,
             };
-            if now.saturating_duration_since(*at) < max_age {
+            // A sessions-only look (Orca in the background) cannot tell the
+            // Current Conversation: only a background refresh may reuse it.
+            let usable = snap.layout || (need == Need::Refresh && !orca_front);
+            if usable && now.saturating_duration_since(*at) < max_age {
                 return Ok(snap.clone());
             }
         }
@@ -1868,6 +1872,7 @@ mod tests {
                 ],
                 has_current: true,
                 active_worktree: Some("repo::/src/my-passport".into()),
+                layout: true,
             },
             ..Default::default()
         };
@@ -2004,6 +2009,22 @@ mod tests {
             t0 + Duration::from_millis(600),
         );
         assert_eq!(c.injector.log, [format!("insert {WECHAT} Please run the unit tests again. ")]);
+    }
+
+    #[test]
+    fn a_sessions_only_look_never_answers_for_the_current_conversation() {
+        let mut c = companion();
+        let t0 = Instant::now();
+        let mut snap = c.orca.snap.clone();
+        snap.has_current = false;
+        snap.layout = false;
+        c.handle_orca_watch(Ok(snap), t0);
+        // Background refresh: the cheap look is enough.
+        let r = c.orca_snapshot(Need::Refresh, false, t0).unwrap();
+        assert!(!r.layout);
+        // Orca in front: ask for the full look instead of trusting it.
+        let r = c.orca_snapshot(Need::Refresh, true, t0).unwrap();
+        assert!(r.layout && r.has_current);
     }
 
     #[test]
@@ -2582,9 +2603,9 @@ mod tests {
         c.injector.frontmost = Some(ORCA_BUNDLE_ID.into());
         c.refresh(t0 + Duration::from_secs(2));
         assert_eq!(c.take_outbox(), [orca_a_state()]);
-        // Orca shows another tab.
+        // Orca shows another tab (seen once the front cache ages out).
         c.orca.snap.sessions.swap(0, 1);
-        c.refresh(t0 + Duration::from_secs(4));
+        c.refresh(t0 + Duration::from_secs(8));
         assert_eq!(c.take_outbox(), [orca_state("my-passport · server")]);
     }
 
@@ -2842,17 +2863,17 @@ mod tests {
         let t0 = Instant::now();
         hello(&mut c, t0);
         assert_eq!(c.orca.snapshots, 1);
-        // Orca Target in the background: reuse for 10 s.
+        // Orca Target in the background: reuse for 15 s.
         c.refresh(t0 + Duration::from_secs(2));
-        c.refresh(t0 + Duration::from_secs(8));
+        c.refresh(t0 + Duration::from_secs(14));
         assert_eq!(c.orca.snapshots, 1);
-        c.refresh(t0 + Duration::from_secs(10));
+        c.refresh(t0 + Duration::from_secs(15));
         assert_eq!(c.orca.snapshots, 2);
-        // Orca frontmost: ask every 2 s.
+        // Orca frontmost: ask every 5 s (the Orca watch usually answers first).
         c.injector.frontmost = Some(ORCA_BUNDLE_ID.into());
-        c.refresh(t0 + Duration::from_secs(11));
+        c.refresh(t0 + Duration::from_secs(19));
         assert_eq!(c.orca.snapshots, 2);
-        c.refresh(t0 + Duration::from_secs(12));
+        c.refresh(t0 + Duration::from_secs(20));
         assert_eq!(c.orca.snapshots, 3);
         // An app Target never asks Orca.
         c.injector.frontmost = Some(WECHAT.into());

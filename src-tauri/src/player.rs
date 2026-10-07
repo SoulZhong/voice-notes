@@ -167,6 +167,8 @@ pub struct PlayerHandle {
     core: Mutex<Option<Arc<Core>>>,
     /// 流线程停止通道(drop/发送皆停,与 microphone.rs 同模式)。
     stop_tx: Mutex<Option<crossbeam_channel::Sender<()>>>,
+    /// 唤醒流线程(play/pause 后立即起停输出流,不等下一个 200ms 周期)。
+    wake_tx: Mutex<Option<crossbeam_channel::Sender<()>>>,
     /// 装载代次(2026-08-10 排障):快速切笔记时多个 player_load 并发在跑,完成序由
     /// 装载耗时(解码/对齐/门控)决定而非请求序——后完成的旧笔记装载会覆盖当前内核
     /// (wrong-writer-wins),表现为点播放被掐、图标弹回、放错笔记的音频。
@@ -185,6 +187,7 @@ impl Default for PlayerHandle {
         Self {
             core: Mutex::new(None),
             stop_tx: Mutex::new(None),
+            wake_tx: Mutex::new(None),
             load_gen: Arc::new(AtomicU64::new(0)),
             publish: Mutex::new(()),
         }
@@ -831,6 +834,7 @@ pub async fn player_load(
 fn start_stream(app: &AppHandle, state: &State<'_, PlayerHandle>, core: Arc<Core>) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(0);
+    let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
     let app = app.clone();
     std::thread::spawn(move || {
@@ -860,7 +864,10 @@ fn start_stream(app: &AppHandle, state: &State<'_, PlayerHandle>, core: Arc<Core
                     None,
                 )
                 .map_err(|e| e.to_string())?;
-            stream.play().map_err(|e| e.to_string())?;
+            // 建好即暂停:cpal 在 macOS 上建流就自动起播(audio_unit.start),不停的话
+            // 声卡一直被占着,coreaudiod 挂着「阻止空闲睡眠」断言。真开始播放才让它跑
+            // (见下方事件泵)。
+            stream.pause().map_err(|e| e.to_string())?;
             Ok((stream, step))
         })();
         let _stream = match opened {
@@ -873,11 +880,37 @@ fn start_stream(app: &AppHandle, state: &State<'_, PlayerHandle>, core: Arc<Core
                 return;
             }
         };
-        // 事件泵:200ms 一发;stop 关闭/收到即退出(流随线程结束 drop 停止)。
+        // 事件泵兼输出流开关(省电,2026-10-07):打开笔记就会装载,旧做法装载即起流,
+        // 暂停/播完也一直往声卡喂静音、每 200ms 发位置事件——启动自动打开最新一篇,
+        // 等于常年占着声卡不让它休眠。现在只在 playing 时让流跑、发事件;停下即暂停
+        // 输出流并补发一次位置(播完由混音回调置 playing=false,这里如实带出)。
+        // play/pause 经 wake 通道立即生效;stop 关闭/收到即退出(流随线程结束 drop)。
+        let mut running = false;
         loop {
-            match stop_rx.recv_timeout(std::time::Duration::from_millis(POS_EVENT_MS)) {
-                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => emit_pos(&app, &core),
+            let playing = core.playing.load(Ordering::Relaxed);
+            if playing && !running {
+                match _stream.play() {
+                    Ok(()) => running = true,
+                    Err(e) => eprintln!("播放流启动失败: {e}"),
+                }
+            } else if !playing && running {
+                if let Err(e) = _stream.pause() {
+                    eprintln!("播放流暂停失败: {e}");
+                }
+                running = false;
+                emit_pos(&app, &core);
+            }
+            if running {
+                crossbeam_channel::select! {
+                    recv(stop_rx) -> _ => break,
+                    recv(wake_rx) -> r => if r.is_err() { break },
+                    default(std::time::Duration::from_millis(POS_EVENT_MS)) => emit_pos(&app, &core),
+                }
+            } else {
+                crossbeam_channel::select! {
+                    recv(stop_rx) -> _ => break,
+                    recv(wake_rx) -> r => if r.is_err() { break },
+                }
             }
         }
     });
@@ -885,11 +918,20 @@ fn start_stream(app: &AppHandle, state: &State<'_, PlayerHandle>, core: Arc<Core
         .recv_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| crate::tr!("输出流启动超时", "Timed out starting the output stream"))??;
     *state.stop_tx.lock().unwrap() = Some(stop_tx);
+    *state.wake_tx.lock().unwrap() = Some(wake_tx);
     Ok(())
+}
+
+/// 叫醒流线程按 playing 起停输出流(满了说明已有一次唤醒在途,丢弃即可)。
+fn wake_stream(state: &State<'_, PlayerHandle>) {
+    if let Some(tx) = state.wake_tx.lock().unwrap().as_ref() {
+        let _ = tx.try_send(());
+    }
 }
 
 fn stop_stream(state: &State<'_, PlayerHandle>) {
     *state.stop_tx.lock().unwrap() = None; // drop 即断开,流线程退出
+    *state.wake_tx.lock().unwrap() = None;
     *state.core.lock().unwrap() = None;
 }
 
@@ -903,6 +945,8 @@ pub fn player_play(app: AppHandle, state: State<'_, PlayerHandle>) -> Result<(),
     }
     core.playing.store(true, Ordering::Relaxed);
     emit_pos(&app, core);
+    drop(g);
+    wake_stream(&state);
     Ok(())
 }
 
@@ -912,6 +956,8 @@ pub fn player_pause(app: AppHandle, state: State<'_, PlayerHandle>) -> Result<()
     let core = g.as_ref().ok_or_else(|| crate::tr!("尚未装载音轨", "No audio track loaded"))?;
     core.playing.store(false, Ordering::Relaxed);
     emit_pos(&app, core);
+    drop(g);
+    wake_stream(&state);
     Ok(())
 }
 

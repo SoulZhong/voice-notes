@@ -75,6 +75,26 @@ enum CoreEvent {
 }
 
 const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
+const ASLEEP_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long the Orca watch waits before its next look. Every look spawns
+/// Orca's CLI (Electron as node, ~0.1 s CPU each); polling twice every 2 s was
+/// nine tenths of what a linked Device cost the battery (measured 2026-10-07:
+/// 59 calls a minute). So look often only when it buys something: an agent
+/// mid-turn (its end raises an Alert), or Orca in front (follow its tabs).
+/// Dictation itself always asks Orca afresh, so a slow pace never sends text
+/// to a stale Target.
+pub fn watch_interval(display_asleep: bool, any_working: bool, orca_front: bool) -> Duration {
+    if display_asleep {
+        Duration::from_secs(30)
+    } else if any_working {
+        Duration::from_secs(3)
+    } else if orca_front {
+        Duration::from_secs(4)
+    } else {
+        Duration::from_secs(10)
+    }
+}
 
 /// A running Device link. Dropping it stops everything.
 pub struct Runtime {
@@ -196,15 +216,30 @@ impl Drop for Runtime {
 
 fn orca_watch(linked: Arc<AtomicBool>, alive: Arc<AtomicBool>, tx: mpsc::Sender<CoreEvent>) {
     use crate::alerts::{TurnWatch, screen_message};
+    use crate::session::Injector;
     let mut client = OrcaClient::new(ProcessRunner::locate());
     let mut turns = TurnWatch::default();
+    let mut injector = SystemInjector;
+    let mut wait = HEALTH_INTERVAL;
     while alive.load(Ordering::Relaxed) {
-        std::thread::sleep(HEALTH_INTERVAL);
+        // Sleep in short steps so a stopped runtime does not keep this thread.
+        let until = Instant::now() + wait;
+        while alive.load(Ordering::Relaxed) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(500).min(until.saturating_duration_since(Instant::now())));
+        }
+        wait = HEALTH_INTERVAL;
         if !linked.load(Ordering::Relaxed) || !platform::app_running(config::ORCA_BUNDLE_ID) {
             turns = TurnWatch::default();
             continue;
         }
-        let mut snap = client.snapshot();
+        let asleep = platform::display_asleep();
+        let orca_front = !asleep
+            && injector
+                .frontmost_bundle_id()
+                .is_some_and(|id| config::supported_app(&id) == config::supported_app(config::ORCA_BUNDLE_ID));
+        // Orca in front: the full look, so the core can follow its tabs from
+        // this snapshot. Otherwise the Alerts only need the sessions.
+        let mut snap = if orca_front { client.snapshot() } else { client.sessions() };
         // A session just finished its turn: read its rendered screen once for
         // the agent's reply (the list preview holds only status lines).
         // Read-only, bounded, and here rather than on the core loop.
@@ -225,6 +260,7 @@ fn orca_watch(linked: Arc<AtomicBool>, alive: Arc<AtomicBool>, tx: mpsc::Sender<
         if tx.send(CoreEvent::OrcaWatch(snap)).is_err() {
             return;
         }
+        wait = watch_interval(asleep, turns.any_working(), orca_front);
     }
 }
 
@@ -308,7 +344,8 @@ fn core_loop(
             None => {}
         }
         if connected && now >= next_health {
-            next_health = now + HEALTH_INTERVAL;
+            // Display asleep: nobody is switching apps, so follow focus slowly.
+            next_health = now + if platform::display_asleep() { ASLEEP_HEALTH_INTERVAL } else { HEALTH_INTERVAL };
             c.refresh(now);
             c.notes_poll();
         }
@@ -329,4 +366,21 @@ fn core_loop(
     c.recognizer.cancel();
     linked.store(false, Ordering::Relaxed);
     log::info!("device core loop stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_orca_watch_looks_often_only_when_it_pays() {
+        // An agent mid-turn: notice its end quickly, even with Orca in front.
+        assert_eq!(watch_interval(false, true, true), Duration::from_secs(3));
+        assert_eq!(watch_interval(false, false, true), Duration::from_secs(4));
+        assert_eq!(watch_interval(false, false, false), Duration::from_secs(10));
+        // Display asleep wins over everything.
+        assert_eq!(watch_interval(true, true, false), Duration::from_secs(30));
+        // The core reuses the watch's look while Orca is in front.
+        assert!(watch_interval(false, false, true) < crate::session::ORCA_CACHE_FRONT);
+    }
 }

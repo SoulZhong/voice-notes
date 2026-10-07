@@ -35,8 +35,9 @@ const REC_FRAMES: &[&[u8]] = &[
     include_bytes!("../icons/tray-logo-rec-4.png"),
     include_bytes!("../icons/tray-logo-rec-5.png"),
 ];
-/// 逐帧间隔：约 9fps，忙碌但不抽搐；低频省电（菜单栏动画不追高帧率）。
-const FRAME_MS: u64 = 110;
+/// 逐帧间隔：约 3fps。原先 110ms(9fps)贯穿整场录音,每帧都要唤醒主线程换图;
+/// 菜单栏只需看得出「在录」,省电优先(2026-10-07)。
+const FRAME_MS: u64 = 330;
 
 /// 动画代际计数。每次 start_anim 领取新一代并起一条动画线程按该代循环；代际一变
 /// （再次 start 或 stop）旧线程下一 tick 自然退出——保证任一时刻至多一条动画线程在跑，
@@ -355,11 +356,24 @@ fn dispatch_icon(app: &AppHandle, bytes: &'static [u8]) {
     }
 }
 
+/// 帧图解码缓存(按内嵌字节的地址):PNG 只解一次,之后每帧直接复用位图。
+fn decoded(bytes: &'static [u8]) -> tauri::Result<Image<'static>> {
+    static CACHE: std::sync::Mutex<Vec<(usize, Image<'static>)>> = std::sync::Mutex::new(Vec::new());
+    let key = bytes.as_ptr() as usize;
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, img)) = cache.iter().find(|(k, _)| *k == key) {
+        return Ok(img.clone());
+    }
+    let img = Image::from_bytes(bytes)?;
+    cache.push((key, img.clone()));
+    Ok(img)
+}
+
 fn set_icon_on_main(app: &AppHandle, bytes: &'static [u8]) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
-    match Image::from_bytes(bytes) {
+    match decoded(bytes) {
         // 原子设图标+模板位（false=彩色 Logo 显色）：避免二次渲染闪烁。
         Ok(icon) => {
             if let Err(e) = tray.set_icon_with_as_template(Some(icon), false) {
