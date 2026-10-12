@@ -25,7 +25,7 @@
   let error = $state("");
   let cancelled = $state(false);
   /** 各工件进度：received/total 字节 + phase。 */
-  let prog = $state<Record<string, { received: number; total: number; phase: string }>>({});
+  let prog = $state<Record<string, { received: number; total: number; phase: string; mirror: boolean }>>({});
 
   onMount(() => {
     // 事件监听随组件生命周期注册/解绑（下载跨页面继续，回到本页重新拿到进度流）。
@@ -51,7 +51,10 @@
       cancelled = true;
       return;
     }
-    prog = { ...prog, [e.artifact]: { received: e.received_bytes, total: e.total_bytes, phase: e.phase } };
+    prog = {
+      ...prog,
+      [e.artifact]: { received: e.received_bytes, total: e.total_bytes, phase: e.phase, mirror: e.message === "mirror" },
+    };
     if (e.phase === "done") onComplete(); // 单工件完成：刷新 present 态
   }
 
@@ -99,6 +102,9 @@
           {#if prog[a.id].phase === "downloading" && prog[a.id].total > 0}
             {mb(prog[a.id].received)}/{mb(prog[a.id].total)}MB
           {/if}
+          {#if prog[a.id].mirror}
+            · {t("settings.models.mirrorSwitched")}
+          {/if}
         </span>
         <div class="bar"><div class="fill" style="width:{pct(prog[a.id])}%"></div></div>
       {/if}
@@ -119,7 +125,7 @@
       <button class="primary" onclick={start}>{error || cancelled ? t("ai.modelCard.resume") : (primaryLabel ?? t("ai.modelCard.download"))}</button>
     {/if}
     {#if !compact}
-      <span class="note">{t("ai.modelCard.mirrorNote")}</span>
+      <span class="note">{t("ai.modelCard.routeNote")}</span>
     {/if}
   </div>
 </div>

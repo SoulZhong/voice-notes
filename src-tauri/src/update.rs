@@ -1,6 +1,5 @@
-//! 轻量升级检查:查 GitHub 最新 Release 的版本号,比当前新就让前端提示用户去发布页
-//! 手动下载 DMG。纯读、无副作用;任何失败(断网/限流/无发布/解析失败)一律降级为
-//! Err,由前端决定静默或提示,绝不影响录制/转写。不做应用内下载安装(那是自动更新档)。
+//! 升级:`check_update` 查 GitHub 最新 Release 的版本号供前端提示(纯读、无副作用,
+//! 任何失败降级为 Err,绝不影响录制/转写);`apply_update` 是一键更新的下载与安装。
 
 use serde::Serialize;
 use tauri::AppHandle;
@@ -43,6 +42,120 @@ pub fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
     let latest = tag.trim_start_matches('v').to_string();
     let has_update = is_newer(&latest, &current);
     Ok(UpdateInfo { current, latest, has_update, url: html_url, notes })
+}
+
+/// 一键更新进度(事件 `update_progress`)。
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateProgress {
+    pub received: u64,
+    /// 0 = 总长未知。
+    pub total: u64,
+    /// 已换到加速线路(界面提示「网络较慢,已切换加速线路」)。
+    pub mirror: bool,
+    /// 下载完毕,正在校验与安装。
+    pub installing: bool,
+}
+
+/// 一键更新:查 latest.json → 经下载线路下载升级包(自动切换直连/镜像、断点续传)→
+/// 校验签名 → 安装。返回 false = 没有更新;true = 已装好,由前端重启应用
+/// (Windows 上安装器会先结束本进程,走不到返回)。
+///
+/// 不用插件自带的 downloadAndInstall:它的 timeout 是**整次下载**的总时限(reqwest
+/// 语义),25MB 的包在每秒不到 0.85MB 的网络上 30 秒必然超时,进度条走到一半就报失败;
+/// 也不能续传、不能换线路。签名校验因此在这里做,口径与插件一致(minisign + 签名里
+/// 记录的版本号必须等于 latest.json 宣布的版本)。
+#[tauri::command]
+pub async fn apply_update(app: AppHandle) -> Result<bool, String> {
+    use tauri::{Emitter, Manager};
+    use tauri_plugin_updater::UpdaterExt;
+    let fail = |e: String| crate::tr!("一键更新失败: {e}", "Update failed: {e}", e = e);
+    let mut builder = app.updater_builder().timeout(std::time::Duration::from_secs(30));
+    if let Some(proxy) = crate::netproxy::system_proxy_url("https://github.com/".into()).and_then(|p| p.parse().ok()) {
+        builder = builder.proxy(proxy);
+    }
+    let updater = builder.build().map_err(|e| fail(e.to_string()))?;
+    let Some(update) = updater.check().await.map_err(|e| fail(e.to_string()))? else {
+        return Ok(false);
+    };
+    let pubkey = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|u| u.get("pubkey"))
+        .and_then(|k| k.as_str())
+        .ok_or_else(|| fail("missing updater pubkey".into()))?
+        .to_string();
+    let cache = app.path().app_cache_dir().map_err(|e| fail(e.to_string()))?;
+    let app_data = app.path().app_data_dir().map_err(|e| fail(e.to_string()))?;
+    let url = update.download_url.to_string();
+    let version = update.version.clone();
+    let signature = update.signature.clone();
+    let app_dl = app.clone();
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+        let part = cache.join(format!("update-{version}.part"));
+        // 旧版本残留的分片没用了。
+        if let Ok(rd) = std::fs::read_dir(&cache) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with("update-") && name.ends_with(".part") && e.path() != part {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        let memory = crate::netroute::RouteMemory::new(&app_data);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let emit = |p: crate::netroute::Progress| {
+            let _ = app_dl.emit(
+                "update_progress",
+                UpdateProgress { received: p.received, total: p.total, mirror: p.switched && p.mirror, installing: false },
+            );
+        };
+        crate::netroute::fetch(&url, &part, &memory, &cancel, &emit)?;
+        let bytes = std::fs::read(&part).map_err(|e| e.to_string())?;
+        if let Err(e) = verify_signature(&bytes, &signature, &pubkey, &version) {
+            // 坏分片(或被篡改)不留着续传。
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+        let _ = std::fs::remove_file(&part);
+        Ok(bytes)
+    })
+    .await
+    .map_err(|e| fail(e.to_string()))?
+    .map_err(fail)?;
+    let _ = app.emit("update_progress", UpdateProgress { received: 0, total: 0, mirror: false, installing: true });
+    tauri::async_runtime::spawn_blocking(move || update.install(bytes))
+        .await
+        .map_err(|e| fail(e.to_string()))?
+        .map_err(|e| fail(e.to_string()))?;
+    Ok(true)
+}
+
+/// 校验升级包签名,口径同 tauri-plugin-updater:pubkey 与 signature 都是 base64 包着的
+/// minisign 文本;签名可信注释里若记了 `version:`,必须等于 latest.json 宣布的版本
+/// (防止篡改的清单把新版本号配上旧安装包)。
+fn verify_signature(data: &[u8], signature_b64: &str, pubkey_b64: &str, announced: &str) -> Result<(), String> {
+    use base64::Engine;
+    let decode = |s: &str| -> Result<String, String> {
+        let raw = base64::engine::general_purpose::STANDARD.decode(s).map_err(|e| e.to_string())?;
+        String::from_utf8(raw).map_err(|e| e.to_string())
+    };
+    let key = minisign_verify::PublicKey::decode(&decode(pubkey_b64)?).map_err(|e| e.to_string())?;
+    let sig = minisign_verify::Signature::decode(&decode(signature_b64)?).map_err(|e| e.to_string())?;
+    key.verify(data, &sig, true)
+        .map_err(|e| crate::tr!("签名校验失败: {e}", "Signature check failed: {e}", e = e))?;
+    let signed = sig.trusted_comment().split('\t').find_map(|f| f.strip_prefix("version:"));
+    match signed {
+        Some(v) if v.trim_start_matches('v') != announced.trim_start_matches('v') => Err(crate::tr!(
+            "签名版本 {v} 与宣布的 {a} 不符",
+            "Signed version {v} does not match announced {a}",
+            v = v,
+            a = announced
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// 从 `releases/latest` JSON 里取 (tag_name, html_url, body)。tag_name 缺失/非 JSON → None;
@@ -116,5 +229,30 @@ mod tests {
         // 缺 tag_name → None;非 JSON → None
         assert!(parse_latest(r#"{"name":"x"}"#).is_none());
         assert!(parse_latest("not json").is_none());
+    }
+
+    /// 联网:经下载线路拉真实的 v0.20.0 升级包与签名,用 tauri.conf 的公钥校验;
+    /// 改一个字节必须校验失败。(现有签名的可信注释没记 version,版本比对不生效,
+    /// 与插件 require_signed_version=false 的口径一致。)
+    #[test]
+    #[ignore]
+    fn real_release_package_verifies_through_netroute() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let pubkey = conf["plugins"]["updater"]["pubkey"].as_str().unwrap();
+        let base = "https://github.com/SoulZhong/voice-notes/releases/download/v0.20.0/voice-notes_aarch64.app.tar.gz";
+        let dir = tempfile::tempdir().unwrap();
+        let mem = crate::netroute::RouteMemory::new(dir.path());
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let part = dir.path().join("pkg.part");
+        let t0 = std::time::Instant::now();
+        let n = crate::netroute::fetch(base, &part, &mem, &cancel, &|_| {}).unwrap();
+        eprintln!("{n} bytes in {:?}, mirror={}", t0.elapsed(), mem.prefers_mirror());
+        let sig_part = dir.path().join("sig.part");
+        crate::netroute::fetch(&format!("{base}.sig"), &sig_part, &mem, &cancel, &|_| {}).unwrap();
+        let sig = std::fs::read_to_string(&sig_part).unwrap();
+        let mut bytes = std::fs::read(&part).unwrap();
+        verify_signature(&bytes, sig.trim(), pubkey, "0.20.0").unwrap();
+        bytes[1000] ^= 1;
+        assert!(verify_signature(&bytes, sig.trim(), pubkey, "0.20.0").is_err(), "篡改必须拒");
     }
 }

@@ -182,7 +182,7 @@ export const zh = {
   "ai.modelCard.pause": "暂停下载",
   "ai.modelCard.resume": "继续下载",
   "ai.modelCard.download": "下载模型",
-  "ai.modelCard.mirrorNote": "下载镜像可在设置页配置。",
+  "ai.modelCard.routeNote": "网络慢时会自动切换加速线路。",
 } as const satisfies Dict;
 
 export const en = {
@@ -371,5 +371,5 @@ export const en = {
   "ai.modelCard.pause": "Pause download",
   "ai.modelCard.resume": "Resume download",
   "ai.modelCard.download": "Download models",
-  "ai.modelCard.mirrorNote": "A download mirror can be configured in Settings.",
+  "ai.modelCard.routeNote": "Switches to a faster route automatically on a slow network.",
 } satisfies Record<keyof typeof zh, Msg>;

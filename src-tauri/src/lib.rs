@@ -11,6 +11,7 @@ pub mod asr;
 mod ipc;
 pub mod models;
 pub mod scene; // devtools bin scene_backfill(#169)重放 SceneSensor 需要
+mod netroute; // 下载线路:直连/加速镜像自动选择(模型与升级包共用)
 mod netproxy; // 出站代理探测(更新器/ureq 共用,v0.13.1 冒烟实录)
 mod session;
 pub mod settings;
@@ -52,7 +53,6 @@ use pipeline::frame_tap::{self, SourceHealth, TapNotify, TapPolicy, TappedCaptur
 use pipeline::segmenter::Segmenter;
 use session::RecordingHandle;
 
-const DOWNLOAD_ATTEMPTS_PER_URL: usize = 3;
 /// 同时下载的模型工件数上限。大文件占带宽,取小值折中;不做用户可配。
 const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 
@@ -7976,43 +7976,22 @@ fn open_models_dir(app: AppHandle) -> Result<(), String> {
         .map_err(|e| tr!("打开目录失败: {e}", "Failed to open the directory: {e}"))
 }
 
-/// 下载单个工件:按 download_urls 的候选顺序尝试。代理候选各试 1 次(死代理快速跳过,
-/// 压回退延迟),原站(候选列表最后一项,== a.url)给足 DOWNLOAD_ATTEMPTS_PER_URL 次。
+/// 下载单个工件。线路切换与重试在 netroute 里做完;这里只把错误收成可展示文案。
 /// 返回 Err(msg):msg=="cancelled" 表示被取消,其余为可展示错误文案。
 fn download_one(
     a: &models::Artifact,
     root: &std::path::Path,
-    mirror_enabled: bool,
-    mirror_prefix: &str,
+    memory: &netroute::RouteMemory,
     cancel: &std::sync::atomic::AtomicBool,
     emit: &(impl Fn(&str, &str, u64, u64, &str) + 'static),
 ) -> Result<(), String> {
-    let urls = models::download::download_urls(a.url, mirror_enabled, mirror_prefix);
-    let mut last_err: Option<String> = None;
-    for url in &urls {
-        // 原站(无前缀,恒等于 a.url)多重试;代理候选各 1 次快速跳过。
-        let attempts = if url == a.url { DOWNLOAD_ATTEMPTS_PER_URL } else { 1 };
-        for attempt in 1..=attempts {
-            match models::download::download_artifact(a, root, url, cancel, emit) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg == "cancelled" {
-                        return Err("cancelled".into());
-                    }
-                    let retryable = models::download::retryable_download_error(&msg);
-                    last_err = Some(format!("{url}: {msg}"));
-                    if !retryable || attempt == attempts {
-                        break; // 换下一个候选 URL
-                    }
-                }
-            }
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err("cancelled".into());
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| tr!("下载失败", "Download failed")))
+    models::download::download_artifact(a, root, memory, cancel, emit).map_err(|e| e.to_string())
+}
+
+/// 上次走通的下载线路:true = 加速镜像(设置页「下载线路」状态行)。
+#[tauri::command]
+fn download_route_mirror(app: AppHandle) -> bool {
+    app.path().app_data_dir().map(|d| netroute::RouteMemory::new(&d).prefers_mirror()).unwrap_or(false)
 }
 
 #[tauri::command]
@@ -8049,7 +8028,7 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
         // preload 需要 app,但 app 随即被 worker 闭包 clone 走,先克隆留给补预载与 done 事件。
         let app_pl = app.clone();
         let app_done = app.clone();
-        let mirror_enabled = s.mirror_enabled;
+        let memory = netroute::RouteMemory::new(&app.path().app_data_dir().unwrap_or_else(|_| root.clone()));
         let items: Vec<&models::Artifact> = selected; // ARTIFACTS 原顺序,进度/展示稳定
         let next = std::sync::atomic::AtomicUsize::new(0);
         let all_ok = std::sync::atomic::AtomicBool::new(true);
@@ -8062,6 +8041,7 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
                 let next = &next;
                 let all_ok = &all_ok;
                 let root = &root;
+                let memory = &memory;
                 let items = &items;
                 scope.spawn(move || {
                     let emit = move |id: &str, phase: &str, received: u64, total: u64, message: &str| {
@@ -8088,7 +8068,7 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
                         if models::artifact_present(root, a) {
                             continue;
                         }
-                        match download_one(a, root, mirror_enabled, settings::MIRROR_PREFIX, cancel, &emit) {
+                        match download_one(a, root, memory, cancel, &emit) {
                             Ok(()) => {}
                             Err(msg) if msg == "cancelled" => {
                                 emit(a.id, "cancelled", 0, 0, "cancelled");
@@ -8473,14 +8453,6 @@ async fn test_refine_llm(base_url: String, model: String, api_key: String) -> Re
 #[tauri::command]
 async fn test_refine_agent(provider: String, bin: String, model: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || refine::agent::probe_run(&provider, &bin, &model))
-        .await
-        .map_err(|e| tr!("执行线程失败: {e}", "Worker thread failed: {e}"))?
-}
-
-/// 设置页「测试」镜像:经镜像前缀探一个已知资源验证可达。
-#[tauri::command]
-async fn test_mirror(prefix: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || models::download::probe_mirror(&prefix))
         .await
         .map_err(|e| tr!("执行线程失败: {e}", "Worker thread failed: {e}"))?
 }
@@ -9196,9 +9168,6 @@ pub fn run() {
             // 复现的一类(codex review P2#7、二轮 P2)。事件仍在本闭包末尾发,
             // 那时 track 才有意义。
             let boot = app_data.as_ref().map(|d| telemetry::open_session(d));
-            // 镜像前缀已随三删一藏改为编译期常量(settings::MIRROR_PREFIX),不再有
-            // mirror_prefix 字段可迁移——一次性 migrate_mirror_prefix 启动调用随之删除。
-            //
             // 启动一次性自愈(2026-08-10 review Important:堵尸检累积回归 → 同日二审 Important:
             // 堵双尸检回归):先前的写法是先 `load(d)` 拿 `s`,再 `if needs_heal { update(d, |_|{}) }`
             // ——`load` 对坏文件会当场写一具 `settings.json.corrupt-*` 尸体,而 `update` 内部
@@ -9519,7 +9488,6 @@ pub fn run() {
             test_hook,
             test_refine_llm,
             test_refine_agent,
-            test_mirror,
             apply_shortcut,
             migrate_data_dir,
             migrate_models_dir,
@@ -9571,6 +9539,8 @@ pub fn run() {
             mcp_skill_read,
             mcp_skill_save,
             update::check_update,
+            update::apply_update,
+            download_route_mirror,
             player::player_load,
             player::player_play,
             player::player_pause,

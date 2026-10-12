@@ -34,7 +34,6 @@ export type AgentProfile = {
 };
 
 export type Settings = {
-  mirror_enabled: boolean;
   data_dir?: string | null;
   models_dir?: string | null;
   asr_model: string;
@@ -153,7 +152,8 @@ export const testRefineLlm = (baseUrl: string, model: string, apiKey: string) =>
   invoke<string>("test_refine_llm", { baseUrl, model, apiKey });
 export const testRefineAgent = (provider: string, bin: string, model: string) =>
   invoke<string>("test_refine_agent", { provider, bin, model });
-export const testMirror = (prefix: string) => invoke<string>("test_mirror", { prefix });
+/** 上次走通的下载线路:true = 加速镜像(见 CONTEXT.md「下载线路」)。 */
+export const downloadRouteMirror = () => invoke<boolean>("download_route_mirror");
 // 云端 ASR 测试连接:直接测试表单当前值,不依赖 onblur 先把凭证落盘。
 // 这样用户粘贴 key 后立刻点测试也不会与异步保存竞态；录制中仍由后端拒绝。
 export const testCloudAsr = (

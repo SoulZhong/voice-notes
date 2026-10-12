@@ -191,13 +191,13 @@ export const zh = {
   "settings.models.originUrl": "原始地址",
   "settings.models.mirrorUrl": "镜像地址",
   "settings.models.copy": "复制",
-  "settings.models.mirrorOff": "未启用镜像加速",
+  "settings.models.mirrorSwitched": "网络较慢，已切换加速线路",
 
   // —— 镜像加速 ——
-  "settings.mirror.label": "镜像加速",
-  "settings.mirror.desc": "国内网络下载模型更快",
-  "settings.mirror.test": "测试",
-  "settings.mirror.aria": "使用镜像加速",
+  "settings.route.label": "下载线路",
+  "settings.route.desc": "自动选择：先用上次走通的线路，连不上或太慢就换另一条（上次：{route}）",
+  "settings.route.direct": "直连",
+  "settings.route.mirror": "加速镜像",
 
   // —— 高级(默认收起) ——
   "settings.section.advanced": "高级",
@@ -225,6 +225,7 @@ export const zh = {
   "settings.update.updating": "更新中…",
   "settings.update.updatingPct": "更新中 {pct}%",
   "settings.update.installing": "安装中…",
+  "settings.update.mirrorSwitched": "网络较慢，已切换加速线路",
 } as const satisfies Dict;
 
 export const en = {
@@ -408,12 +409,12 @@ export const en = {
   "settings.models.originUrl": "Original URL",
   "settings.models.mirrorUrl": "Mirror URL",
   "settings.models.copy": "Copy",
-  "settings.models.mirrorOff": "Mirror acceleration is off",
+  "settings.models.mirrorSwitched": "Slow network; switched to a faster route",
 
-  "settings.mirror.label": "Mirror acceleration",
-  "settings.mirror.desc": "Faster model downloads on networks in China",
-  "settings.mirror.test": "Test",
-  "settings.mirror.aria": "Use mirror acceleration",
+  "settings.route.label": "Download route",
+  "settings.route.desc": "Automatic: uses the route that worked last time and switches if it cannot connect or is too slow (last: {route})",
+  "settings.route.direct": "direct",
+  "settings.route.mirror": "mirror",
 
   "settings.section.advanced": "Advanced",
   "settings.section.advancedDesc": "Low-frequency/advanced options: garbled text filter, auto-identify speakers",
@@ -439,4 +440,5 @@ export const en = {
   "settings.update.updating": "Updating…",
   "settings.update.updatingPct": "Updating {pct}%",
   "settings.update.installing": "Installing…",
+  "settings.update.mirrorSwitched": "Slow network; switched to a faster route",
 } satisfies Record<keyof typeof zh, Msg>;
