@@ -26,17 +26,17 @@ pub(crate) const TRAY_ID: &str = "main-tray";
 
 /// 空闲静止帧。彩色 App Logo，非模板图。
 const IDLE_ICON: &[u8] = include_bytes!("../icons/tray-logo-idle.png");
-/// 录制/Aing 抖动帧（循环播放）。与 IDLE 同源 Logo，逐帧轻微旋转+位移。
+/// 录制/Aing 书写帧（循环播放）。与 IDLE 同一小姑娘，只有铅笔在本子上来回划写。
+/// 由 scripts/gen_tray_logo_frames.py 生成。
 const REC_FRAMES: &[&[u8]] = &[
     include_bytes!("../icons/tray-logo-rec-0.png"),
     include_bytes!("../icons/tray-logo-rec-1.png"),
     include_bytes!("../icons/tray-logo-rec-2.png"),
     include_bytes!("../icons/tray-logo-rec-3.png"),
-    include_bytes!("../icons/tray-logo-rec-4.png"),
-    include_bytes!("../icons/tray-logo-rec-5.png"),
 ];
 /// 逐帧间隔：约 3fps。原先 110ms(9fps)贯穿整场录音,每帧都要唤醒主线程换图;
-/// 菜单栏只需看得出「在录」,省电优先(2026-10-07)。
+/// 菜单栏只需看得出「在录」,省电优先(2026-10-07)。看不看得出靠铅笔动作幅度,
+/// 不靠帧率(2026-10-13 加大幅度后帧率不变)。
 const FRAME_MS: u64 = 330;
 
 /// 动画代际计数。每次 start_anim 领取新一代并起一条动画线程按该代循环；代际一变
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(no_session, ["toggle", "show", "quit"]);
     }
 
-    /// 录制动画的可见性契约:6 帧必须两两不同,且都不等于静止帧。
+    /// 录制动画的可见性契约:各帧必须两两不同,且都不等于静止帧。
     /// 为什么存在:PR#57 的图标流水线曾把 7 张帧 PNG 覆盖成 App 图标的近似副本,
     /// 动画线程照常循环但每帧长一样——用户看到"小姑娘不写字了"。字节级去重是
     /// 最便宜的哨兵:真动画必然逐帧有别,流水线再次压平资产时这里先红。
