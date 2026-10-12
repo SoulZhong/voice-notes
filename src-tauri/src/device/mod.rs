@@ -574,7 +574,9 @@ pub async fn device_grant_speech(app: AppHandle) -> Result<String, String> {
             .map_err(|e| e.to_string())?;
         let name = sp::status_name(s).to_owned();
         eprintln!("设备: 语音识别授权 {name}");
-        if name == "denied" || name == "restricted" {
+        // 拒绝过、受限,或请求后仍「未决定」(系统没弹框:未打包运行时权限记在启动它的
+        // 应用头上,永远弹不出来)都去系统设置,别让按钮看起来毫无反应。
+        if name != "authorized" {
             app.opener()
                 .open_url(
                     "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition",
