@@ -102,6 +102,8 @@ export type Settings = {
   device_enabled: boolean;
   /** 连过的设备名;只归设备连接流程写,set_settings 会保留后端值。 */
   device_name?: string | null;
+  /** 界面模式:true = 完整模式,false = 简洁模式(只影响设置页与左侧菜单显示,不改任何设置值)。 */
+  show_all_settings: boolean;
   /** 听写识别引擎:"auto" / "apple" / "sherpa"。 */
   dictation_engine: string;
   dictation_save_text: boolean;

@@ -28,7 +28,7 @@
   import { graphFilter } from "$lib/graphFilter.svelte";
   import { noteGraphState } from "$lib/noteGraph.svelte";
   import { i18n, t } from "$lib/i18n/index.svelte";
-  import { deviceMenu, loadDeviceMenu } from "$lib/deviceMenu.svelte";
+  import { loadUiMode, showDeviceTab, showHooksTab } from "$lib/uiMode.svelte";
   import {
     listDictationNotes,
     deleteDictationNote,
@@ -241,7 +241,7 @@
 
   // 「设备」菜单是否显示:挂载时按设置对齐一次(之后由设置页开关直接改)。
   $effect(() => {
-    loadDeviceMenu();
+    loadUiMode();
   });
 
   // 设备听写写下新句子/撤销时后端发事件:列表上的计数与排序随之更新。
@@ -444,12 +444,14 @@
         onclick={() => (graphDrawerOpen = !graphDrawerOpen)}
       >{t("shell.graph.filterToggle")}</button>
     {/if}
-    <a
-      class="vtab"
-      class:active={tab === "hooks"}
-      href="/hooks"
-      data-sveltekit-preload-code="eager">{t("shell.tab.hooks")}</a
-    >
+    {#if showHooksTab()}
+      <a
+        class="vtab"
+        class:active={tab === "hooks"}
+        href="/hooks"
+        data-sveltekit-preload-code="eager">{t("shell.tab.hooks")}</a
+      >
+    {/if}
     <!-- AI 页签按语言分流(2026-09-18 用户点名:中英各守各的排版习惯):
          中文竖排里拉丁缩略语用縦中横正立;英文界面与其余页签一致按书脊惯例旋转 -->
     <a
@@ -458,7 +460,7 @@
       class:active={tab === "ai"}
       href="/ai">AI</a
     >
-    {#if deviceMenu.visible}
+    {#if showDeviceTab()}
       <button
         class="vtab"
         class:active={tab === "device"}

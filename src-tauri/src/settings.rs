@@ -259,6 +259,10 @@ pub struct Settings {
     /// 连过的设备名(`VibeVoice-XXXX`)。Some = 已激活:启动时自动去连。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
+    /// 界面模式(见 CONTEXT.md「界面模式」):true = 完整模式,false = 简洁模式。
+    /// 只决定设置页与左侧菜单显示哪些项,从不改动任何设置值。新装默认简洁;
+    /// 升级上来的老用户(键缺失且已走完首启引导)保持完整。
+    pub show_all_settings: bool,
     /// 听写识别引擎:"auto"(macOS 用 Apple 语音识别,不可用时退回 sherpa;Windows 用
     /// sherpa)/ "apple" / "sherpa"(流式 zipformer 出实时字 + SenseVoice 出终稿)。
     /// 与会议录制的 asr_model 分开设置:听写要快,录会要准。
@@ -386,6 +390,9 @@ struct SettingsRepr {
     device_enabled: bool,
     #[serde(default)]
     device_name: Option<String>,
+    /// 键存在性判定:缺失 = 本版之前的设置文件,由 `From` 按 onboarded 推出。
+    #[serde(default)]
+    show_all_settings: Option<bool>,
     #[serde(default = "default_dictation_engine")]
     dictation_engine: String,
     #[serde(default = "default_true")]
@@ -484,6 +491,7 @@ impl From<SettingsRepr> for Settings {
             identify_auto_apply: r.identify_auto_apply,
             device_enabled: r.device_enabled,
             device_name: r.device_name.filter(|n| !n.trim().is_empty()),
+            show_all_settings: r.show_all_settings.unwrap_or(r.onboarded),
             dictation_engine: r.dictation_engine,
             dictation_save_text: r.dictation_save_text,
             dictation_save_audio: r.dictation_save_audio,
@@ -634,6 +642,7 @@ impl Default for Settings {
             identify_auto_apply: false,
             device_enabled: true,
             device_name: None,
+            show_all_settings: false,
             dictation_engine: default_dictation_engine(),
             dictation_save_text: true,
             dictation_save_audio: false,
@@ -1625,4 +1634,19 @@ mod tests {
         assert_eq!(before, corpse_names(tmp.path()), "文件已干净的后续启动不应再新增尸体");
     }
 
+
+    #[test]
+    fn simple_mode_for_new_installs_full_mode_kept_for_existing_users() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!load(tmp.path()).show_all_settings, "新装默认简洁模式");
+        std::fs::write(tmp.path().join("settings.json"), r#"{"onboarded":true}"#).unwrap();
+        assert!(load(tmp.path()).show_all_settings, "老用户升级保持完整模式");
+        std::fs::write(tmp.path().join("settings.json"), r#"{"onboarded":false}"#).unwrap();
+        assert!(!load(tmp.path()).show_all_settings);
+        // 键在场恒照旧,不再看 onboarded。
+        std::fs::write(tmp.path().join("settings.json"), r#"{"onboarded":true,"show_all_settings":false}"#).unwrap();
+        assert!(!load(tmp.path()).show_all_settings);
+        let got = update(tmp.path(), |s| s.show_all_settings = true).unwrap();
+        assert!(got.show_all_settings && load(tmp.path()).show_all_settings);
+    }
 }
