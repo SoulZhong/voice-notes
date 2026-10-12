@@ -58,6 +58,8 @@ sys-locale = "0.3"
 # 为什么不靠 posthog-rs 自己注入 $os:见 telemetry.rs env_props 的说明。
 os_info = "3"
 base64 = "0.22"
+# 一键更新自己下载升级包后校验签名(与 tauri-plugin-updater 同一实现)
+minisign-verify = "0.2"
 hex = "0.4"
 bzip2 = "0.5"
 tar = "0.4"

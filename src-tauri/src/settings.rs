@@ -1,13 +1,8 @@
-//! 轻量应用设置（app_data_dir/settings.json，原子写）。目前仅镜像加速配置。
+//! 轻量应用设置（app_data_dir/settings.json，原子写）。
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-/// 镜像加速前缀。曾经是可存盘/可迁移的字段(`Settings::mirror_prefix`),但 UI 从不
-/// 允许用户编辑它——值永远等于内置默认,字段与其迁移逻辑(`migrate_mirror_prefix`)
-/// 纯属历史包袱。三删一藏(配置项大梳理)改为编译期常量,不再落盘、不再有迁移代码。
-pub const MIRROR_PREFIX: &str = "https://ghfast.top/";
 
 /// ASR 模型选型标识,供 settings.asr_model 与后续选型逻辑复用。
 pub const ASR_SENSE_VOICE: &str = "sense_voice";
@@ -158,7 +153,6 @@ pub const CLOUD_ALIYUN: &str = "aliyun";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "SettingsRepr")]
 pub struct Settings {
-    pub mirror_enabled: bool,
     /// 自定义数据目录(录音/转写等落盘位置);None 时回退到 app_data_dir。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<String>,
@@ -295,8 +289,6 @@ pub const DICTATION_SHERPA: &str = "sherpa";
 /// 故意设计的编译期后盾,不是三份重复代码的疏漏。
 #[derive(Debug, Clone, Deserialize)]
 struct SettingsRepr {
-    #[serde(default = "default_true")]
-    mirror_enabled: bool,
     #[serde(default)]
     data_dir: Option<String>,
     #[serde(default)]
@@ -445,7 +437,6 @@ impl From<SettingsRepr> for Settings {
             };
         }
         Self {
-            mirror_enabled: r.mirror_enabled,
             data_dir: r.data_dir,
             models_dir: r.models_dir,
             asr_model: r.asr_model,
@@ -606,7 +597,6 @@ fn default_true() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            mirror_enabled: true,
             data_dir: None,
             models_dir: None,
             asr_model: default_asr(),
@@ -852,18 +842,18 @@ mod tests {
     fn load_missing_or_corrupt_falls_back_to_default() {
         let tmp = tempfile::tempdir().unwrap();
         let s = load(tmp.path());
-        assert!(s.mirror_enabled);
+        assert!(s.tray_enabled);
         std::fs::write(tmp.path().join("settings.json"), "not json").unwrap();
-        assert!(load(tmp.path()).mirror_enabled, "损坏 → 默认值");
+        assert!(load(tmp.path()).tray_enabled, "损坏 → 默认值");
     }
 
     #[test]
     fn save_then_load_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = Settings { mirror_enabled: true, ..Default::default() };
+        let s = Settings { refine_enabled: true, ..Default::default() };
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());
-        assert!(got.mirror_enabled);
+        assert!(got.refine_enabled);
         assert!(!tmp.path().join("settings.json.tmp").exists(), "原子写不留 tmp");
     }
 
@@ -890,14 +880,12 @@ mod tests {
     #[test]
     fn new_fields_default_and_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        // 旧文件(仅镜像字段)→ 新字段全默认
+        // 旧文件(仅已撤的镜像字段)→ 旧键忽略、新字段全默认
         std::fs::write(tmp.path().join("settings.json"), r#"{"mirror_enabled":true,"mirror_prefix":"x"}"#).unwrap();
         let s = load(tmp.path());
         assert_eq!(s.data_dir, None);
         assert_eq!(s.models_dir, None);
         assert_eq!(s.asr_model, ASR_SENSE_VOICE);
-        std::fs::write(tmp.path().join("settings.json"), "{}").unwrap();
-        assert!(load(tmp.path()).mirror_enabled, "旧配置缺镜像字段时应默认启用内置加速");
         // 新字段 roundtrip
         let s = Settings {
             data_dir: Some("/tmp/d".into()),
@@ -927,9 +915,9 @@ mod tests {
     #[test]
     fn update_roundtrip_applies_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
-        let got = update(tmp.path(), |s| s.mirror_enabled = true).unwrap();
-        assert!(got.mirror_enabled, "返回落盘后的新值");
-        assert!(load(tmp.path()).mirror_enabled, "已持久化到磁盘");
+        let got = update(tmp.path(), |s| s.refine_enabled = true).unwrap();
+        assert!(got.refine_enabled, "返回落盘后的新值");
+        assert!(load(tmp.path()).refine_enabled, "已持久化到磁盘");
     }
 
     #[test]
@@ -968,7 +956,7 @@ mod tests {
         let d1 = dir.clone();
         let h1 = std::thread::spawn(move || {
             for _ in 0..100 {
-                update(&d1, |s| s.mirror_enabled = true).unwrap();
+                update(&d1, |s| s.refine_enabled = true).unwrap();
             }
         });
         let d2 = dir.clone();
@@ -980,7 +968,7 @@ mod tests {
         h1.join().unwrap();
         h2.join().unwrap();
         let got = load(&dir);
-        assert!(got.mirror_enabled, "线程1 的写未被丢");
+        assert!(got.refine_enabled, "线程1 的写未被丢");
         assert_eq!(got.asr_model, ASR_WHISPER, "线程2 的写未被丢");
     }
 

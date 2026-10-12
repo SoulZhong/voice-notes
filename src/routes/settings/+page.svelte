@@ -25,7 +25,7 @@
     appleAsrStatus,
     installAppleAsr,
     type AppleAsrStatus,
-    testMirror,
+    downloadRouteMirror,
     testCloudAsr,
     calendarPermission,
     requestCalendarPermission,
@@ -52,31 +52,12 @@
   let updateInfo = $state<UpdateInfo | null>(null);
   let updateChecking = $state(false);
   let updateError = $state("");
-  let mirrorTest = $state<{ ok: boolean; msg: string } | null>(null);
-  let mirrorTesting = $state(false);
+  /** 上次走通的下载线路(true = 加速镜像),见 CONTEXT.md「下载线路」。 */
+  let routeMirror = $state<boolean | null>(null);
   let expandedId = $state<string | null>(null);
 
-  /** 镜像前缀:曾是设置项上的可编辑字段,三删一藏后 UI 从不允许编辑它——值永远等于后端
-   * 内置常量,该字段随之从设置类型上移除。这里保留同值字面量只为拼预览 URL / 传给
-   * test_mirror,不代表前端可配置。 */
-  const MIRROR_PREFIX = "https://ghfast.top/";
-  /** 镜像开启时返回「前缀+原始url」(等同后端 apply_mirror);关闭时返回原始 url。 */
-  function effectiveUrl(url: string): string {
-    if (!settings?.mirror_enabled) return url;
-    return `${MIRROR_PREFIX}${url}`;
-  }
-  async function runMirrorTest() {
-    if (!settings) return;
-    mirrorTesting = true;
-    mirrorTest = null;
-    try {
-      mirrorTest = { ok: true, msg: await testMirror(MIRROR_PREFIX) };
-    } catch (e) {
-      mirrorTest = { ok: false, msg: String(e) };
-    } finally {
-      mirrorTesting = false;
-    }
-  }
+  /** 加速镜像下的地址(手动下载用),与后端 netroute::MIRRORS 首项同前缀。 */
+  const mirrorUrl = (url: string) => `https://ghfast.top/${url}`;
   async function doCheckUpdate() {
     updateChecking = true;
     updateError = "";
@@ -205,7 +186,7 @@
   let confirmDeleteId = $state<string | null>(null);
 
   /** 各工件下载进度:received/total 字节 + phase(done/error/cancelled 后清除)。 */
-  let prog = $state<Record<string, { received: number; total: number; phase: string }>>({});
+  let prog = $state<Record<string, { received: number; total: number; phase: string; mirror?: boolean }>>({});
 
   // 任一工件处于未终结的下载态(downloading/verifying/extracting)→ 视为下载进行中。
   const downloadingActive = $derived(
@@ -408,7 +389,11 @@
       refreshStatus(); // 单工件完成:刷新 present 态(行变「已下载」)
       return;
     }
-    prog = { ...prog, [e.artifact]: { received: e.received_bytes, total: e.total_bytes, phase: e.phase } };
+    prog = {
+      ...prog,
+      [e.artifact]: { received: e.received_bytes, total: e.total_bytes, phase: e.phase, mirror: e.message === "mirror" },
+    };
+    if (e.message === "mirror") routeMirror = true;
   }
 
   function dropProg(id: string) {
@@ -418,6 +403,7 @@
 
   onMount(() => {
     refreshSettings();
+    downloadRouteMirror().then((m) => (routeMirror = m)).catch(() => {});
     calendarPermission().then((p) => (calPerm = p)).catch(() => {});
     refreshStatus();
     refreshDiskUsage();
@@ -803,14 +789,6 @@
     } finally {
       testingCloud = false;
     }
-  }
-
-  // —— 镜像加速(逻辑照搬 ModelDownloadCard)——
-  async function toggleMirror() {
-    mirrorTest = null;
-    if (!settings) return;
-    settings = { ...settings, mirror_enabled: !settings.mirror_enabled };
-    await setSettings(settings);
   }
 
   const pct = (p: { received: number; total: number }) =>
@@ -1432,6 +1410,9 @@
                   {#if prog[a.id].phase === "downloading" && prog[a.id].total > 0}
                     {mb(prog[a.id].received)}/{mb(prog[a.id].total)}MB
                   {/if}
+                  {#if prog[a.id].mirror}
+                    · {t("settings.models.mirrorSwitched")}
+                  {/if}
                 </span>
                 <div class="bar"><div class="fill" style="width:{pct(prog[a.id])}%"></div></div>
                 <!-- 镜像僵死等场景的逃生口:后端置取消标志,worker 发 cancelled 事件清本行。
@@ -1473,12 +1454,8 @@
               </div>
               <div class="url-line">
                 <span class="url-tag">{t("settings.models.mirrorUrl")}</span>
-                {#if settings?.mirror_enabled}
-                  <code class="url-text">{effectiveUrl(a.url)}</code>
-                  <button class="link" onclick={() => navigator.clipboard.writeText(effectiveUrl(a.url))}>{t("settings.models.copy")}</button>
-                {:else}
-                  <span class="url-muted">{t("settings.models.mirrorOff")}</span>
-                {/if}
+                <code class="url-text">{mirrorUrl(a.url)}</code>
+                <button class="link" onclick={() => navigator.clipboard.writeText(mirrorUrl(a.url))}>{t("settings.models.copy")}</button>
               </div>
             </div>
           {/if}
@@ -1486,32 +1463,13 @@
       {/if}
       <div class="row">
         <div class="row-info">
-          <span class="row-label">{t("settings.mirror.label")}</span>
+          <span class="row-label">{t("settings.route.label")}</span>
           <span class="row-desc">
-            {#if mirrorTest}
-              <span class={mirrorTest.ok ? "mtest-ok" : "mtest-err"}>
-                {mirrorTest.ok
-                  ? t("settings.test.ok", { msg: mirrorTest.msg })
-                  : t("settings.test.failed", { msg: mirrorTest.msg })}
-              </span>
-            {:else}
-              {t("settings.mirror.desc")}
-            {/if}
+            {t("settings.route.desc", {
+              route: routeMirror === null ? "…" : routeMirror ? t("settings.route.mirror") : t("settings.route.direct"),
+            })}
           </span>
         </div>
-        {#if settings?.mirror_enabled}
-          <button class="btn-secondary" onclick={runMirrorTest} disabled={mirrorTesting}>
-            {mirrorTesting ? t("settings.testing") : t("settings.mirror.test")}
-          </button>
-        {/if}
-        <input
-          type="checkbox"
-          class="ctl switch"
-          aria-label={t("settings.mirror.aria")}
-          checked={settings?.mirror_enabled ?? false}
-          disabled={!settings}
-          onchange={toggleMirror}
-        />
       </div>
     </div>
   </section>

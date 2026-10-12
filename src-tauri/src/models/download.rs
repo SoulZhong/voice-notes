@@ -5,105 +5,15 @@
 use super::FinalFile;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-
-/// 镜像前缀拼接：启用且前缀非空时 = prefix + 原完整 URL（ghproxy 风格），自动补尾 '/'。
-pub fn apply_mirror(url: &str, enabled: bool, prefix: &str) -> String {
-    let p = prefix.trim();
-    if !enabled || p.is_empty() {
-        return url.to_string();
-    }
-    if p.ends_with('/') {
-        format!("{p}{url}")
-    } else {
-        format!("{p}/{url}")
-    }
-}
-
-/// 备用 GitHub 下载代理(主代理失败后按序回退)。均为「前缀 + 完整原始 URL」的 ghproxy 风格。
-/// 存活实测(2026-07-16)健在;公共代理会波动,失效时改此列表并发版。列表短以压回退延迟。
-pub const BACKUP_MIRROR_PREFIXES: &[&str] = &["https://gh-proxy.com/", "https://ghproxy.net/"];
-
-/// 下载候选 URL(按序尝试):启用镜像时 = [主代理+url, 备用代理+url(去重), 原站url];
-/// 停用/空前缀 = [原站url]。原站恒为最后一项。Task 4 依此区分「代理少重试、原站多重试」。
-pub fn download_urls(url: &str, mirror_enabled: bool, mirror_prefix: &str) -> Vec<String> {
-    let primary = apply_mirror(url, mirror_enabled, mirror_prefix);
-    if primary == url {
-        // 镜像停用或空前缀:只有原站。
-        return vec![url.to_string()];
-    }
-    let mut out = vec![primary];
-    for bp in BACKUP_MIRROR_PREFIXES {
-        let candidate = apply_mirror(url, true, bp);
-        if candidate != url && !out.contains(&candidate) {
-            out.push(candidate);
-        }
-    }
-    out.push(url.to_string()); // 原站兜底,恒最后
-    out
-}
-
-/// 「测试」镜像:经前缀对一个已知模型资源发 Range 探测请求(只取 1 字节,不拉正文),
-/// 验证镜像可达。空前缀直接报错(未启用/未填无可测)。成功返回 HTTP 状态。
-pub fn probe_mirror(prefix: &str) -> Result<String, String> {
-    let p = prefix.trim();
-    if p.is_empty() {
-        return Err(crate::tr!("镜像前缀为空", "Mirror prefix is empty"));
-    }
-    // 取注册表里一个稳定的小资源(vad,~1MB)做探测;Range 只要头 1 字节。
-    let origin = crate::models::ARTIFACTS
-        .iter()
-        .find(|a| a.id == "vad")
-        .map(|a| a.url)
-        .unwrap_or("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx");
-    let url = apply_mirror(origin, true, p);
-    match crate::netproxy::agent_for(&url).get(&url)
-        .timeout(Duration::from_secs(10))
-        .set("Range", "bytes=0-0")
-        .call()
-    {
-        Ok(r) => Ok(crate::tr!("镜像可达(HTTP {code})", "Mirror reachable (HTTP {code})", code = r.status())),
-        Err(ureq::Error::Status(code, _)) if (200..400).contains(&code) => {
-            Ok(crate::tr!("镜像可达(HTTP {code})", "Mirror reachable (HTTP {code})", code = code))
-        }
-        Err(ureq::Error::Status(code, _)) => {
-            Err(crate::tr!("镜像返回 HTTP {code}", "Mirror returned HTTP {code}", code = code))
-        }
-        Err(ureq::Error::Transport(t)) => {
-            let s = t.to_string();
-            if s.contains("timed out") || s.contains("timeout") {
-                Err(crate::tr!("镜像连接超时", "Mirror connection timed out"))
-            } else {
-                Err(crate::tr!("镜像不可达:{s}", "Mirror unreachable: {s}", s = s))
-            }
-        }
-    }
-}
 
 /// 稳定错误码:以 "[E_*]" 前缀嵌入错误串,重试判定只认码不认人类可读文案——
 /// 文案可随 UI 语言(tr!)翻译,控制流不受影响。"cancelled" 字面量是取消协议,不在此列。
 pub const CODE_SIZE_MISMATCH: &str = "[E_SIZE_MISMATCH]";
 pub const CODE_SHA256_MISMATCH: &str = "[E_SHA256_MISMATCH]";
 pub const CODE_ARCHIVE_MISSING_DIR: &str = "[E_ARCHIVE_MISSING_DIR]";
-pub const CODE_RESUME_OFFSET: &str = "[E_RESUME_OFFSET]";
-
-pub fn retryable_download_error(message: &str) -> bool {
-    message != "cancelled"
-        && !message.contains(CODE_SIZE_MISMATCH)
-        && !message.contains(CODE_SHA256_MISMATCH)
-        && !message.contains(CODE_ARCHIVE_MISSING_DIR)
-        && !message.contains(CODE_RESUME_OFFSET)
-        // 4xx 是永久失败,重试同一 URL 纯浪费(直接换下一个 URL)。ureq 对非 2xx 走
-        // Err(Status),经 download_artifact 包装后的真实文案是
-        // 「请求失败: <url>: status code 404」(前缀随 UI 语言翻译,但 ": status code"
-        // 来自 ureq error.rs 的 Display 格式,恒为英文,判据不受翻译影响);
-        // 本仓自己的 "HTTP {n}" 分支只有 204 等非 200/206 的 2xx 才可达,一并保留。
-        && !message.contains(": status code 4")
-        && !message.starts_with("HTTP 4")
-}
 
 /// 流式计算文件 SHA256（hex 小写）。
 pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
@@ -276,100 +186,25 @@ fn finalize_artifact(
 }
 
 /// 下载并安装单个工件。断点：root/<id>.part（HTTP Range 续传；服务端不支持则重下）。
+/// 线路(直连/镜像)由 [`crate::netroute::fetch`] 自动选择与切换。
 /// cancel 置位 → Err 且消息恰为 "cancelled"（保留 .part 供续传）；
 /// 校验/解压失败 → 删 .part（脏数据不值得续）并 Err。
+/// 进度回调的 message 为 "mirror" 表示已换到加速线路(界面据此提示)。
 pub fn download_artifact(
     a: &super::Artifact,
     root: &Path,
-    url: &str,
+    memory: &crate::netroute::RouteMemory,
     cancel: &AtomicBool,
     progress: &Progress,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(root)?;
     let part = root.join(format!("{}.part", a.id));
-    let mut offset = part.metadata().map(|m| m.len()).unwrap_or(0);
-
-    // 分层超时取代旧的"整体 10 小时"单一超时(2026-08-11 冒烟实证的坑:镜像对大文件
-    // 建连后迟迟不吐首字节,整体超时不到期 → download_one 的候选 URL 轮换永远轮不到
-    // 原站,UI 卡"下载中"且取消在阻塞读里失灵):
-    // - connect 15s:死镜像/黑洞路由快速失败,候选链真正生效;
-    // - 每次 read 30s:只限"无数据流动"的僵死,不限总时长——慢链路只要字节在走就
-    //   永不误杀;读间隙的取消检查也因此最迟 30s 内响应。
-    // 读超时错误文案含 "timed out",经 retryable_download_error 判定可重试,同 URL
-    // Range 续传后再轮换,已下字节不浪费。
-    let agent = crate::netproxy::agent_with_timeouts(&url, Duration::from_secs(15), Duration::from_secs(30));
-    let req = agent.get(url);
-    let req = if offset > 0 { req.set("Range", &format!("bytes={offset}-")) } else { req };
-    let resp = match req.call() {
-        Ok(r) => r,
-        // 416 = 偏移 ≥ 服务端全量。两种来源:上次解压被取消(.part 是完好全量
-        // tarball,直接收尾复装,免整包重下)或崩溃残留脏分片(收尾校验失败 →
-        // finalize 已删分片,报错引导重试,同旧行为)。
-        Err(ureq::Error::Status(416, _)) => {
-            return finalize_artifact(a, root, &part, cancel, progress, offset, offset).map_err(|e| {
-                if e.to_string() == "cancelled" {
-                    e
-                } else {
-                    anyhow::anyhow!(
-                        "{CODE_RESUME_OFFSET} {}",
-                        crate::tr!(
-                            "续传偏移越界,残留分片无法直接安装,请重试({e})",
-                            "Resume offset out of range; leftover partial file cannot be installed directly, please retry ({e})",
-                            e = e
-                        )
-                    )
-                }
-            });
-        }
-        Err(e) => anyhow::bail!("{}", crate::tr!("请求失败: {e}", "Request failed: {e}", e = e)),
+    let on_progress = |p: crate::netroute::Progress| {
+        let note = if p.switched && p.mirror { "mirror" } else { "" };
+        progress(a.id, "downloading", p.received, p.total, note);
     };
-    let status = resp.status();
-    let out: fs::File;
-    if status == 206 {
-        out = fs::OpenOptions::new().append(true).open(&part)?;
-    } else if status == 200 {
-        offset = 0; // 服务端不支持 Range（或首次下载）：从头来
-        out = fs::File::create(&part)?;
-    } else {
-        anyhow::bail!("HTTP {status}");
-    }
-    let total = offset
-        + resp
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-    let mut reader = resp.into_reader();
-    let mut out = std::io::BufWriter::new(out);
-    let mut received = offset;
-    let mut buf = [0u8; 64 * 1024];
-    let mut last_emit = Instant::now() - Duration::from_secs(1);
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            drop(out); // 落盘已写字节，保留 .part
-            anyhow::bail!("cancelled");
-        }
-        let n = match reader.read(&mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                let _ = out.flush();
-                drop(out);
-                anyhow::bail!("{}", crate::tr!("下载中断: {e}", "Download interrupted: {e}", e = e));
-            }
-        };
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n])?;
-        received += n as u64;
-        if last_emit.elapsed() >= Duration::from_millis(250) {
-            last_emit = Instant::now();
-            progress(a.id, "downloading", received, total, "");
-        }
-    }
-    out.flush()?;
-    drop(out);
-
-    finalize_artifact(a, root, &part, cancel, progress, received, total)
+    let received = crate::netroute::fetch(a.url, &part, memory, cancel, &on_progress).map_err(|e| anyhow::anyhow!(e))?;
+    finalize_artifact(a, root, &part, cancel, progress, received, received)
 }
 
 #[cfg(test)]
@@ -406,76 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_mirror_prefixes_only_when_enabled() {
-        let u = "https://github.com/a/b.onnx";
-        assert_eq!(apply_mirror(u, false, "https://ghproxy.net/"), u);
-        assert_eq!(apply_mirror(u, true, ""), u, "空前缀视同关闭");
-        assert_eq!(apply_mirror(u, true, "https://ghproxy.net/"), format!("https://ghproxy.net/{u}"));
-        assert_eq!(apply_mirror(u, true, "https://ghproxy.net"), format!("https://ghproxy.net/{u}"), "自动补尾斜杠");
-    }
-
-    #[test]
-    fn download_urls_try_mirror_first_then_origin_when_enabled() {
-        let u = "https://github.com/a/b.onnx";
-        assert_eq!(download_urls(u, false, "https://ghproxy.net/"), vec![u.to_string()]);
-        assert_eq!(download_urls(u, true, ""), vec![u.to_string()], "空前缀视同停用");
-        let urls = download_urls(u, true, "https://ghproxy.net/");
-        assert_eq!(urls.first().unwrap(), &format!("https://ghproxy.net/{u}"), "主代理在最前");
-        assert_eq!(urls.last().unwrap(), u, "原站恒为最后");
-    }
-
-    #[test]
-    fn download_urls_multi_proxy_dedup_and_origin_last() {
-        let u = "https://github.com/a/b.onnx";
-        // 主代理恰好等于某个备用代理时,该代理只应出现一次。
-        let backup0 = format!("{}{u}", BACKUP_MIRROR_PREFIXES[0]);
-        let urls = download_urls(u, true, BACKUP_MIRROR_PREFIXES[0]);
-        assert_eq!(urls.iter().filter(|x| **x == backup0).count(), 1, "主/备重复应去重");
-        assert_eq!(urls.last().unwrap(), u, "原站恒为最后");
-        // 全程无重复项。
-        let mut sorted = urls.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), urls.len(), "候选列表不应有重复");
-    }
-
-    #[test]
-    fn download_urls_includes_backup_proxies() {
-        let u = "https://github.com/a/b.onnx";
-        let urls = download_urls(u, true, "https://ghfast.top/");
-        // 主代理 + 至少一个备用代理 + 原站。
-        assert!(urls.len() >= 3, "应含主代理、备用代理与原站, got {urls:?}");
-        for bp in BACKUP_MIRROR_PREFIXES {
-            if *bp != "https://ghfast.top/" {
-                assert!(urls.iter().any(|x| x == &format!("{bp}{u}")), "应含备用代理 {bp}");
-            }
-        }
-    }
-
-    #[test]
-    fn retryable_download_error_keeps_transient_failures_retryable() {
-        assert!(retryable_download_error("下载中断: response body closed before all bytes were read"));
-        assert!(retryable_download_error("请求失败: Network Error: Operation timed out"));
-        assert!(!retryable_download_error("cancelled"));
-        // 永久失败判定只认稳定错误码,文案(中/英)可自由翻译。
-        assert!(!retryable_download_error("[E_SHA256_MISMATCH] m.bin SHA256 校验失败"));
-        assert!(!retryable_download_error("[E_SHA256_MISMATCH] m.bin: SHA256 checksum failed"));
-        assert!(!retryable_download_error("[E_SIZE_MISMATCH] m.bin 大小不符: 4 != 5"));
-        assert!(!retryable_download_error("[E_ARCHIVE_MISSING_DIR] Archive is missing directory d"));
-        assert!(!retryable_download_error("[E_RESUME_OFFSET] 续传偏移越界,残留分片无法直接安装,请重试(x)"));
-        // 无码的纯文案不再触发永久失败判定(判据已结构化)。
-        assert!(retryable_download_error("m.bin SHA256 校验失败"));
-        // 4xx 的**真实**文案(ureq Status Display 经 "请求失败: {e}" 包装),
-        // 不是虚构的 "HTTP 404"——PR #16 评审实证,勿改回纯 starts_with 匹配。
-        assert!(!retryable_download_error(
-            "请求失败: https://github.com/a/b.onnx: status code 404"
-        ));
-        assert!(!retryable_download_error("HTTP 404")); // 非 200/206 的 2xx 分支格式
-        // 5xx 是服务端瞬态,保持可重试。
-        assert!(retryable_download_error("请求失败: https://x/y: status code 503"));
-    }
-
-    #[test]
     fn verify_file_checks_size_then_hash() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("m.bin");
@@ -483,12 +248,10 @@ mod tests {
         assert!(verify_file(&p, &ff("m.bin", b"hello")).is_ok());
         let size_err = verify_file(&p, &ff("m.bin", b"hell")).unwrap_err().to_string();
         assert!(size_err.contains(CODE_SIZE_MISMATCH), "大小不符应带稳定码: {size_err}");
-        assert!(!retryable_download_error(&size_err), "大小不符不可重试");
         let mut wrong = ff("m.bin", b"hello");
         wrong.sha256 = Box::leak("0".repeat(64).into_boxed_str());
         let hash_err = verify_file(&p, &wrong).unwrap_err().to_string();
         assert!(hash_err.contains(CODE_SHA256_MISMATCH), "哈希不符应带稳定码: {hash_err}");
-        assert!(!retryable_download_error(&hash_err), "哈希不符不可重试");
     }
 
     #[test]
@@ -568,36 +331,19 @@ mod tests {
     }
 
     #[test]
-    fn probe_mirror_empty_prefix_errs() {
-        // 文案随全局语言:拿 test_lang_guard 与其它改语言的用例互斥后,两种语言各断言一次。
-        let _guard = crate::i18n::test_lang_guard();
-        crate::i18n::set_lang("zh");
-        let e = probe_mirror("   ").unwrap_err();
-        assert!(e.contains("为空"), "空前缀应报错(中文): {e}");
-        crate::i18n::set_lang("en");
-        let e = probe_mirror("   ").unwrap_err();
-        assert!(e.contains("empty"), "空前缀应报错(英文): {e}");
-        crate::i18n::set_lang("zh");
-    }
-
-    /// 真机验证(网络依赖,与既有 7 个模型依赖测试同惯例 #[ignore]):走生产同款
-    /// download_artifact 实际拉取 dtln_aec_256_1(~5.5MB,注册表最小的一个),校验落位
-    /// models 根目录 + SHA256 与 Global Constraints 钉死值一致,证明镜像/下载/校验链路
-    /// 对新工件同样生效,无需为此新写任何下载逻辑。
-    /// Run: cd src-tauri && cargo test --lib real_download_installs_dtln_aec_256_1 -- --ignored --nocapture
-    #[test]
     #[ignore]
-    fn real_download_installs_dtln_aec_256_1_with_verified_hash() {
+    fn real_download_installs_vad_with_verified_hash() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let a = crate::models::ARTIFACTS
             .iter()
-            .find(|a| a.id == "dtln_aec_256_1")
-            .expect("dtln_aec_256_1 已注册");
+            .find(|a| a.id == "vad")
+            .expect("vad 已注册");
         let noop: &Progress = &|id, phase, received, total, msg| {
             eprintln!("[{id}] {phase} {received}/{total} {msg}");
         };
-        download_artifact(a, root, a.url, &AtomicBool::new(false), noop)
+        let memory = crate::netroute::RouteMemory::new(root);
+        download_artifact(a, root, &memory, &AtomicBool::new(false), noop)
             .expect("真机下载应成功");
         let installed = root.join(a.files[0].rel_path);
         assert!(installed.is_file(), "应落位 models 根目录");

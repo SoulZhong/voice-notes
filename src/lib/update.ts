@@ -56,16 +56,14 @@ export type UpdateProgress = {
   label: string;
 };
 
-/** 网络请求超时(查询与下载各自适用):连接悬死不能让按钮永远停在「更新中」。 */
-const UPDATE_TIMEOUT_MS = 30_000;
-
 // 单飞锁:横幅(+layout)与设置页两个入口同时可见,各自组件态互不知情,
 // 不加锁会并发两趟 downloadAndInstall(双下载、安装互踩)。进行中再调用
 // 直接复用同一 promise(后来者的进度回调不接线,其按钮停在初始「更新中…」,
 // 与真实进度共享同一次安装)。
 let inFlight: Promise<"none"> | null = null;
 
-/** 一键更新:updater 插件查 → 下载(回调进度文案)→ 安装 → 重启。
+/** 一键更新:后端 apply_update 查 → 下载(经下载线路,自动切换直连/加速镜像、断点续传)
+ * → 校验签名 → 安装,进度经 `update_progress` 事件回传;装好后这里重启。
  * 返回 "none" = 端上认为没有更新(与 check_update 的 GitHub API 判断可能短暂不一致,
  * 如 Release 刚发但 latest.json 未就绪);安装成功后 relaunch 不返回
  * (Windows 上安装器会先行结束应用,relaunch 根本执行不到——由安装器负责收尾)。
@@ -78,38 +76,30 @@ export function applyUpdate(onProgress: (p: UpdateProgress) => void): Promise<"n
   return inFlight;
 }
 
+/** 后端 `update_progress` 事件载荷(见 src-tauri/src/update.rs UpdateProgress)。 */
+export type RawUpdateProgress = { received: number; total: number; mirror: boolean; installing: boolean };
+
+/** 事件载荷 → 界面进度。换到加速线路时文案后缀一句,免得用户以为卡住了。 */
+export function toUpdateProgress(p: RawUpdateProgress): UpdateProgress {
+  if (p.installing) return { pct: null, installing: true, label: t("settings.update.installing") };
+  const total = p.total > 0 ? p.total : undefined;
+  const base = updateProgressLabel(p.received, total);
+  return {
+    pct: total ? Math.min(100, Math.round((p.received / total) * 100)) : null,
+    installing: false,
+    label: p.mirror ? `${base} · ${t("settings.update.mirrorSwitched")}` : base,
+  };
+}
+
 async function doApplyUpdate(onProgress: (p: UpdateProgress) => void): Promise<"none"> {
-  const { check } = await import("@tauri-apps/plugin-updater");
+  const { listen } = await import("@tauri-apps/api/event");
   const { relaunch } = await import("@tauri-apps/plugin-process");
-  // 代理探测(v0.13.1 冒烟实录):GUI 进程不继承终端代理变量,更新器直连 github
-  // 在 Clash 系统代理模式下时通时不通;后端读环境变量/macOS 系统代理,有则显式传入。
-  const { invoke } = await import("@tauri-apps/api/core");
-  const proxy =
-    (await invoke<string | null>("system_proxy_url", { target: "https://github.com/" }).catch(() => null)) ??
-    undefined;
-  const update = await check({ timeout: UPDATE_TIMEOUT_MS, proxy });
-  if (!update) return "none";
-  let downloaded = 0;
-  let total: number | undefined;
-  await update.downloadAndInstall(
-    (event) => {
-      if (event.event === "Started") {
-        total = event.data.contentLength ?? undefined;
-      } else if (event.event === "Progress") {
-        downloaded += event.data.chunkLength;
-        onProgress({
-          pct: total ? Math.min(100, Math.round((downloaded / total) * 100)) : null,
-          installing: false,
-          label: updateProgressLabel(downloaded, total),
-        });
-      } else if (event.event === "Finished") {
-        // 下载完成后还有签名校验+解包安装,可能要几十秒;不处理会停在
-        // 「更新中 100%」像卡死。
-        onProgress({ pct: null, installing: true, label: t("settings.update.installing") });
-      }
-    },
-    { timeout: UPDATE_TIMEOUT_MS },
-  );
+  const unlisten = await listen<RawUpdateProgress>("update_progress", (e) => onProgress(toUpdateProgress(e.payload)));
+  try {
+    if (!(await invoke<boolean>("apply_update"))) return "none";
+  } finally {
+    unlisten();
+  }
   await relaunch();
   return "none"; // relaunch 后通常到不了这里,类型完整性兜底
 }
