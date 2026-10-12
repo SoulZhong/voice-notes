@@ -14,6 +14,7 @@
   import { mcpAgentsStatus, mcpRegister, type AgentStatus, type RegisterOutcome } from "$lib/mcp";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import { t } from "$lib/i18n/index.svelte";
+  import { uiMode } from "$lib/uiMode.svelte";
 
   let {
     status,
@@ -57,7 +58,7 @@
   const registerLocked = $derived(registering || finishing || (outcomes !== null && outcomes.every((o) => o.ok)));
 
   /** 基础初始化和本功能引导分别记账；后续功能使用自己的 guide ID。 */
-  async function markOnboarded() {
+  async function markOnboarded(showAll = false) {
     try {
       const s = await getSettings();
       const completed = new Set(s.completed_guides);
@@ -67,16 +68,19 @@
         onboarded: true,
         mcp_onboarded: true,
         completed_guides: [...completed],
+        // 从「高级设置」出口离开的人是要看全部设置的:切完整模式(仅此一处自动切换)。
+        show_all_settings: showAll || s.show_all_settings,
       });
+      if (showAll) uiMode.full = true;
     } catch {
       /* 落盘失败下次启动会再见到欢迎层,幂等,不打断跳转 */
     }
   }
 
-  async function finish(target: "/record" | "/settings" | "/ai" | "/ai?guide=ai-tools-v1") {
+  async function finish(target: "/record" | "/settings" | "/ai" | "/ai?guide=ai-tools-v1", showAll = false) {
     if (finishing) return;
     finishing = true;
-    await markOnboarded();
+    await markOnboarded(showAll);
     onDone(target);
   }
 
@@ -198,7 +202,7 @@
   }
 
   async function advanced() {
-    await finish("/settings");
+    await finish("/settings", true);
   }
 </script>
 

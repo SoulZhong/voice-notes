@@ -38,7 +38,7 @@
   import { refineReady } from "$lib/refineReady";
   import EditableField from "$lib/EditableField.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { deviceMenu } from "$lib/deviceMenu.svelte";
+  import { uiMode, syncUiMode } from "$lib/uiMode.svelte";
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
   import Segmented from "$lib/Segmented.svelte";
@@ -208,6 +208,50 @@
       ? appleAsr !== "ready"
       : !!status && !status.artifacts.find((a) => a.id === asrArtifactId)?.present,
   );
+
+  // —— 简洁模式(见 CONTEXT.md「界面模式」):隐藏项保持原值照样生效,识别与模型各换一行状态 ——
+  const full = $derived(uiMode.full);
+  const engineName = $derived(
+    asrChoice === "apple" ? t("settings.asr.appleLabel")
+      : asrChoice === "whisper" ? "Whisper"
+      : asrChoice === "paraformer" ? "Paraformer"
+      : asrChoice === "qwen3" ? "Qwen3"
+      : asrChoice === "firered" ? "FireRed"
+      : "SenseVoice",
+  );
+  const providerName = $derived(cloudProvider === "aliyun" ? t("settings.cloud.aliyun") : t("settings.cloud.volcano"));
+  const asrSummary = $derived(
+    asrMode === "cloud" ? `${t("settings.asrMode.cloud")} · ${providerName}`
+      : asrMode === "local_cloud" ? `${t("settings.asrMode.localCloud")} · ${engineName} + ${providerName}`
+      : `${t("settings.asrMode.local")} · ${engineName}`,
+  );
+  const missingRequired = $derived(status ? status.artifacts.filter((a) => !a.present && a.required_for_recording) : []);
+  const downloadingAll = $derived(Object.values(prog).filter((p) => p.phase === "downloading"));
+  const modelsSummary = $derived.by(() => {
+    if (downloadingAll.length > 0) {
+      const got = downloadingAll.reduce((n, p) => n + p.received, 0);
+      const total = downloadingAll.reduce((n, p) => n + p.total, 0);
+      return total > 0
+        ? t("settings.summary.modelsDownloading", { pct: Math.min(100, Math.round((got / total) * 100)) })
+        : t("settings.summary.modelsDownloadingNoPct");
+    }
+    if (missingRequired.length > 0) return t("settings.summary.modelsMissing", { n: missingRequired.length });
+    return status ? t("settings.summary.modelsReady") : "…";
+  });
+  async function downloadMissing() {
+    for (const a of missingRequired) prog = { ...prog, [a.id]: { received: 0, total: 0, phase: "downloading" } };
+    try {
+      await downloadModels(missingRequired.map((a) => a.id));
+    } catch (e) {
+      if (!String(e).includes("已在进行中")) { // i18n-exempt: 与后端错误原文判等
+        error = t("settings.models.downloadFailed", { e });
+      }
+    }
+  }
+  async function toggleShowAll(on: boolean) {
+    await saveSetting((s) => (s.show_all_settings = on));
+    if (settings) syncUiMode(settings);
+  }
 
   // 会后 AI 就绪状态徽标:开关已开但配置未齐备(openai 档缺 base_url/model/api_key,
   // 或 provider 未回填)时提示,口径对齐后端 readiness(refineReady,见 $lib/refineReady)。
@@ -817,6 +861,25 @@
     <div class="banner">{error}</div>
   {/if}
 
+  <!-- —— 界面模式:简洁 / 完整 —— -->
+  <section>
+    <div class="rows">
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.mode.label")}</span>
+          <span class="row-desc">{t("settings.mode.desc")}</span>
+        </div>
+        <input
+          type="checkbox"
+          class="ctl switch"
+          checked={full}
+          disabled={!settings}
+          onchange={(e) => toggleShowAll((e.target as HTMLInputElement).checked)}
+        />
+      </label>
+    </div>
+  </section>
+
   <!-- —— 通用 —— -->
   <section>
     <h2 class="section-title">{t("settings.section.general")}</h2>
@@ -872,6 +935,7 @@
         <div class="row-info"><span class="row-label">{t("settings.autostart.label")}</span></div>
         <input type="checkbox" class="ctl switch" bind:checked={autostartEnabled} onchange={toggleAutostart} />
       </label>
+      {#if full}
       <label class="row">
         <div class="row-info">
           <span class="row-label">{t("settings.tray.label")}</span>
@@ -899,10 +963,11 @@
           onchange={async (e) => {
             const on = (e.target as HTMLInputElement).checked;
             await saveSetting((s) => (s.device_enabled = on));
-            deviceMenu.visible = settings?.device_enabled !== false;
+            if (settings) syncUiMode(settings);
           }}
         />
       </label>
+      {/if}
       <!-- 隐私:欢迎页文案承诺了这个开关的存在(shell.welcome.telemetryHint),
            删它就得同步改文案——上一版正是因为开关被移除而留下了一句假承诺。 -->
       <label class="row">
@@ -944,8 +1009,10 @@
   <section>
     <h2 class="section-title">{t("settings.section.store")}</h2>
     <div class="rows">
-      {@render storeRow("data", t("settings.store.dataDir"), dataDirLabel)}
-      {@render storeRow("models", t("settings.store.modelsDir"), modelsDirLabel)}
+      {#if full}
+        {@render storeRow("data", t("settings.store.dataDir"), dataDirLabel)}
+        {@render storeRow("models", t("settings.store.modelsDir"), modelsDirLabel)}
+      {/if}
       <div class="row">
         <div class="row-info">
           <span class="row-label">{t("settings.store.audioUsage")}</span>
@@ -1006,6 +1073,7 @@
   <section>
     <h2 class="section-title">{t("settings.section.record")}</h2>
     <div class="rows">
+      {#if full}
       <div class="row">
         <div class="row-info">
           <span class="row-label">{t("settings.record.audioScheme.label")}</span>
@@ -1020,6 +1088,7 @@
           }}
         />
       </div>
+      {/if}
       {#if calPerm !== "unavailable"}
         <label class="row">
           <div class="row-info">
@@ -1050,6 +1119,14 @@
           <div class="row"><div class="row-info"><span class="row-desc">{t("settings.calendar.insufficient")}</span></div></div>
         {/if}
       {/if}
+      {#if !full}
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">{t("settings.summary.asr")}</span>
+            <span class="row-desc">{asrSummary}</span>
+          </div>
+        </div>
+      {:else}
       <div class="row">
         <div class="row-info">
           <span class="row-label">{t("settings.asrMode.label")}</span>
@@ -1341,6 +1418,7 @@
           }}
         />
       </div>
+      {/if}
       <!-- 非 <label>:徽标里挂了跳转按钮,若整行仍是 <label> 点按钮会被浏览器
            顺带判成"点了 label"而误触开关(nested interactive 元素的经典坑)。 -->
       <div class="row">
@@ -1374,8 +1452,22 @@
   </section>
 
   <!-- —— 语音模型 —— -->
-  <!-- —— 设备听写(AI Passport)—— -->
-
+  {#if !full}
+  <section>
+    <h2 class="section-title">{t("settings.section.models")}</h2>
+    <div class="rows">
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.summary.models")}</span>
+          <span class="row-desc">{modelsSummary}</span>
+        </div>
+        {#if missingRequired.length > 0 && downloadingAll.length === 0}
+          <button class="btn-secondary row-action" onclick={downloadMissing}>{t("settings.models.download")}</button>
+        {/if}
+      </div>
+    </div>
+  </section>
+  {:else}
   <section>
     <h2 class="section-title">{t("settings.section.models")}</h2>
     {#if status}
@@ -1474,6 +1566,9 @@
     </div>
   </section>
 
+  {/if}
+
+  {#if full}
   <!-- —— 高级(默认收起,低频/进阶选项)—— -->
   <section>
     <h2 class="section-title">
@@ -1535,6 +1630,8 @@
       </div>
     </div>
   </section>
+
+  {/if}
 
   <!-- —— 关于 / 更新 —— -->
   <section>
