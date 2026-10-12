@@ -351,6 +351,33 @@ mod tests {
         verify_file(&installed, &a.files[0]).expect("SHA256 应与钉死值一致");
     }
 
+    /// 联网:注册表里每个模型的下载地址都还在(发版前跑)。自托管工件的 Release 被删过
+    /// 一次(models-dtln-aec-v1,疑随 2026-08-08 重写历史清理远端标签而丢),全体用户
+    /// 下载 404 两个月无人发现。只取 1 字节;单文件工件顺带核对服务端总长。
+    #[test]
+    #[ignore]
+    fn every_registered_model_url_is_downloadable() {
+        let mut broken = Vec::new();
+        for a in crate::models::ARTIFACTS {
+            let agent = crate::netproxy::agent_for(a.url);
+            match agent.get(a.url).timeout(std::time::Duration::from_secs(30)).set("Range", "bytes=0-0").call() {
+                Ok(r) => {
+                    let total = r
+                        .header("Content-Range")
+                        .and_then(|v| v.rsplit('/').next())
+                        .and_then(|n| n.parse::<u64>().ok());
+                    if let (super::super::ArtifactKind::File, Some(n)) = (&a.kind, total) {
+                        if n != a.files[0].bytes {
+                            broken.push(format!("{}: 服务端 {n} 字节,登记 {}", a.id, a.files[0].bytes));
+                        }
+                    }
+                }
+                Err(e) => broken.push(format!("{}: {e}", a.id)),
+            }
+        }
+        assert!(broken.is_empty(), "下载地址失效:\n{}", broken.join("\n"));
+    }
+
     /// 416 免重下复装的核心路径:全量有效 .part 直接 finalize 完成安装(无网络)。
     #[test]
     fn finalize_artifact_installs_valid_full_part_without_network() {
