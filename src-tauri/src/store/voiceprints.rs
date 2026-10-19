@@ -1261,14 +1261,14 @@ impl VoiceprintStore {
             .collect()
     }
 
-    /// 「单场档案」:现存样本全部溯源到同一场会的人物。种子构建据此给他们换更严的
-    /// 认领门槛(registry::SEED_ASSIGN_THRESHOLD_SINGLE_MEETING)——只录过一场的档案
-    /// 连那间屋子的声学特征一起记下了,别的会上谁在类似环境里说话都像他。
-    /// 有样本推不出来源(2026-08-20 之前的老样本)的人不算:拿不准就不加严。
+    /// 每人的现存样本出自几场会(只收样本全部溯源得到的人)。种子构建据此给只来过
+    /// 一两场的人换更严的认领门槛(registry::seed_threshold_for)——样本只出自一两场
+    /// 的档案连那几间屋子的声学特征一起记下了,别的会上谁在类似环境里说话都像他。
+    /// 有样本推不出来源(2026-08-20 之前的老样本)或没有样本的人不收:拿不准就不加严。
     /// 只读不加锁(与 sample_origin 同)。
-    pub fn single_meeting_people(&self, vp: &Voiceprints) -> std::collections::BTreeSet<String> {
+    pub fn sample_meeting_counts(&self, vp: &Voiceprints) -> BTreeMap<String, usize> {
         let trace = super::sample_trace::load(&self.root);
-        let mut out = std::collections::BTreeSet::new();
+        let mut out = BTreeMap::new();
         for id in vp.people.keys() {
             if Self::resolve(vp, id) != Some(id.as_str()) {
                 continue;
@@ -1278,8 +1278,8 @@ impl VoiceprintStore {
                 .iter()
                 .map(|p| self.sample_origin_in(&trace, p).map(|(note, _)| note))
                 .collect();
-            if notes.is_some_and(|n| n.len() == 1) {
-                out.insert(id.clone());
+            if let Some(n) = notes.filter(|n| !n.is_empty()) {
+                out.insert(id.clone(), n.len());
             }
         }
         out
@@ -1720,7 +1720,7 @@ fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool, with_sub: bool) ->
                 centroid: c.vec.clone(),
                 count: c.count,
                 source: src.clone(),
-                single_meeting: false,
+                sample_meetings: 0,
             });
         }
         if with_sub {
@@ -1732,7 +1732,7 @@ fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool, with_sub: bool) ->
                         centroid: c.vec.clone(),
                         count: c.count,
                         source: src.clone(),
-                        single_meeting: false,
+                        sample_meetings: 0,
                     });
                 }
             }
@@ -1748,7 +1748,7 @@ fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool, with_sub: bool) ->
                     centroid: c.vec.clone(),
                     count: c.count,
                     source: src.clone(),
-                    single_meeting: false,
+                    sample_meetings: 0,
                 });
             }
         }
@@ -3022,9 +3022,9 @@ mod tests {
         assert!(c.centroids.is_empty(), "无样本者质心已清空(新空间无从匹配)");
     }
 
-    /// 单场档案:样本全溯源到同一场 → 算;来自两场、有一份推不出来源、没有样本 → 都不算。
+    /// 样本出自几场会:全溯源才算;有一份推不出来源、没有样本 → 不收。
     #[test]
-    fn single_meeting_people_needs_every_sample_traced_to_one_note() {
+    fn sample_meeting_counts_needs_every_sample_traced() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let links = store
@@ -3067,11 +3067,11 @@ mod tests {
             }
         }
         let vp = store.load();
-        let single = store.single_meeting_people(&vp);
-        assert!(single.contains(&one), "两份样本都出自 n1 → 单场档案");
-        assert!(!single.contains(&two), "来自两场");
-        assert!(!single.contains(&untraced), "有一份推不出来源,拿不准就不加严");
-        assert!(!single.contains(&empty), "没有样本");
+        let counts = store.sample_meeting_counts(&vp);
+        assert_eq!(counts.get(&one), Some(&1), "两份样本都出自 n1");
+        assert_eq!(counts.get(&two), Some(&2));
+        assert_eq!(counts.get(&untraced), None, "有一份推不出来源,拿不准就不加严");
+        assert_eq!(counts.get(&empty), None, "没有样本");
     }
 
     /// 样本改归属(2026-08-28):文件进对方空槽、溯源跟着走、原主人少一份;
@@ -3373,7 +3373,7 @@ mod tests {
 
         // 本场:该人作为种子注入(count=40),命中两段长音频。
         let seeds =
-            vec![SeedCluster { person: pid.clone(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 40, source: "mic".into(), single_meeting: false }];
+            vec![SeedCluster { person: pid.clone(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 40, source: "mic".into(), sample_meetings: 0 }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
         r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();

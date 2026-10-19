@@ -294,10 +294,10 @@ fn load_voiceprint_seeds_for(app: &AppHandle, cur: &str) -> Vec<crate::diar::reg
     } else {
         store::seed_clusters(&vp)
     };
-    // 单场档案换严门槛(见 SEED_ASSIGN_THRESHOLD_SINGLE_MEETING)。
-    let single = vp_store.single_meeting_people(&vp);
+    // 只来过一两场的人换严门槛(见 diar::registry::seed_threshold_for)。
+    let meetings = vp_store.sample_meeting_counts(&vp);
     for s in &mut seeds {
-        s.single_meeting = single.contains(&s.person);
+        s.sample_meetings = meetings.get(&s.person).copied().unwrap_or(0);
     }
     seeds
 }

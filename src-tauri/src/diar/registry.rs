@@ -36,17 +36,31 @@ pub const MERGE_CHECK_INTERVAL: u64 = 8;
 /// 种子簇(已关联库人物)的归簇阈值,高于普通阈值。跨会议信道差异比同会议内大,
 /// 命错人比不命名更糟,故要求更高相似度才认领。待真实会议数据校准。
 pub const SEED_ASSIGN_THRESHOLD: f32 = 0.68;
-/// 「单场档案」(全部样本出自同一场会,见 SeedCluster::single_meeting)的认领门槛,
-/// 取代上面的 SEED_ASSIGN_THRESHOLD;认领、z 通道裸分地板、无主簇并入种子三处都用它。
+/// 「少场档案」(样本全部溯源、只出自一两场会,见 SeedCluster::sample_meetings)的认领
+/// 门槛,取代上面的 SEED_ASSIGN_THRESHOLD;认领、z 通道裸分地板、无主簇并入种子三处
+/// 都用它(seed_threshold_for)。
 ///
 /// 2026-10-19 事故:「王虎-苏州资管」只来过 9/14 一场,样本全出自那间会议室的远场
 /// 录音,档案连屋子和麦克风的特征一起记下了,此后 6 场他没来的会都被认成他;
-/// 「苏州资管法务」「中网投-洛总经理」同理。回放 9/1 以来 117 场(逐段嵌入 × 现库,
-/// 「某人在某场被认出」口径):全库误认 119→65、认对 241→233。15 个单场档案在其
-/// 来源场之外:0.68 认对 14/误认 59,0.75 为 8/14,0.78 为 6/5,0.80 为 4/2。取 0.78:
-/// 当天那句 7.5s 的误认(0.765)要它才拦得住;真来第二次的人漏认了,用户点一次名
-/// 字就攒到第二场样本,自动回到普通门槛。
-pub const SEED_ASSIGN_THRESHOLD_SINGLE_MEETING: f32 = 0.78;
+/// 「苏州资管法务」「中网投-洛总经理」同理,「孙柯」样本出自巨凡的两场会,又被认进
+/// 内部周会和面试录音。回放 9/1 以来 117 场(逐段嵌入 × 现库,「某人在某场被认出」
+/// 口径),15 个单场档案在其来源场之外:0.68 认对 14/误认 59,0.75 为 8/14,0.78 为
+/// 6/5,0.80 为 4/2。取 0.78:当天那句 7.5s 的误认(0.765)要它才拦得住。两场档案
+/// (孙柯、陈思桦):0.68 认对 7/误认 15,0.72 为 7/6,0.74 为 6/2,0.76 为 4/0,取 0.74。
+/// 合起来全库误认 124→55、认对 236→229。真来了却漏认的人,用户点一次名字就多攒一场
+/// 样本,门槛随之降档。
+pub const SEED_ASSIGN_THRESHOLD_ONE_MEETING: f32 = 0.78;
+/// 见 SEED_ASSIGN_THRESHOLD_ONE_MEETING。
+pub const SEED_ASSIGN_THRESHOLD_TWO_MEETINGS: f32 = 0.74;
+
+/// 种子认领门槛按样本出自几场会分档;0 = 有样本推不出来源,拿不准就不加严。
+pub fn seed_threshold_for(sample_meetings: usize) -> f32 {
+    match sample_meetings {
+        1 => SEED_ASSIGN_THRESHOLD_ONE_MEETING,
+        2 => SEED_ASSIGN_THRESHOLD_TWO_MEETINGS,
+        _ => SEED_ASSIGN_THRESHOLD,
+    }
+}
 /// 段短于此(16kHz 样本数,2s)不参与种子命中:<2s 嵌入可靠性跳崖(文献:2s 条件
 /// EER 可翻 3 倍),短段无权拍板"这是谁";仍可归场内簇/软归属。待评测集校准的初值。
 pub const SEED_MIN_SAMPLES: usize = 32_000;
@@ -157,9 +171,9 @@ pub struct SeedCluster {
     /// 该质心来自的信道(如 "mic"/"system")。跨信道种子只走归一化通道
     /// (Task 2)的前提:注入后要知道自己质心的信道身份。
     pub source: String,
-    /// 该人全部录音样本出自同一场会(种子构建时按 VoiceprintStore::single_meeting_people 标记)。
-    /// 认领门槛改用 SEED_ASSIGN_THRESHOLD_SINGLE_MEETING。
-    pub single_meeting: bool,
+    /// 该人录音样本出自几场会(种子构建时按 VoiceprintStore::sample_meeting_counts 填);
+    /// 0 = 未知(有样本推不出来源)。决定认领门槛,见 seed_threshold_for。
+    pub sample_meetings: usize,
 }
 
 /// —— 种子匹配策略(说话人识别方法)——
@@ -348,7 +362,7 @@ struct Cluster {
     /// 只在库种子注入路径预计算一次(O(种子²·维度)，with_seeds 内一次性代价)；
     /// 快照恢复的簇同样保守留 None，语义由 Task 2 处理。
     seed_cohort: Option<(f32, f32)>,
-    /// 种子认领门槛:SEED_ASSIGN_THRESHOLD,单场档案为 SEED_ASSIGN_THRESHOLD_SINGLE_MEETING。
+    /// 种子认领门槛:seed_threshold_for(样本出自几场会)。
     /// 合并时取两侧较严者,降级为"恢复簇"后照样生效。
     seed_threshold: f32,
 }
@@ -359,7 +373,7 @@ impl Cluster {
         self.person.is_some() && !self.session_enrolled
     }
 
-    /// 单场档案的种子:z 通道的裸分地板一并抬到它的认领门槛。
+    /// 少场档案的种子:z 通道的裸分地板一并抬到它的认领门槛。
     fn seed_raw_floor(&self) -> f32 {
         if self.seed_threshold > SEED_ASSIGN_THRESHOLD {
             self.seed_threshold
@@ -844,7 +858,7 @@ impl SpeakerRegistry {
                     //   assign_inner 的三闸,这里不重复;
                     // - 无主 ↔ 无主维持 MERGE_THRESHOLD(0.74 为首轮真实会议校准,防过度合并)。
                     // 上面凡写 SEED_ASSIGN_THRESHOLD 处实际取该种子自己的 seed_threshold:
-                    // 单场档案抬到 SEED_ASSIGN_THRESHOLD_SINGLE_MEETING(2026-10-19 当天
+                    // 少场档案按 seed_threshold_for 抬高(2026-10-19 当天
                     // 「苏州资管法务」就是整簇从这条路并进去的,认领日志里没有记录)。
                     let pair_threshold = match (&a.person, &b.person) {
                         (Some(x), Some(y)) if x != y => continue,
@@ -905,7 +919,7 @@ impl SpeakerRegistry {
                 winner.seed_source = None;
                 winner.seed_cohort = None;
             }
-            // 单场档案的严门槛跟着人走:并进来的是它,winner 继承它的门槛。
+            // 少场档案的严门槛跟着人走:并进来的是它,winner 继承它的门槛。
             winner.seed_threshold = winner.seed_threshold.max(loser.seed_threshold);
             // winner 无 person 而 loser 有 → 继承(person 冲突的情形已被上面的检查挡掉)；
             // session_enrolled 随 person 一起继承，阈值档位跟着身份走。
@@ -1085,11 +1099,7 @@ impl SpeakerRegistry {
                 seed_source: Some(s.source.clone()),
                 // 下面统一预计算(precompute_seed_cohorts),此处先占位。
                 seed_cohort: None,
-                seed_threshold: if s.single_meeting {
-                    SEED_ASSIGN_THRESHOLD_SINGLE_MEETING
-                } else {
-                    SEED_ASSIGN_THRESHOLD
-                },
+                seed_threshold: seed_threshold_for(s.sample_meetings),
             });
         }
         r.precompute_seed_cohorts(seeds);
@@ -1150,7 +1160,7 @@ mod tests {
             centroid: vec![1.0, 0.0, 0.0],
             count: 5,
             source: "mic".into(),
-            single_meeting: false,
+            sample_meetings: 0,
         }]);
         // 与种子高相似 + 段长过闸 → seed_adopt
         let hit = r.assign(&[1.0, 0.01, 0.0], "mic", 16_000 * 5);
@@ -1229,7 +1239,7 @@ mod tests {
             centroid: v(1.0, 0.0, 0.0),
             count: 5,
             source: "mic".into(),
-            single_meeting: false,
+            sample_meetings: 0,
         }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         // 与种子余弦 0.5(灰区):不得软归属领走人名 → 长段落地为新普通簇
@@ -1247,10 +1257,10 @@ mod tests {
     fn with_seeds_precomputes_cohort_stats_per_seed() {
         // 4 个人物(其他人数=3,达门槛)→ 每个种子簇的 seed_cohort 都应是 Some。
         let seeds4 = vec![
-            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![1.0, 0.0, 0.0, 0.0], count: 5, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0, 0.0], count: 5, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P3".into(), name: "丙".into(), centroid: vec![0.0, 0.0, 1.0, 0.0], count: 5, source: "system".into(), single_meeting: false },
-            SeedCluster { person: "P4".into(), name: "丁".into(), centroid: vec![0.0, 0.0, 0.0, 1.0], count: 5, source: "system".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![1.0, 0.0, 0.0, 0.0], count: 5, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0, 0.0], count: 5, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P3".into(), name: "丙".into(), centroid: vec![0.0, 0.0, 1.0, 0.0], count: 5, source: "system".into(), sample_meetings: 0 },
+            SeedCluster { person: "P4".into(), name: "丁".into(), centroid: vec![0.0, 0.0, 0.0, 1.0], count: 5, source: "system".into(), sample_meetings: 0 },
         ];
         let r = SpeakerRegistry::with_seeds(&[], &seeds4);
         assert_eq!(r.clusters.len(), 4);
@@ -1261,8 +1271,8 @@ mod tests {
 
         // 只有 2 个人物(1 个其他人)→ 未达门槛,全部 None。
         let seeds2 = vec![
-            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![1.0, 0.0, 0.0, 0.0], count: 5, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0, 0.0], count: 5, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![1.0, 0.0, 0.0, 0.0], count: 5, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0, 0.0], count: 5, source: "mic".into(), sample_meetings: 0 },
         ];
         let r2 = SpeakerRegistry::with_seeds(&[], &seeds2);
         for c in &r2.clusters {
@@ -1283,7 +1293,7 @@ mod tests {
         let seeds: Vec<SeedCluster> = (0..4).map(|i| SeedCluster {
             person: format!("P{i}"), name: format!("人{i}"),
             centroid: unit(i), count: 10, source: "mic".into(),
-            single_meeting: false,
+            sample_meetings: 0,
         }).collect();
         // 探针:与 P0 余弦 0.6(灰区:≥0.50 地板、<0.68 快路)
         let mut probe = vec![0.0f32; dim];
@@ -1478,8 +1488,8 @@ mod tests {
             total_ms: 0,
         };
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "张三".into(), centroid: v(1.0, 0.0, 0.0), count: 40, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P9".into(), name: "旧人".into(), centroid: v(0.0, 1.0, 0.0), count: 7, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "张三".into(), centroid: v(1.0, 0.0, 0.0), count: 40, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P9".into(), name: "旧人".into(), centroid: v(0.0, 1.0, 0.0), count: 7, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
         // P9 已在快照,种子去重:簇数 = 快照1 + P1 种子1
@@ -1494,7 +1504,7 @@ mod tests {
     #[test]
     fn seed_threshold_is_stricter_than_session_threshold() {
         // 相似度 ~0.65:普通簇能命中(≥0.62),种子簇不能(<0.68)
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), single_meeting: false }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 }];
         let mut seeded = SpeakerRegistry::with_seeds(&[], &seeds);
         let probe = v(0.65, (1.0f32 - 0.65 * 0.65).sqrt(), 0.0);
         let id = seeded.assign(&probe, "mic", LONG).unwrap();
@@ -1507,36 +1517,34 @@ mod tests {
         assert_eq!(plain.speakers().len(), 1, "0.65 ≥ 0.62,普通簇应命中: {id2}");
     }
 
-    /// 单场档案(2026-10-19 王虎-苏州资管事故):0.72 普通档案认领;单场档案 0.76 不认,
-    /// 过了 0.78 照认。
+    /// 少场档案(2026-10-19 王虎-苏州资管事故):一场 0.78、两场 0.74、三场及未知 0.68。
     #[test]
-    fn single_meeting_seed_needs_stricter_threshold_to_claim() {
-        let seed = |single_meeting| {
-            vec![SeedCluster {
+    fn few_meeting_seed_needs_stricter_threshold_to_claim() {
+        let claimed = |sample_meetings, c: f32| {
+            let seeds = vec![SeedCluster {
                 person: "P1".into(),
                 name: "甲".into(),
                 centroid: v(1.0, 0.0, 0.0),
                 count: 10,
                 source: "mic".into(),
-                single_meeting,
-            }]
-        };
-        let probe = |c: f32| v(c, (1.0f32 - c * c).sqrt(), 0.0);
-        let claimed = |single_meeting, c| {
-            let mut r = SpeakerRegistry::with_seeds(&[], &seed(single_meeting));
-            let id = r.assign(&probe(c), "mic", LONG).unwrap();
+                sample_meetings,
+            }];
+            let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+            let id = r.assign(&v(c, (1.0f32 - c * c).sqrt(), 0.0), "mic", LONG).unwrap();
             r.speakers().into_iter().find(|s| s.id == id).unwrap().person
         };
-        assert_eq!(claimed(false, 0.72), Some("P1".into()), "普通档案 0.72 ≥ 0.68 认领");
-        assert_eq!(claimed(true, 0.72), None);
-        assert_eq!(claimed(true, 0.76), None, "单场档案 0.76 < 0.78 不认");
-        assert_eq!(claimed(true, 0.80), Some("P1".into()), "单场档案过了 0.78 照认");
+        let p1 = Some("P1".to_string());
+        assert_eq!(claimed(0, 0.70), p1, "来源未知:不加严");
+        assert_eq!(claimed(3, 0.70), p1, "三场:普通门槛");
+        assert_eq!(claimed(2, 0.72), None, "两场 0.72 < 0.74 不认");
+        assert_eq!(claimed(2, 0.75), p1);
+        assert_eq!(claimed(1, 0.76), None, "一场 0.76 < 0.78 不认");
+        assert_eq!(claimed(1, 0.80), p1);
     }
 
-    /// 单场档案也不能从合并路走回来:同信道无主簇 0.71 并普通种子,不并单场种子。
     #[test]
     fn unowned_cluster_does_not_merge_into_single_meeting_seed_below_its_threshold() {
-        let merges = |single_meeting| {
+        let merges = |sample_meetings| {
             let snap = ClusterSnapshot {
                 id: "S9".into(),
                 centroid: v(0.71, 0.70413, 0.0),
@@ -1551,12 +1559,12 @@ mod tests {
                 centroid: v(1.0, 0.0, 0.0),
                 count: 10,
                 source: "mic".into(),
-                single_meeting,
+                sample_meetings,
             }];
             SpeakerRegistry::with_seeds(&[snap], &seeds).take_merges().len()
         };
-        assert_eq!(merges(false), 1);
-        assert_eq!(merges(true), 0, "0.71 < 0.78,无主簇不得并进单场档案");
+        assert_eq!(merges(0), 1);
+        assert_eq!(merges(1), 0, "0.71 < 0.78,无主簇不得并进单场档案");
     }
 
     #[test]
@@ -1580,7 +1588,7 @@ mod tests {
             centroid: v(1.0, 0.0, 0.0),
             count: 10,
             source: "mic".into(),
-            single_meeting: false,
+            sample_meetings: 0,
         }];
         let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
         assert_eq!(r.take_merges().len(), 1, "同信道下,无主↔有主在 0.71 应按归簇同款阈值合并");
@@ -1615,8 +1623,8 @@ mod tests {
     #[test]
     fn different_persons_never_automerge_and_winner_inherits_person() {
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.9805, 0.19612, 0.0), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.9805, 0.19612, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         // 两种子余弦 ~0.98 ≥ MERGE_THRESHOLD,但 person 不同 → 永不自动合并
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
@@ -1628,7 +1636,7 @@ mod tests {
         // 余弦 ≥ MERGE_THRESHOLD,且 count 更大 → S2 胜出,继承 S1 的 person。
         let mut r2 = SpeakerRegistry::with_seeds(
             &[],
-            &[SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 1, source: "mic".into(), single_meeting: false }],
+            &[SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 1, source: "mic".into(), sample_meetings: 0 }],
         );
         // 建 S2(与 e1 余弦 0.30,低于种子阈值 0.68 → 新建普通簇)
         r2.assign(&v(0.30, (1.0f32 - 0.09f32).sqrt(), 0.0), "system", LONG).unwrap();
@@ -1672,8 +1680,8 @@ mod tests {
     #[test]
     fn unhit_seed_cluster_has_empty_sources_hit_one_has_nonempty() {
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.0, 1.0, 0.0), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.0, 1.0, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         // 只命中甲(与 e1 余弦 ≈0.99 ≥ 种子阈值 0.68);乙从未被 assign 到。
@@ -1694,7 +1702,7 @@ mod tests {
     /// 再报一遍,库 count 几何级数膨胀,质心学习率随之衰减到接近失效。
     #[test]
     fn snapshot_exports_incremental_count_not_seed_base_for_seed_cluster() {
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 40, source: "mic".into(), single_meeting: false }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 40, source: "mic".into(), sample_meetings: 0 }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
@@ -1720,7 +1728,7 @@ mod tests {
         assert!(r.enroll_candidates(2000).is_empty(), "已入库簇不重复候选");
 
         // 未命中的种子簇(sources 空)不是候选。
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(0.0, 1.0, 0.0), count: 10, source: "mic".into(), single_meeting: false }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(0.0, 1.0, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 }];
         let r2 = SpeakerRegistry::with_seeds(&[], &seeds);
         assert!(r2.enroll_candidates(0).is_empty(), "种子簇有主且 sources 空,不候选");
     }
@@ -1841,7 +1849,7 @@ mod tests {
         // 与 B 余弦 0.63 ∈(0.62,0.68)(够得着普通阈值),且 0.63 < 0.65(全局最相似是 A,不是 B)。
         // 修前:全局 argmax 先选中 A(0.65 全局最大),再验 A 的阈值 0.68 → 失败 → 错误新建第三个簇。
         // 修后:先按各簇自己的阈值过滤合格候选(A 不合格被滤掉,只剩 B),合格者中取最相似 → 命中 B。
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), single_meeting: false }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds); // S1 = 种子簇 A
         let b_id = r.assign(&v(0.0, 1.0, 0.0), "mic", LONG).unwrap(); // S2 = 会话普通簇 B(与 A 正交)
         assert_eq!(r.speakers().len(), 2);
@@ -1990,7 +1998,7 @@ mod tests {
     /// 场内无其他簇可归、种子又不参与软归属,只能留空;够长(2.1s)立即命中。
     #[test]
     fn short_segment_never_claims_seed() {
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), single_meeting: false }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         let probe = v(0.9, (1.0f32 - 0.81).sqrt(), 0.0); // 同信道裸分 0.9,足以命中快路
         // 1.9s(30400 样本)< SEED_MIN_SAMPLES(32000,2s):无权拍板种子。
@@ -2010,7 +2018,7 @@ mod tests {
     /// 时 z 通道天然关闭——旧行为下裸 cos 0.70 ≥ 0.68 会命中,新语义下必须拒绝。
     #[test]
     fn cross_channel_raw_hit_no_longer_accepted() {
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "system".into(), single_meeting: false }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "system".into(), sample_meetings: 0 }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         let probe = v(0.70, (1.0f32 - 0.49).sqrt(), 0.0); // mic 段 vs system 种子,裸分 0.70
         let id = r.assign(&probe, "mic", LONG).unwrap();
@@ -2024,10 +2032,10 @@ mod tests {
     #[test]
     fn cross_channel_high_z_accepted() {
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "一".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P2".into(), name: "二".into(), centroid: vec![0.0, 1.0, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P3".into(), name: "三".into(), centroid: vec![0.0, 0.0, 1.0, 0.0, 0.0], count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P4".into(), name: "四".into(), centroid: vec![0.0, 0.0, 0.0, 1.0, 0.0], count: 10, source: "system".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "一".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P2".into(), name: "二".into(), centroid: vec![0.0, 1.0, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P3".into(), name: "三".into(), centroid: vec![0.0, 0.0, 1.0, 0.0, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P4".into(), name: "四".into(), centroid: vec![0.0, 0.0, 0.0, 1.0, 0.0], count: 10, source: "system".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         let tail = (1.0f32 - (0.12f32.powi(2) + 0.09f32.powi(2) + 0.09f32.powi(2) + 0.55f32.powi(2))).sqrt();
@@ -2041,7 +2049,7 @@ mod tests {
     /// (库里只此一人,z 通道关闭,与修改前的行为完全一致)。
     #[test]
     fn same_channel_fast_path_unchanged() {
-        let mk_seed = || vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), single_meeting: false }];
+        let mk_seed = || vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 }];
 
         let mut r1 = SpeakerRegistry::with_seeds(&[], &mk_seed());
         let probe69 = v(0.69, (1.0f32 - 0.69 * 0.69).sqrt(), 0.0);
@@ -2067,8 +2075,8 @@ mod tests {
     #[test]
     fn z_path_disabled_below_min_cohort() {
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "system".into(), single_meeting: false },
-            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.0, 0.0, 1.0), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "system".into(), sample_meetings: 0 },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.0, 0.0, 1.0), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         let probe = v(0.55, (1.0f32 - 0.55 * 0.55).sqrt(), 0.0); // mic 段 vs system 种子 P1,与 P2(e3)正交
@@ -2123,7 +2131,7 @@ mod tests {
             person: None,
             total_ms: 3000,
         };
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), single_meeting: false }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(), sample_meetings: 0 }];
         let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
         assert_eq!(r.take_merges().len(), 1, "同信道下,无主↔有主在 0.71 应按归簇同款阈值合并(前置条件与既有测试一致)");
         let winner = r.clusters.iter().find(|c| c.person.as_deref() == Some("P1")).unwrap();
@@ -2182,10 +2190,10 @@ mod tests {
     #[test]
     fn symmetric_z_formula_rejects_single_sided_or_undivided_variants() {
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "一".into(), centroid: vec![0.10, 0.994_987_5, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P2".into(), name: "二".into(), centroid: vec![0.20, 0.0, 0.979_795_9, 0.0, 0.0], count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P3".into(), name: "三".into(), centroid: vec![0.30, 0.0, 0.0, 0.953_939_2, 0.0], count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P4".into(), name: "四".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 10, source: "system".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "一".into(), centroid: vec![0.10, 0.994_987_5, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P2".into(), name: "二".into(), centroid: vec![0.20, 0.0, 0.979_795_9, 0.0, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P3".into(), name: "三".into(), centroid: vec![0.30, 0.0, 0.0, 0.953_939_2, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P4".into(), name: "四".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 10, source: "system".into(), sample_meetings: 0 },
         ];
 
         // 命中用例:za=1.8、zb=4.4,对称 z=3.1≥3。
@@ -2220,13 +2228,13 @@ mod tests {
     #[test]
     fn same_channel_z_channel_widens_recall_not_tightens() {
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "一".into(), centroid: vec![0.10, 0.994_987_5, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P2".into(), name: "二".into(), centroid: vec![0.20, 0.0, 0.979_795_9, 0.0, 0.0], count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P3".into(), name: "三".into(), centroid: vec![0.30, 0.0, 0.0, 0.953_939_2, 0.0], count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "一".into(), centroid: vec![0.10, 0.994_987_5, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P2".into(), name: "二".into(), centroid: vec![0.20, 0.0, 0.979_795_9, 0.0, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P3".into(), name: "三".into(), centroid: vec![0.30, 0.0, 0.0, 0.953_939_2, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
             // 候选人物、陪衬人物、探针全部同信道("mic")——若 z 通道只对跨信道
             // 开放,这里应因裸分 0.64<0.68(快路够不着)而落空;实测未按信道
             // 区分,z=3.1≥3 依旧命中。
-            SeedCluster { person: "P4".into(), name: "四".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P4".into(), name: "四".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         let probe = vec![0.64, 0.297_491_2, 0.338_846_1, 0.385_768_8, 0.488_123_7]; // sim=0.64 ∈ [0.50,0.68)
@@ -2250,12 +2258,12 @@ mod tests {
     #[test]
     fn same_person_seed_variants_never_automerge_and_keep_seed_identity() {
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 40, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 40, source: "mic".into(), sample_meetings: 0 },
             // 与主质心余弦 = 0.9(0.9² + 0.435_889_9² ≈ 1)。
-            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![0.9, 0.435_889_9, 0.0, 0.0, 0.0], count: 5, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0, 0.0, 0.0], count: 5, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P3".into(), name: "丙".into(), centroid: vec![0.0, 0.0, 1.0, 0.0, 0.0], count: 5, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P4".into(), name: "丁".into(), centroid: vec![0.0, 0.0, 0.0, 1.0, 0.0], count: 5, source: "system".into(), single_meeting: false },
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![0.9, 0.435_889_9, 0.0, 0.0, 0.0], count: 5, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0, 0.0, 0.0], count: 5, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P3".into(), name: "丙".into(), centroid: vec![0.0, 0.0, 1.0, 0.0, 0.0], count: 5, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P4".into(), name: "丁".into(), centroid: vec![0.0, 0.0, 0.0, 1.0, 0.0], count: 5, source: "system".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         assert_eq!(r.clusters.len(), 5, "P1 的两条种子(主质心+变体)都应各自建簇");
@@ -2292,7 +2300,7 @@ mod tests {
     fn masterless_to_seed_merge_still_works_after_f1() {
         let mut r2 = SpeakerRegistry::with_seeds(
             &[],
-            &[SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 1, source: "mic".into(), single_meeting: false }],
+            &[SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 1, source: "mic".into(), sample_meetings: 0 }],
         );
         // 建无主簇(system 信道),与种子(mic)正交起步。
         r2.assign(&v(0.30, (1.0f32 - 0.09f32).sqrt(), 0.0), "system", LONG).unwrap();
@@ -2318,7 +2326,7 @@ mod tests {
     /// 改写其质心到目标余弦,只验证 detect_merges 的门槛逻辑本身。
     #[test]
     fn masterless_to_seed_merge_cross_channel_threshold_raised() {
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "system".into(), single_meeting: false }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "system".into(), sample_meetings: 0 }];
 
         // 跨信道(无主簇来源 "mic"):0.70 < 0.74,不应合并。
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
@@ -2355,10 +2363,10 @@ mod tests {
         // 甲只有 1 份但离探针最近(0.80)。旧单最近邻会判甲;k-NN 票决下
         // top-4 席位乙占 3 席,乙胜出,认领落在乙的最高分席位上。
         let seeds = vec![
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.71), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.71), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.set_matcher(Box::new(KnnVoteMatcher));
@@ -2373,10 +2381,10 @@ mod tests {
         // 甲 1 席 0.80 过阈但只是少数派。票决胜者乙无合格席位 → 种子路
         // 不认领也不降格给第二名(误命名比不命名糟),探针新建无主簇。
         let seeds = vec![
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.64), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.63), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.62), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.64), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.63), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.62), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.set_matcher(Box::new(KnnVoteMatcher));
@@ -2390,10 +2398,10 @@ mod tests {
         // 甲乙各 2 席平票,甲的最高分(0.80)高于乙(0.73)→ 甲胜(差 0.07 过差距门;
         // 差距内的平票弃权见 knn_vote_abstains_within_margin)。
         let seeds = vec![
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.73), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.73), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.set_matcher(Box::new(KnnVoteMatcher));
@@ -2408,8 +2416,8 @@ mod tests {
     #[test]
     fn nearest_picks_best_eligible_not_nearest_overall() {
         let seeds = vec![
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "system".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "system".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
@@ -2431,9 +2439,9 @@ mod tests {
             total_ms: 0,
         };
         let seeds = vec![
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.71), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.71), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
         r.set_matcher(Box::new(KnnVoteMatcher));
@@ -2448,10 +2456,10 @@ mod tests {
     #[test]
     fn knn_vote_full_tie_across_persons_keeps_first_seen() {
         let seeds = vec![
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.69), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.69), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.69), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.69), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.set_matcher(Box::new(KnnVoteMatcher));
@@ -2466,7 +2474,7 @@ mod tests {
     fn nearest_tie_between_seed_and_regular_keeps_seed() {
         let seeds = vec![SeedCluster {
             person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(),
-            single_meeting: false,
+            sample_meetings: 0,
         }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         // 先造一个正交方向的普通簇。
@@ -2482,10 +2490,10 @@ mod tests {
     #[test]
     fn matcher_from_key_falls_back_to_nearest() {
         let seeds = vec![
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.71), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.71), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.set_matcher(matcher_from_key("garbage-value"));
@@ -2511,7 +2519,7 @@ mod tests {
                 centroid: at_cos(0.70),
                 count: 10,
                 source: "mic".into(),
-                single_meeting: false,
+                sample_meetings: 0,
             })
             .collect();
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
@@ -2527,15 +2535,15 @@ mod tests {
         // top-5 = 甲 4 席 + 乙 0.69 一席 → 甲以 4:1 胜;若错把全库席位都
         // 计票,乙 5 席反超,此测试即失败。
         let seeds = vec![
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.75), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.74), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.73), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.69), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.32), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.31), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.30), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.29), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.75), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.74), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.73), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.72), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.69), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.32), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.31), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.30), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.29), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.set_matcher(Box::new(KnnVoteMatcher));
@@ -2549,8 +2557,8 @@ mod tests {
     #[test]
     fn nearest_abstains_when_two_persons_within_margin() {
         let seeds = vec![
-            SeedCluster { person: "P11".into(), name: "郑".into(), centroid: at_cos(0.96), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "P14".into(), name: "仲".into(), centroid: at_cos(0.94), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P11".into(), name: "郑".into(), centroid: at_cos(0.96), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "P14".into(), name: "仲".into(), centroid: at_cos(0.94), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
@@ -2567,9 +2575,9 @@ mod tests {
     #[test]
     fn nearest_margin_ignores_same_person_variants() {
         let seeds = vec![
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.96), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.95), count: 10, source: "mic".into(), single_meeting: false },
-            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.96), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.95), count: 10, source: "mic".into(), sample_meetings: 0 },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.80), count: 10, source: "mic".into(), sample_meetings: 0 },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
