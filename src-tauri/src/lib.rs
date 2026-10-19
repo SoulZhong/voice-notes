@@ -277,7 +277,8 @@ fn load_voiceprint_seeds_for(app: &AppHandle, cur: &str) -> Vec<crate::diar::reg
         eprintln!("声纹库路径不可用，本场开录跳过种子注入（不影响录制）");
         return Vec::new();
     };
-    let vp = store::VoiceprintStore::new(root).load();
+    let vp_store = store::VoiceprintStore::new(root);
+    let vp = vp_store.load();
     // 嵌入模型标签与当前选型不一致(切换后台重建尚未完成的窗口)时不注入种子:
     // 不同模型的向量空间不可混比,错认比不认糟。此门禁足以杜绝一切跨空间比较——
     // 种子被跳过后,本场新簇只在新空间内互比;既有人物无种子即不会被命中回写。
@@ -288,11 +289,17 @@ fn load_voiceprint_seeds_for(app: &AppHandle, cur: &str) -> Vec<crate::diar::reg
     // 种子构建下沉 store::seed_clusters(只取主质心;会话变体 2026-08-29 起不再成席)。
     // 识别方法 multi_centroid 时再加子质心席位(store::seed_clusters_multi)。
     let method = app.path().app_data_dir().map(|d| settings::load(&d).speaker_match).unwrap_or_default();
-    if method == diar::registry::SPEAKER_MATCH_MULTI_CENTROID {
+    let mut seeds = if method == diar::registry::SPEAKER_MATCH_MULTI_CENTROID {
         store::seed_clusters_multi(&vp)
     } else {
         store::seed_clusters(&vp)
+    };
+    // 只来过一两场的人换严门槛(见 diar::registry::seed_threshold_for)。
+    let meetings = vp_store.sample_meeting_counts(&vp);
+    for s in &mut seeds {
+        s.sample_meetings = meetings.get(&s.person).copied().unwrap_or(0);
     }
+    seeds
 }
 
 // abort_or_finalize 已随 writer 所有权迁入 lifecycle actor(actor.rs::abort_owned,

@@ -1261,6 +1261,30 @@ impl VoiceprintStore {
             .collect()
     }
 
+    /// 每人的现存样本出自几场会(只收样本全部溯源得到的人)。种子构建据此给只来过
+    /// 一两场的人换更严的认领门槛(registry::seed_threshold_for)——样本只出自一两场
+    /// 的档案连那几间屋子的声学特征一起记下了,别的会上谁在类似环境里说话都像他。
+    /// 有样本推不出来源(2026-08-20 之前的老样本)或没有样本的人不收:拿不准就不加严。
+    /// 只读不加锁(与 sample_origin 同)。
+    pub fn sample_meeting_counts(&self, vp: &Voiceprints) -> BTreeMap<String, usize> {
+        let trace = super::sample_trace::load(&self.root);
+        let mut out = BTreeMap::new();
+        for id in vp.people.keys() {
+            if Self::resolve(vp, id) != Some(id.as_str()) {
+                continue;
+            }
+            let notes: Option<std::collections::BTreeSet<String>> = self
+                .sample_paths_existing(id)
+                .iter()
+                .map(|p| self.sample_origin_in(&trace, p).map(|(note, _)| note))
+                .collect();
+            if let Some(n) = notes.filter(|n| !n.is_empty()) {
+                out.insert(id.clone(), n.len());
+            }
+        }
+        out
+    }
+
     /// 样本文件 → 溯源 receipt(note_id, cluster_id)。无溯源(2026-08-20 之前写下的
     /// 老样本)返回 None,由调用方按时间推断。只读不加锁。
     pub fn sample_origin(&self, path: &std::path::Path) -> Option<(String, String)> {
@@ -1696,6 +1720,7 @@ fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool, with_sub: bool) ->
                 centroid: c.vec.clone(),
                 count: c.count,
                 source: src.clone(),
+                sample_meetings: 0,
             });
         }
         if with_sub {
@@ -1707,6 +1732,7 @@ fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool, with_sub: bool) ->
                         centroid: c.vec.clone(),
                         count: c.count,
                         source: src.clone(),
+                        sample_meetings: 0,
                     });
                 }
             }
@@ -1722,6 +1748,7 @@ fn seed_clusters_inner(vp: &Voiceprints, with_variants: bool, with_sub: bool) ->
                     centroid: c.vec.clone(),
                     count: c.count,
                     source: src.clone(),
+                    sample_meetings: 0,
                 });
             }
         }
@@ -2995,6 +3022,58 @@ mod tests {
         assert!(c.centroids.is_empty(), "无样本者质心已清空(新空间无从匹配)");
     }
 
+    /// 样本出自几场会:全溯源才算;有一份推不出来源、没有样本 → 不收。
+    #[test]
+    fn sample_meeting_counts_needs_every_sample_traced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(
+                &[
+                    snap("S1", vec![1.0, 0.0, 0.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                    snap("S2", vec![0.0, 1.0, 0.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                    snap("S3", vec![0.0, 0.0, 1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                    snap("S4", vec![0.0, 0.0, 0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                ],
+                "t1",
+                MODEL,
+            )
+            .unwrap();
+        let (one, two, untraced, empty) =
+            (links["S1"].clone(), links["S2"].clone(), links["S3"].clone(), links["S4"].clone());
+        let trace = |pid: &str, path: &std::path::Path, note: &str| {
+            let rel = path.strip_prefix(tmp.path()).unwrap().to_string_lossy().into_owned();
+            super::super::sample_trace::wal_complete(
+                tmp.path(),
+                super::super::sample_trace::SampleReceipt {
+                    receipt_id: format!("r-{rel}"),
+                    note_id: note.into(),
+                    cluster_id: "S1".into(),
+                    person_id: pid.into(),
+                    path: rel,
+                    content_hash: "h".into(),
+                    at: "t".into(),
+                },
+            )
+            .unwrap();
+        };
+        for (pid, notes) in [(&one, ["n1", "n1"]), (&two, ["n1", "n2"]), (&untraced, ["n1", ""])] {
+            for note in notes {
+                assert!(store.append_sample(pid, &[0.5; 16]).unwrap());
+                let p = store.sample_paths_existing(pid).last().cloned().unwrap();
+                if !note.is_empty() {
+                    trace(pid, &p, note);
+                }
+            }
+        }
+        let vp = store.load();
+        let counts = store.sample_meeting_counts(&vp);
+        assert_eq!(counts.get(&one), Some(&1), "两份样本都出自 n1");
+        assert_eq!(counts.get(&two), Some(&2));
+        assert_eq!(counts.get(&untraced), None, "有一份推不出来源,拿不准就不加严");
+        assert_eq!(counts.get(&empty), None, "没有样本");
+    }
+
     /// 样本改归属(2026-08-28):文件进对方空槽、溯源跟着走、原主人少一份;
     /// 外来路径/同一人/对方满员一律拒绝且不动文件。
     #[test]
@@ -3294,7 +3373,7 @@ mod tests {
 
         // 本场:该人作为种子注入(count=40),命中两段长音频。
         let seeds =
-            vec![SeedCluster { person: pid.clone(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 40, source: "mic".into() }];
+            vec![SeedCluster { person: pid.clone(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 40, source: "mic".into(), sample_meetings: 0 }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
         r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
