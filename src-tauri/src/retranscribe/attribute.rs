@@ -252,6 +252,7 @@ mod tests {
     fn dual_mode_seed_hit_yields_owned_cluster() {
         let seeds = vec![SeedCluster {
             person: "P1".into(), name: "张三".into(), centroid: unit(0, 8), count: 10, source: "mic".into(),
+            single_meeting: false,
         }];
         let segs = vec![rec("mic", 0, 3000)]; // 3s=48000 样本,过 SEED_MIN_SAMPLES
         let mut emb: Option<Box<dyn SpeakerEmbedder>> = Some(Box::new(ScriptEmbedder(vec![unit(0, 8)], 0)));
@@ -277,6 +278,7 @@ mod tests {
     fn mixed_mode_rewrites_seed_source_for_fast_path() {
         let seeds = vec![SeedCluster {
             person: "P1".into(), name: "张三".into(), centroid: unit(0, 8), count: 10, source: "mic".into(),
+            single_meeting: false,
         }];
         let segs = vec![rec("mixed", 0, 3000)];
         let mut emb: Option<Box<dyn SpeakerEmbedder>> = Some(Box::new(ScriptEmbedder(vec![unit(0, 8)], 0)));

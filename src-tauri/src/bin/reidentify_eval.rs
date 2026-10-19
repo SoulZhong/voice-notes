@@ -35,7 +35,12 @@ fn main() {
 
     let vp_store = VoiceprintStore::new(root.clone());
     let vp = vp_store.load();
-    let seeds = if multi { seed_clusters_multi(&vp) } else { seed_clusters(&vp) };
+    let mut seeds = if multi { seed_clusters_multi(&vp) } else { seed_clusters(&vp) };
+    // 与生产 load_voiceprint_seeds_for 同口径:单场档案换严门槛。
+    let single = vp_store.single_meeting_people(&vp);
+    for s in &mut seeds {
+        s.single_meeting = single.contains(&s.person);
+    }
     let label = |pid: &str| -> String {
         let r = VoiceprintStore::resolve(&vp, pid).unwrap_or(pid);
         match vp.people.get(r).map(|p| p.name.as_str()) {

@@ -421,6 +421,7 @@ mod tests {
         let embs = vec![v(a, 0.0), v(a, 0.01)];
         let hit = vec![crate::diar::registry::SeedCluster {
             person: "P1".into(), name: "张三".into(), centroid: vec![1.0, 0.0, 0.0], count: 5, source: "mic".into(),
+            single_meeting: false,
         }];
         let stats = stats_by_speaker(&inputs, &embs, &hit, &crate::diar::registry::NearestMatcher);
         let (pid, name, sim, adopted) = stats[0].seed.clone().unwrap();
@@ -429,6 +430,7 @@ mod tests {
 
         let far = vec![crate::diar::registry::SeedCluster {
             person: "P9".into(), name: "王五".into(), centroid: vec![0.5, 0.86, 0.0], count: 5, source: "mic".into(),
+            single_meeting: false,
         }];
         let stats = stats_by_speaker(&inputs, &embs, &far, &crate::diar::registry::NearestMatcher);
         let (pid, _, sim, adopted) = stats[0].seed.clone().unwrap();
@@ -543,6 +545,7 @@ mod tests {
     fn split_merges_groups_sharing_confident_seed_but_not_weak_ones() {
         let sc = |p: &str, c: Vec<f32>| crate::diar::registry::SeedCluster {
             person: p.into(), name: p.into(), centroid: c, count: 5, source: "mic".into(),
+            single_meeting: false,
         };
         // 两个互不相似(dot=0 < AHC 阈值)的方向,但都与种子 PX 高相似(0.8+)。
         let a = [1.0, 0.0, 0.0];
@@ -566,8 +569,8 @@ mod tests {
         let inputs = vec![seg(0, 0, 9000)];
         let embs = vec![v([1.0, 0.0, 0.0], 0.0)];
         let seeds = vec![
-            SeedCluster { person: "P7".into(), name: "甲".into(), centroid: vec![0.99, 0.05, 0.0], count: 5, source: "mic".into() },
-            SeedCluster { person: "P8".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0], count: 5, source: "mic".into() },
+            SeedCluster { person: "P7".into(), name: "甲".into(), centroid: vec![0.99, 0.05, 0.0], count: 5, source: "mic".into(), single_meeting: false },
+            SeedCluster { person: "P8".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0], count: 5, source: "mic".into(), single_meeting: false },
         ];
         let sug = recluster_split(&inputs, &embs, &seeds);
         let (pid, name, sim) = sug.groups[0].suggested.clone().expect("应有建议");
