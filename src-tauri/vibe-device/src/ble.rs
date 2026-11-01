@@ -497,17 +497,31 @@ pub async fn run(
             }
         }
     };
+    // Fetch the Adapter ONCE and reuse it on every pass. On macOS each
+    // `manager.adapters()` builds a fresh Adapter whose CoreBluetooth thread
+    // (btleplug `run_corebluetooth_thread`) loops forever and is never joined,
+    // so asking per pass leaked one 2 MB thread every ~10 s while no Device was
+    // in range — after ~2 days the process hit the 16k thread cap and died on
+    // the next wake (WebKit could not allocate).
+    let adapter = loop {
+        if outgoing.is_closed() {
+            return LinkEnd::Stopped;
+        }
+        match adapter(&manager).await {
+            Some(a) => break a,
+            None => {
+                state(&LinkState::Unavailable);
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    };
+    backoff = Duration::from_secs(1);
     let mut last_name: Option<String> = opts.wanted.clone();
     loop {
         if outgoing.is_closed() {
             return LinkEnd::Stopped;
         }
-        let Some(adapter) = adapter(&manager).await else {
-            state(&LinkState::Unavailable);
-            sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-            continue;
-        };
         state(&LinkState::Searching);
         let mut found = find_device(&adapter, last_name.as_deref()).await;
         if found.is_none() && last_name.is_some() {
