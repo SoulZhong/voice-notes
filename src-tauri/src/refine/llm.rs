@@ -474,14 +474,39 @@ impl std::fmt::Display for ChunkErr {
     }
 }
 
+/// 每块备注合计上限(字符),不计入 `CHUNK_CHARS`——不改变既有分块边界。
+pub const MEMO_CHUNK_CHARS: usize = 800;
+/// 拟题时备注合计上限。
+pub const MEMO_TITLE_CHARS: usize = 500;
+/// 一块只带时间落在 `[块首段 start − 30s, 块末段 end + 30s]` 内的备注。
+pub const MEMO_WINDOW_MS: u64 = 30_000;
+
+/// 取 `[lo, hi]` 内有文字的备注排成提示行,合计不超过 `cap` 字(超出即截止,不切半条)。
+/// 时间标记(空文字)没有提示价值,不进提示词。
+pub(crate) fn memo_hints(memos: &[crate::store::memos::Memo], lo: u64, hi: u64, cap: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for m in memos.iter().filter(|m| !m.text.trim().is_empty() && lo <= m.at_ms && m.at_ms <= hi) {
+        let line = prompts::memo_hint_line(m.at_ms, &m.text);
+        let n = line.chars().count();
+        if used + n > cap {
+            break;
+        }
+        used += n;
+        out.push_str(&line);
+    }
+    out
+}
+
 fn call_chunk(
     cfg: &LlmConfig,
     glossary: &Value,
     paragraphs: &[ChunkPara],
+    memo_block: &str,
     log: Option<&crate::ailog::Ctx>,
 ) -> Result<(Value, Vec<String>, Vec<RawEntity>), ChunkErr> {
     let numbered = format_chunk_paragraphs(paragraphs);
-    let user = prompts::refine_user(glossary, &numbered);
+    let user = prompts::refine_user_with_memos(glossary, &numbered, memo_block);
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let mut body_json = json!({
         "model": cfg.model,
@@ -708,9 +733,11 @@ fn do_call_chunk(
 
 /// 为整场笔记生成主题标题(Aing 完成后调用,替换未被用户改过的默认标题)。
 /// 单次请求、失败即放弃:标题是锦上添花,不进 stages、不重试、不影响 Aing 结果。
-pub fn gen_title(
+/// 备注放在正文之前(合计 ≤ [`MEMO_TITLE_CHARS`];无备注时输入与旧版逐字节一致)。
+pub fn gen_title_with_memos(
     cfg: &LlmConfig,
     paragraphs: &[RefinedParagraph],
+    memos: &[crate::store::memos::Memo],
     log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<String> {
     let mut text = String::new();
@@ -730,7 +757,7 @@ pub fn gen_title(
         "temperature": 0.3,
         "messages": [
             { "role": "system", "content": prompts::TITLE_SYSTEM },
-            { "role": "user", "content": text },
+            { "role": "user", "content": prompts::title_input(&memo_hints(memos, 0, u64::MAX, MEMO_TITLE_CHARS), &text) },
         ],
     });
     apply_thinking_off(&cfg.base_url, &mut body_json);
@@ -783,6 +810,7 @@ pub fn gen_title(
 /// 逐块 Aing,glossary 串行前传。全部成功 Done;有内容级失败(或网络与内容混合失败)
 /// 计入 Partial;全部分块都是网络级失败(服务完全不可达)判 Failed。
 /// log=Some 时每个分块的请求/响应记入 AI 日志(旁路,失败不影响 Aing)。
+#[cfg(test)]
 pub fn polish(
     cfg: &LlmConfig,
     paragraphs: &mut [RefinedParagraph],
@@ -795,6 +823,18 @@ pub fn polish(
     //   每块最坏 CHUNK_TIMEOUT_S×2=360s),没有逐块信号,长会议的正常 Aing 会被误判卡死;
     // ② 界面进度(「精修中 3/8 · 约剩 4 分」)——avg_ms 是已完成块的平均耗时,
     //   done<1 时为 0,ETA 由前端乘剩余块数(2026-08-20 设计)。
+    progress: &dyn Fn(usize, usize, u64),
+) -> (LlmOutcome, Vec<RawEntity>) {
+    polish_with_memos(cfg, paragraphs, labels, &[], log, progress)
+}
+
+/// 逐块 Aing(见上 `polish` 的说明),每块附上本时间窗内的会议备注(只读提示,见 [`memo_hints`])。
+pub fn polish_with_memos(
+    cfg: &LlmConfig,
+    paragraphs: &mut [RefinedParagraph],
+    labels: &std::collections::BTreeMap<String, String>,
+    memos: &[crate::store::memos::Memo],
+    log: Option<&crate::ailog::Ctx>,
     progress: &dyn Fn(usize, usize, u64),
 ) -> (LlmOutcome, Vec<RawEntity>) {
     let chunks = chunk_indices(paragraphs);
@@ -828,7 +868,16 @@ pub fn polish(
                 text: paragraphs[i].text.as_str(),
             })
             .collect();
-        match call_chunk(cfg, &glossary, &inputs, log) {
+        let memo_block = match (chunk.first(), chunk.last()) {
+            (Some(&a), Some(&b)) if !memos.is_empty() => memo_hints(
+                memos,
+                paragraphs[a].start_ms.saturating_sub(MEMO_WINDOW_MS),
+                paragraphs[b].end_ms.saturating_add(MEMO_WINDOW_MS),
+                MEMO_CHUNK_CHARS,
+            ),
+            _ => String::new(),
+        };
+        match call_chunk(cfg, &glossary, &inputs, &memo_block, log) {
             Ok((g, outs, ents)) => {
                 if let Value::Object(map) = g {
                     if let Value::Object(acc) = &mut glossary {

@@ -1012,6 +1012,13 @@ pub fn run_refine(
                 request: serde_json::json!({
                     "args": result.as_ref().map(|(args, ..)| args.clone()).unwrap_or_default(),
                     "prompt": prompt,
+                    // 备注是 Agent 经 MCP get_note 读的,读不写日志——这里补一份快照,
+                    // 事后能对证「这一轮 Agent 看到了哪些备注」。
+                    "memos": crate::store::memos::load_memos(note_dir)
+                        .memos
+                        .iter()
+                        .map(|m| serde_json::json!({ "at_ms": m.at_ms, "text": m.text }))
+                        .collect::<Vec<_>>(),
                 }),
                 response,
                 status: if verdict.is_ok() { "ok" } else { "error" },
@@ -1108,11 +1115,24 @@ fn mark_graph_failed(note_dir: &Path) -> anyhow::Result<()> {
 }
 
 /// 为整场笔记生成主题标题(语义与 llm::gen_title 一致:锦上添花,失败即放弃)。
+#[cfg(test)]
 pub fn gen_title(
     kind: AgentKind,
     bin: &Path,
     model: &str,
     paragraphs: &[RefinedParagraph],
+    log: Option<&crate::ailog::Ctx>,
+) -> anyhow::Result<String> {
+    gen_title_with_memos(kind, bin, model, paragraphs, &[], log)
+}
+
+/// 同 [`gen_title`],备注放在正文之前(见 `llm::gen_title_with_memos`)。
+pub fn gen_title_with_memos(
+    kind: AgentKind,
+    bin: &Path,
+    model: &str,
+    paragraphs: &[RefinedParagraph],
+    memos: &[crate::store::memos::Memo],
     log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<String> {
     let mut text = String::new();
@@ -1126,7 +1146,8 @@ pub fn gen_title(
     if text.trim().is_empty() {
         anyhow::bail!("修订稿无内容,不生成标题");
     }
-    let prompt = prompts::agent_title(&text);
+    let hints = super::llm::memo_hints(memos, 0, u64::MAX, super::llm::MEMO_TITLE_CHARS);
+    let prompt = prompts::agent_title(&prompts::title_input(&hints, &text));
     let scratch = make_scratch("title")?;
     let started = std::time::Instant::now();
     let run = (|| -> anyhow::Result<(bool, String, String)> {

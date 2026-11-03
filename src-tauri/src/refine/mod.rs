@@ -576,7 +576,9 @@ pub fn run_llm(
     *doc = latest;
     let fallback_graph = GraphFallbackSnapshot::capture(doc);
 
-    let (text_outcome, raw_entities) = llm::polish(cfg, &mut doc.paragraphs, labels, log, progress);
+    // 会议备注:开头读一次当只读提示(之后的改动本轮看不到,下一轮才看到)。
+    let memos = crate::store::memos::load_memos(note_dir).memos;
+    let (text_outcome, raw_entities) = llm::polish_with_memos(cfg, &mut doc.paragraphs, labels, &memos, log, progress);
     let state = match &text_outcome {
         llm::LlmOutcome::Done => "done",
         llm::LlmOutcome::Partial(_) => "partial",

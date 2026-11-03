@@ -153,6 +153,19 @@ pub fn search_notes(roots: &DataRoots, query: &str, limit: usize) -> serde_json:
             continue;
         };
         scanned += 1;
+        // 备注先于逐段:「我记得写过一句『封版』」正是备注最常见的找法。
+        for m in store::memos::load_memos(&notes_dir(roots).join(&summary.id)).memos {
+            if m.text.is_empty() || !m.text.to_lowercase().contains(&needle) {
+                continue;
+            }
+            hits.push(serde_json::json!({
+                "kind": "memo", "note_id": summary.id, "title": summary.title,
+                "memo_id": m.id, "at_ms": m.at_ms, "text": m.text,
+            }));
+            if hits.len() >= limit.clamp(1, 100) {
+                break 'outer;
+            }
+        }
         for (i, seg) in note.segments.iter().enumerate() {
             if !seg.text.to_lowercase().contains(&needle) {
                 continue;
@@ -213,12 +226,20 @@ pub fn get_note(
         })
         .collect::<serde_json::Map<_, _>>()
         .into();
+    // 会议备注:用户亲手写的只读提示(Agent 精修用它校人名术语;一期不开放 MCP 写备注)。
+    let note_dir = notes_dir(roots).join(id);
+    let memo_list = store::memos::load_memos(&note_dir).memos;
+    let memos_json: Vec<serde_json::Value> = memo_list
+        .iter()
+        .map(|m| serde_json::json!({ "id": m.id, "at_ms": m.at_ms, "text": m.text }))
+        .collect();
     match format {
         "segments" => Ok(match refined {
             Some(doc) => serde_json::json!({
                 "id": note.meta.id, "title": note.meta.title, "started_at": note.meta.started_at,
                 "state": note.meta.state, "speakers": speakers, "refined": true,
                 "generated_at": doc.generated_at,
+                "memos": memos_json,
                 "paragraphs": doc.paragraphs.iter().map(|p| serde_json::json!({
                     "speaker": p.speaker, "name": p.name, "start_ms": p.start_ms,
                     "end_ms": p.end_ms, "text": p.text,
@@ -227,6 +248,7 @@ pub fn get_note(
             None => serde_json::json!({
                 "id": note.meta.id, "title": note.meta.title, "started_at": note.meta.started_at,
                 "state": note.meta.state, "speakers": speakers, "refined": false,
+                "memos": memos_json,
                 "segments": note.segments.iter().map(|s| serde_json::json!({
                     "seq": s.seq, "source": s.source, "speaker": s.speaker,
                     "start_ms": s.start_ms, "end_ms": s.end_ms, "text": s.text,
@@ -235,13 +257,19 @@ pub fn get_note(
         }),
         "markdown" | "text" => {
             let was_refined = refined.is_some();
+            let cuts = store::edits::load_edits(&note_dir).cuts;
             let content = match refined {
-                Some(doc) => store::render_refined(&note.meta.title, &doc, format == "markdown"),
+                Some(doc) => {
+                    store::render_refined_with_memos(&note.meta.title, &doc, format == "markdown", &memo_list, &cuts)
+                }
                 // note 已在函数开头 load 过一次;render_loaded 直接渲染内存里的
                 // Note,避免 render(id, ..) 对同一笔记再触发一次磁盘 load。
-                None => {
-                    store.render_loaded(&note, if format == "markdown" { "md" } else { "txt" })?
-                }
+                None => store.render_loaded_with_memos(
+                    &note,
+                    if format == "markdown" { "md" } else { "txt" },
+                    &memo_list,
+                    &cuts,
+                )?,
             };
             Ok(serde_json::json!({
                 "id": note.meta.id, "title": note.meta.title,
@@ -936,6 +964,24 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn memos_reach_get_note_and_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "20260101-100000";
+        fixture_note(tmp.path(), id, "评审会", "2026-01-01T10:00:00+08:00", &[("S1", "先看背景", 0), ("S1", "散会", 9000)]);
+        let dir = notes_dir(&roots(tmp.path())).join(id);
+        store::memos::add_memo(&dir, 5_000, "周一封版", "composer", None).unwrap();
+        let v = get_note(&roots(tmp.path()), id, "segments", true).unwrap();
+        assert_eq!(v["memos"][0]["text"], "周一封版");
+        assert_eq!(v["memos"][0]["at_ms"], 5000);
+        let md = get_note(&roots(tmp.path()), id, "markdown", true).unwrap();
+        let c = md["content"].as_str().unwrap();
+        assert!(c.find("先看背景").unwrap() < c.find("周一封版").unwrap() && c.find("周一封版").unwrap() < c.find("散会").unwrap(), "{c}");
+        let hits = search_notes(&roots(tmp.path()), "封版", 10);
+        assert_eq!(hits["hits"][0]["kind"], "memo");
+        assert_eq!(hits["hits"][0]["at_ms"], 5000);
     }
 
     #[test]

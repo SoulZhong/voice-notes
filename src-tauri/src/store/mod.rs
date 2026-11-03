@@ -24,7 +24,7 @@ pub use aing_graph::{
     ensure_graph_ids, evidence_id, mention_id, relation_fact_id, source_hash, stable_id,
     GraphExtraction, RelationEvidence, RelationFact, RelationPredicate,
 };
-pub use export::render_refined; // GUI 导出与 MCP get_note 共用的 Aing 渲染(format_ts 已无 store:: 路径消费者,不再 re-export)。
+pub use export::{render_refined, render_refined_with_memos}; // GUI 导出与 MCP get_note 共用的 Aing 渲染(format_ts 已无 store:: 路径消费者,不再 re-export)。
 pub use notes::NoteStore;
 pub use refined::apply_refined_texts; // Agent Aing 写回(mcp::tools 消费)。
 pub use refined::load_refined_for_display; // 纯展示面(笔记页/导出)专用:额外套跨轨时基投影,绝不可用于任何会写回的路径。
