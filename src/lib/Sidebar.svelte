@@ -191,7 +191,7 @@
   /** 菜单里点了「重命名」:等菜单收起后再进改名态——否则改名框刚拿到焦点就可能被
       菜单的关闭/焦点归还抢走,blur 立即提交,看上去像「点了重命名没反应」。 */
   let renameAfterClose: NoteSummary | null = null;
-  /** 只有「重命名」关闭菜单时才不还焦点(改名框要拿焦点);Esc 等普通关闭照常还给原行(Codex P2)。 */
+  /** 关菜单时要不要把焦点还给原行:Esc 关 → 还;选「重命名」或点菜单外关 → 不还(改名框/被点处要拿焦点)。 */
   let skipRestoreFocus = false;
 
   function onListContextMenu(e: MouseEvent, open: unknown) {
@@ -856,6 +856,10 @@
   <!-- 关闭时默认把焦点还给原行;只有选了「重命名」才不还(改名框此刻要拿焦点,见 renameAfterClose)。 -->
   <ContextMenu.Content
     class="min-w-36"
+    onInteractOutside={() => {
+      // 点菜单外关闭:焦点该留在用户刚点的地方(如搜索框),不拽回原行(Codex 二轮 P2)。
+      skipRestoreFocus = true;
+    }}
     onCloseAutoFocus={(e) => {
       if (skipRestoreFocus) e.preventDefault();
       skipRestoreFocus = false;
