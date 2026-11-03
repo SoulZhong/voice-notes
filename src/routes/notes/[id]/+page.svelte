@@ -94,6 +94,22 @@
   import { watchJob } from "$lib/jobWatch";
   import Segmented from "$lib/Segmented.svelte";
   import type { SegmentedItem } from "$lib/segmented";
+  import MemoColumn from "$lib/MemoColumn.svelte";
+  import {
+    addMemo,
+    clampAt,
+    deleteMemo,
+    editMemo,
+    loadMemoColumnPref,
+    memoColumnOpen,
+    memoKeyAllowed,
+    noteMemos,
+    onMemosChanged,
+    saveMemoColumnPref,
+    type Memo,
+    type MemoOrigin,
+  } from "$lib/memos";
+  import type { MemoAction, MemoDraft } from "$lib/editor/memoDecorations";
 
   let note = $state<Note | null>(null);
   let error = $state("");
@@ -1929,6 +1945,147 @@
       editsErr = t("notes.edits.failed", { e });
     }
   }
+  // ── 会议备注(memo):正文书签(编辑器装饰)+ 右侧备注栏 + 加/改/删/调时间/撤销。
+  //    纪律同 segment_edited:不做乐观更新,一律以 note_memos / memos_changed 整表为准。
+  //    设计:docs/superpowers/specs/2026-11-03-meeting-memo-design.md「前端 › 笔记页」。 ──
+  let memos = $state<Memo[]>([]);
+  /** 未保存的草稿书签(按 M / 点「加备注」插入;回车保存、Esc 丢弃)。 */
+  let memoDraft = $state<MemoDraft | null>(null);
+  let memoDraftSeq = 0;
+  /** 刚删掉的那条(撤销 = 带原 id 重新 add_memo);约 10s 后收走。 */
+  let memoUndo = $state<Memo | null>(null);
+  let memoUndoTimer: ReturnType<typeof setTimeout> | undefined;
+  let memoErr = $state("");
+  let memoErrTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 本笔记正在录制(含暂停):加备注归录制页,这里不给入口。 */
+  const noteIsRecording = $derived(recording.isLive && recording.noteId === id);
+
+  // 进页/切笔记:先挂 memos_changed 订阅、listen 落定后再取整表——取表在途时若已有
+  // 事件到达,以事件为准(事件是写入之后的整表,比在途的快照新)。
+  $effect(() => {
+    const forId = id;
+    memos = [];
+    memoDraft = null;
+    memoUndo = null;
+    memoErr = "";
+    let alive = true;
+    let gotEvent = false;
+    const un = onMemosChanged((e) => {
+      if (!alive || e.note_id !== forId) return;
+      gotEvent = true;
+      memos = e.memos;
+    });
+    un.then(() => noteMemos(forId))
+      .then((list) => {
+        if (alive && !gotEvent) memos = list;
+      })
+      .catch((e) => {
+        if (alive) showMemoErr(e);
+      });
+    return () => {
+      alive = false;
+      un.then((f) => f());
+    };
+  });
+
+  function showMemoErr(e: unknown) {
+    memoErr = t("memo.failed", { e });
+    clearTimeout(memoErrTimer);
+    memoErrTimer = setTimeout(() => (memoErr = ""), 8000);
+  }
+  /** 备注写命令统一出口:失败给提示并把错误抛回书签(书签据此保持编辑态)。 */
+  async function memoCall<T>(f: () => Promise<T>): Promise<T> {
+    try {
+      return await f();
+    } catch (e) {
+      showMemoErr(e);
+      throw e;
+    }
+  }
+
+  /** 播放器时钟 → 备注时间轴(seekFix 的反向):成品轨播放时扣回 mic 的首帧偏移。 */
+  const unseekFix = (ms: number) =>
+    playbackScheme === "mixed" ? ms - (mixedInfo?.seek_offset_ms["mic"] ?? 0) : ms;
+
+  function startMemoDraft() {
+    if (!note || noteIsRecording) return;
+    const dur = player?.durationMs() ?? 0;
+    const at = clampAt(unseekFix(playerMs), dur > 0 ? dur : Number.MAX_SAFE_INTEGER);
+    memoDraft = { at_ms: at, seq: ++memoDraftSeq };
+  }
+
+  async function onMemoAction(a: MemoAction): Promise<void> {
+    const forId = id; // await 期间可能切笔记:旧笔记的回执不得写进新页
+    switch (a.kind) {
+      case "play":
+        playFrom({ start_ms: a.memo.at_ms });
+        return;
+      case "draftCancel":
+        memoDraft = null;
+        return;
+      case "draftSave":
+        await memoCall(() => addMemo(forId, a.at_ms, a.text, "note"));
+        if (forId === id) memoDraft = null;
+        return;
+      case "edit":
+        await memoCall(() => editMemo(forId, a.memo, { text: a.text }));
+        return;
+      case "adjust":
+        await memoCall(() => editMemo(forId, a.memo, { at_ms: a.at_ms }));
+        return;
+      case "delete": {
+        const gone = await memoCall(() => deleteMemo(forId, a.memo.id));
+        if (forId !== id) return;
+        memoUndo = gone;
+        clearTimeout(memoUndoTimer);
+        memoUndoTimer = setTimeout(() => (memoUndo = null), 10_000);
+        return;
+      }
+    }
+  }
+
+  async function undoMemoDelete() {
+    const m = memoUndo;
+    if (!m) return;
+    memoUndo = null;
+    clearTimeout(memoUndoTimer);
+    const forId = id;
+    await memoCall(() =>
+      addMemo(forId, m.at_ms, m.text, m.origin as MemoOrigin, { id: m.id, created_at: m.created_at }),
+    ).catch(() => {});
+  }
+
+  /** 备注栏点一条:滚到正文书签并闪一下;**不跳播**(拍板:看备注≠听录音)。
+      播放跟随中先停跟随,否则下一拍就被拽回当前段(「回到当前位置」按钮随之出现)。 */
+  function pickMemo(m: Memo) {
+    const el = transcriptEl?.querySelector<HTMLElement>(`.memo-bm[data-memo-id="${CSS.escape(m.id)}"]`);
+    if (!el) return;
+    if (playerPlaying) follow = false;
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    el.classList.add("flash");
+    setTimeout(() => el.classList.remove("flash"), 1200);
+  }
+
+  // 备注栏展开/收起:主区(容器)宽度 ≥ 900px 默认展开;用户手动切过就记住、不再自动切。
+  let containerEl = $state<HTMLElement | null>(null);
+  let containerW = $state(0);
+  let topbarH = $state(0);
+  let memoColPref = $state<boolean | null>(loadMemoColumnPref("note"));
+  const memoColOpen = $derived(memoColumnOpen(containerW, memoColPref));
+  function toggleMemoCol() {
+    memoColPref = !memoColOpen;
+    saveMemoColumnPref("note", memoColPref);
+  }
+  $effect(() => {
+    const el = containerEl;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      containerW = entries[0]?.contentRect.width ?? 0;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
   async function restoreCut(c: CutRange) {
     editsErr = "";
     const forId = id; // 同 deleteRange:切笔记后旧响应作废
@@ -2434,17 +2591,22 @@
       editsManage = false;
       retransConfirm = false;
     }
+    // 前台 M = 在播放位置插一个草稿书签(守卫:无修饰键/非输入法/不在可编辑区/本篇没在录)
+    if (note && memoKeyAllowed(e, e.target as HTMLElement | null, noteIsRecording)) {
+      e.preventDefault();
+      startMemoDraft();
+    }
   }}
 />
 
-<main class="container">
+<main class="container" bind:this={containerEl}>
   {#if error}
     <div class="banner banner-danger">{error}</div>
   {/if}
 
   {#if note}
     <!-- 操作栏吸顶:标题/播放器/视图切换钉在滚动视口顶端,长转写滚动或播放跟随时操作不失联 -->
-    <div class="topbar">
+    <div class="topbar" bind:offsetHeight={topbarH}>
       <div class="header">
         <div class="header-main">
           {#if editing}
@@ -2721,6 +2883,16 @@
               </div>
             {/if}
           </div>
+          <!-- 加备注:在当前播放位置插一个草稿书签(同 M 键);录制中本区不出现,入口归录制页 -->
+          <div class="memo-add-wrap">
+            <button class="memo-add" title={`${t("memo.note.add")} (M)`} onclick={startMemoDraft}>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3.5 14.5V2" />
+                <path d="M3.5 2.5h8.2l-1.9 2.9 1.9 2.9H3.5" />
+              </svg>
+              {t("memo.note.add")}
+            </button>
+          </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
           <div class="mix-switch" title={t("notes.mix.title")}>
@@ -2937,6 +3109,8 @@
     </div>
 
 
+    <!-- 正文 + 备注栏两栏:备注栏 sticky 钉在吸顶操作栏下方,滚动仍归 layout 的 .main -->
+    <div class="note-body" class:memo-open={memoColOpen} style="--memo-col-top: {topbarH}px">
     <div class="transcript" class:live={playerPlaying} bind:this={transcriptEl}>
       {#if effectiveView === "refined" && refined}
         <!-- 精修稿 WYSIWYG:MarkdownEditor(可编辑,mode="refined")+ 实体/徽章浮层。
@@ -2953,6 +3127,10 @@
             onDrainRefined={(p) => refinedSync.queueDrain(p)}
             onBadgeClick={(attrs, rect) => (refinedBadgePop = { attrs, rect })}
             onPlayFrom={(ms) => playFrom({ start_ms: ms })}
+            {memos}
+            memoCuts={edits}
+            {memoDraft}
+            {onMemoAction}
           />
         </div>
         {#if refined.paragraphs.length === 0}
@@ -2993,6 +3171,10 @@
               segDeletePop = { seq, rect };
             }}
             onPlayFrom={(ms) => playFrom({ start_ms: ms })}
+            {memos}
+            memoCuts={edits}
+            {memoDraft}
+            {onMemoAction}
           />
         {/key}
         {#if displaySegments.length === 0}
@@ -3000,6 +3182,20 @@
         {/if}
       {/if}
     </div>
+      <div class="memo-col-slot">
+        <MemoColumn {memos} cuts={edits} open={memoColOpen} onToggle={toggleMemoCol} onPick={pickMemo} />
+      </div>
+    </div>
+
+    {#if memoUndo || memoErr}
+      <div class="memo-toast" role="status">
+        {#if memoErr}<span class="memo-toast-err">{memoErr}</span>{/if}
+        {#if memoUndo}
+          <span>{t("memo.deleted")}</span>
+          <button class="link" onclick={() => void undoMemoDelete()}>{t("memo.undo")}</button>
+        {/if}
+      </div>
+    {/if}
 
     {#if segMenuPop && note}
       <!-- 段落说话人选择弹窗(2026-08-22 批量化):与胸牌菜单同一套视觉;
@@ -3459,6 +3655,55 @@
     flex: none;
   }
   /* 控制行:录音 + 播放器整合一行(录音机式) */
+  /* 正文 + 备注栏:收起时第二列只剩竖条按钮(auto),展开 260px */
+  .note-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 16px;
+    align-items: start;
+  }
+  .note-body.memo-open {
+    grid-template-columns: minmax(0, 1fr) 260px;
+  }
+  .memo-col-slot {
+    position: sticky;
+    top: calc(var(--memo-col-top, 0px) + 8px);
+    min-width: 0;
+  }
+  .memo-add-wrap {
+    display: inline-flex;
+    align-items: center;
+    height: 3.1rem; /* 与 .mix-switch 同:锚定播放器第一行高度 */
+    flex: none;
+  }
+  .memo-add {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
+    padding: 0.4em 0.9em;
+    font-size: 0.85rem;
+  }
+  /* 删除撤销/失败提示:右下角浮条(本页此前没有 toast 机制,只给备注用) */
+  .memo-toast {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    max-width: min(28rem, calc(100vw - 40px));
+    padding: 0.5rem 0.9rem;
+    font-size: 0.85rem;
+    color: var(--ink);
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+  }
+  .memo-toast-err {
+    color: var(--danger-ink);
+  }
   .transport {
     display: flex;
     /* flex-start + 右侧控件按第一行高度(3.1rem=播放键 2.1rem+上下 0.5rem 内边距)
