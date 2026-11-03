@@ -86,12 +86,49 @@ pub fn authorization_status() -> SFSpeechRecognizerAuthorizationStatus {
     unsafe { SFSpeechRecognizer::authorizationStatus() }
 }
 
-/// Whether this process runs from an `.app` bundle (and is therefore its own
-/// responsible process for privacy prompts).
+/// Whether this process runs from an `.app` bundle **and** is its own
+/// responsible process for privacy prompts.
+///
+/// The path check alone is not enough: running
+/// `/Applications/voice-notes.app/Contents/MacOS/voice-notes` straight from a
+/// terminal (or an agent's shell) keeps the bundle path, but TCC then treats
+/// the terminal as the responsible app, finds no
+/// `NSSpeechRecognitionUsageDescription` in *its* Info.plist and aborts us
+/// (`Namespace TCC`, crash reports 2026-11-03 15:20 / 15:56, launched by
+/// `codex` / `zsh` under orca-terminal-host).
 pub fn in_app_bundle() -> bool {
-    std::env::current_exe()
+    let bundled = std::env::current_exe()
         .map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    bundled && responsible_for_self()
+}
+
+/// Whether TCC attributes this process's privacy requests to itself (launched
+/// by LaunchServices: Finder, Dock, login item, `open`) rather than to the
+/// process that spawned it (a terminal, an agent).
+fn responsible_for_self() -> bool {
+    unsafe extern "C" {
+        // libSystem SPI, present on every supported macOS; the same lookup
+        // TCC itself uses to pick whose usage descriptions apply.
+        fn responsibility_get_pid_responsible_for_pid(pid: i32) -> i32;
+    }
+    let me = std::process::id() as i32;
+    let responsible = unsafe { responsibility_get_pid_responsible_for_pid(me) };
+    // <= 0: lookup failed. Assume someone else is responsible; skipping the
+    // prompt only costs a log line, prompting wrongly kills the process.
+    responsible == me
+}
+
+#[cfg(test)]
+mod responsibility_tests {
+    /// `cargo test` runs under a terminal/agent shell, so the test binary is
+    /// never its own responsible process — exactly the case that must not
+    /// prompt. (Run from Finder it would be; nobody runs tests that way.)
+    #[test]
+    fn shell_launched_process_is_not_responsible_for_itself() {
+        assert!(!super::responsible_for_self());
+        assert!(!super::in_app_bundle());
+    }
 }
 
 pub fn status_name(s: SFSpeechRecognizerAuthorizationStatus) -> &'static str {
