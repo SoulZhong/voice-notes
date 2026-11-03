@@ -272,6 +272,8 @@ fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
             // append 前读 next_seq 即本段将被分配的 seq：actor 单线程串行，
             // 读取与 append 之间无并发写入，成功/降级两条路径下都成立。
             let seq = owned.writer.next_seq();
+            // 录制中被用户删掉的说话人:实时聚类不知情,其后的段落盘与上屏都不归属。
+            let speaker = owned.writer.live_speaker(speaker.as_deref());
             // 不丢内容优先：先落盘（失败进待写队列），再通知 UI。
             match owned
                 .writer
@@ -339,17 +341,8 @@ fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
                         }
                     }
                 }
-                let speakers = w
-                    .speakers()
-                    .iter()
-                    .map(|(id, m)| crate::ipc::SpeakerEntry {
-                        id: id.clone(),
-                        name: m.name.clone(),
-                        sources: m.sources.clone(),
-                        person_id: m.person_id.clone(),
-                    })
-                    .collect();
-                let _ = app.emit("speakers", crate::ipc::SpeakersEvent { speakers, merged: None });
+                let speakers = speaker_entries(app, w);
+                let _ = app.emit("speakers", crate::ipc::SpeakersEvent { speakers, merged: None, cleared: None });
             }
             crate::session::DiarEvent::Merged { loser, winner } => {
                 let w = &mut owned.writer;
@@ -359,21 +352,13 @@ fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
                     eprintln!("说话人合并重写失败({loser}->{winner}): {e}");
                     let _ = app.emit("storage", crate::ipc::StorageEvent { state: "degraded".into() });
                 }
-                let speakers = w
-                    .speakers()
-                    .iter()
-                    .map(|(id, m)| crate::ipc::SpeakerEntry {
-                        id: id.clone(),
-                        name: m.name.clone(),
-                        sources: m.sources.clone(),
-                        person_id: m.person_id.clone(),
-                    })
-                    .collect();
+                let speakers = speaker_entries(app, w);
                 let _ = app.emit(
                     "speakers",
                     crate::ipc::SpeakersEvent {
                         speakers,
                         merged: Some(crate::ipc::MergedPair { loser, winner }),
+                        cleared: None,
                     },
                 );
             }
@@ -445,6 +430,38 @@ fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
             }
         },
     }
+}
+
+/// 录制中说话人表 → 前端快照。本地名为空而已关联库人物的(录制中选人按关联规则清了
+/// 本地名),用库中现名补上展示——与录完后笔记加载时的只读 join 同口径,不落盘。
+fn speaker_entries(
+    app: &AppHandle,
+    w: &crate::store::writer::NoteWriter,
+) -> Vec<crate::ipc::SpeakerEntry> {
+    let needs_join = w.speakers().values().any(|m| m.name.is_empty() && m.person_id.is_some());
+    let vp = needs_join
+        .then(|| crate::data_root(app).ok())
+        .flatten()
+        .map(|root| crate::store::VoiceprintStore::new(root).load());
+    w.speakers()
+        .iter()
+        .map(|(id, m)| {
+            let mut name = m.name.clone();
+            if name.is_empty() {
+                if let (Some(vp), Some(pid)) = (vp.as_ref(), m.person_id.as_deref()) {
+                    if let Some(p) = crate::store::VoiceprintStore::resolve(vp, pid).and_then(|r| vp.people.get(r)) {
+                        name = p.name.clone();
+                    }
+                }
+            }
+            crate::ipc::SpeakerEntry {
+                id: id.clone(),
+                name,
+                sources: m.sources.clone(),
+                person_id: m.person_id.clone(),
+            }
+        })
+        .collect()
 }
 
 pub fn spawn(app: AppHandle) -> LifecycleHandle {
@@ -907,6 +924,8 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                     // 漏斗 1 的"首次拿到转写"。必须在 finalize 之前取:
                                     // 之后 writer 要被搬空,拿不到了。
                                     let had_content = o.writer.has_content();
+                                    // 录制中选人的库侧补课单:finalize 之后 writer 被搬空,先取。
+                                    let live_links = o.writer.take_pending_links();
                                     let mut finalized_ok = false;
                                     let finalized = o.writer.finalize(chrono::Local::now());
                                     match finalized {
@@ -918,6 +937,11 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                             crate::spawn_enroll_named_speakers(
                                                 &app,
                                                 note_id.clone(),
+                                            );
+                                            crate::spawn_replay_live_links(
+                                                &app,
+                                                note_id.clone(),
+                                                live_links,
                                             );
                                             // 一场录制到底有没有产出转写。空转写是这条链路最常见的
                                             // 失败形态(权限拿到了、录也录了,就是一个字都没出来),
@@ -1042,19 +1066,70 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                 };
                                 o.writer.set_speaker_name(speaker_id, name);
                                 let persisted = o.writer.persist_speakers();
-                                let speakers = o
-                                    .writer
-                                    .speakers()
-                                    .iter()
-                                    .map(|(id, m)| crate::ipc::SpeakerEntry {
-                                        id: id.clone(),
-                                        name: m.name.clone(),
-                                        sources: m.sources.clone(),
-                                        person_id: m.person_id.clone(),
-                                    })
-                                    .collect();
+                                let speakers = speaker_entries(&app, &o.writer);
                                 persisted.map_err(|e| format!("说话人改名落盘失败: {e}"))?;
-                                let _ = app.emit("speakers", crate::ipc::SpeakersEvent { speakers, merged: None });
+                                let _ = app.emit("speakers", crate::ipc::SpeakersEvent { speakers, merged: None, cleared: None });
+                                Ok(())
+                            })();
+                            if result.is_ok() { result = r; }
+                        }
+                        // 录制中选人/取消关联/删除:与改名同骨架——按 note_id 与槽内 writer
+                        // 对账,writer 单写者路径改表+落盘,再广播快照。库侧一概不动
+                        // (录制中禁库写),选人的库侧工作记入补课单,停录后补走。
+                        Effect::DoLinkActiveSpeaker { note_id, speaker_id, link } => {
+                            let r = (|| {
+                                let o = match owned.as_mut() {
+                                    Some(o) if o.note_id == *note_id => o,
+                                    _ => return Err("录制会话已结束,请重试".to_string()),
+                                };
+                                o.writer
+                                    .link_speaker_live(speaker_id, &link.person_id, link.clone())
+                                    .map_err(|e| format!("关联说话人失败: {e}"))?;
+                                let speakers = speaker_entries(&app, &o.writer);
+                                let _ = app.emit("speakers", crate::ipc::SpeakersEvent { speakers, merged: None, cleared: None });
+                                Ok(())
+                            })();
+                            if result.is_ok() { result = r; }
+                        }
+                        Effect::DoUnlinkActiveSpeaker { note_id, speaker_id } => {
+                            let r = (|| {
+                                let o = match owned.as_mut() {
+                                    Some(o) if o.note_id == *note_id => o,
+                                    _ => return Err("录制会话已结束,请重试".to_string()),
+                                };
+                                let root = crate::data_root(&app).ok();
+                                o.writer
+                                    .unlink_speaker_live(speaker_id, |pid| {
+                                        let vp = crate::store::VoiceprintStore::new(root?).load();
+                                        let rid = crate::store::VoiceprintStore::resolve(&vp, pid)?;
+                                        let name = vp.people.get(rid)?.name.clone();
+                                        (!name.is_empty()).then_some(name)
+                                    })
+                                    .map_err(|e| format!("取消关联失败: {e}"))?;
+                                let speakers = speaker_entries(&app, &o.writer);
+                                let _ = app.emit("speakers", crate::ipc::SpeakersEvent { speakers, merged: None, cleared: None });
+                                Ok(())
+                            })();
+                            if result.is_ok() { result = r; }
+                        }
+                        Effect::DoDeleteActiveSpeaker { note_id, speaker_id } => {
+                            let r = (|| {
+                                let o = match owned.as_mut() {
+                                    Some(o) if o.note_id == *note_id => o,
+                                    _ => return Err("录制会话已结束,请重试".to_string()),
+                                };
+                                o.writer
+                                    .delete_speaker_live(speaker_id)
+                                    .map_err(|e| format!("删除说话人失败: {e}"))?;
+                                let speakers = speaker_entries(&app, &o.writer);
+                                let _ = app.emit(
+                                    "speakers",
+                                    crate::ipc::SpeakersEvent {
+                                        speakers,
+                                        merged: None,
+                                        cleared: Some(speaker_id.clone()),
+                                    },
+                                );
                                 Ok(())
                             })();
                             if result.is_ok() { result = r; }

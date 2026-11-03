@@ -4563,11 +4563,13 @@ fn retry_relation_backfill_index(
 }
 
 /// 原始稿说话人关联声纹库人物（会议搭子选人）：speakers.json 写 person_id 并清空
-/// 本地改名，展示走既有只读 join 显示库中现名。录制中拒绝（speakers.json 由 writer
-/// 独占）；person_id 经 resolve 归一，悬空报错。
+/// 本地改名，展示走既有只读 join 显示库中现名。person_id 经 resolve 归一，悬空报错。
+/// 录制中的笔记走 writer 单写者路径(speakers.json 由 writer 独占):只改本场表,
+/// 库侧样本/回灌留到停录后由 spawn_replay_live_links 补走(录制中禁库写)。
 #[tauri::command]
 fn assign_note_speaker_person(
     app: AppHandle,
+    state: State<AppState>,
     note_id: String,
     speaker_id: String,
     person_id: String,
@@ -4575,6 +4577,29 @@ fn assign_note_speaker_person(
     // 用户在试听面板勾选的「作为样本」段(2026-08-30):非空则样本**只**由这些段构成。
     selected_seqs: Option<Vec<u64>>,
 ) -> Result<(), String> {
+    if is_active_note(&state, &note_id) {
+        admit_note(&app, &note_id, occupancy::Intent::LiveEdit)?;
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        let vp = store::VoiceprintStore::new(root).load();
+        let resolved = store::VoiceprintStore::resolve(&vp, &person_id).map(str::to_string).ok_or_else(|| {
+            tr!(
+                "声纹库中没有该人物: {person_id}",
+                "No such person in the voiceprint library: {person_id}",
+                person_id = person_id
+            )
+        })?;
+        return app.state::<lifecycle::LifecycleHandle>().request(
+            lifecycle::machine::Msg::LinkActiveSpeaker {
+                note_id,
+                speaker_id,
+                link: store::writer::PendingLink {
+                    person_id: resolved,
+                    audited_seq,
+                    selected_seqs: selected_seqs.unwrap_or_default(),
+                },
+            },
+        );
+    }
     admit_note(&app, &note_id, occupancy::Intent::Edit)?;
     speaker_link::link_speaker_with(
         &TauriEnv(app),
@@ -4599,12 +4624,22 @@ fn assign_note_speaker_person(
 /// (先前关联的是无名自动人物 → 整个人物被并进目标),那次合并是库级 journaled 操作,
 /// 有自己的撤销入口(收件箱回执),不在这里连带回滚——回灌账本里根本没有它的条目,
 /// 撤销会如实报 NoEntry 并落日志。硬要在这里 un-merge 会把两本账搅乱。
+///
+/// 录制中的笔记:只断开本场表里的关联(这次录制里选的人还没入库,没有样本要退;
+/// 种子命中猜的人本就没写库),并记住这是用户的决定,实时识别不再把人关联回来。
 #[tauri::command]
 fn clear_note_speaker_person(
     app: AppHandle,
+    state: State<AppState>,
     note_id: String,
     speaker_id: String,
 ) -> Result<(), String> {
+    if is_active_note(&state, &note_id) {
+        admit_note(&app, &note_id, occupancy::Intent::LiveEdit)?;
+        return app.state::<lifecycle::LifecycleHandle>().request(
+            lifecycle::machine::Msg::UnlinkActiveSpeaker { note_id, speaker_id },
+        );
+    }
     admit_note(&app, &note_id, occupancy::Intent::Edit)?;
     speaker_link::unlink_speaker_with(&TauriEnv(app), &note_id, &speaker_id)
 }
@@ -6211,6 +6246,34 @@ fn delete_note(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 
+/// 停录后补做录制中选人的库侧工作(样本落库/回灌;录制中声纹库禁写,只改了本场表)。
+/// 逐条重走录完后选人的同一入口 `link_speaker_with`——此时表里已是该人,计划算出的是
+/// 「确认这次关联」:样本按本篇该说话人的段截取。失败只记日志,本篇关联不受影响。
+pub(crate) fn spawn_replay_live_links(
+    app: &AppHandle,
+    note_id: String,
+    links: std::collections::BTreeMap<String, store::writer::PendingLink>,
+) {
+    if links.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        for (sid, l) in links {
+            if let Err(e) = speaker_link::link_speaker_with(
+                &TauriEnv(app.clone()),
+                &note_id,
+                &sid,
+                &l.person_id,
+                l.audited_seq,
+                &l.selected_seqs,
+            ) {
+                eprintln!("录制中选人补入库失败({note_id}/{sid} → {}): {e}", l.person_id);
+            }
+        }
+    });
+}
+
 /// 停录后补做录制中命名的入库(录制中不能动库,只记名字;此处兑现)。
 /// 扫本篇「有名无主」说话人逐个走命名即入库(speaker_link::enroll_named_with),幂等。
 pub(crate) fn spawn_enroll_named_speakers(app: &AppHandle, note_id: String) {
@@ -6272,15 +6335,23 @@ fn rename_speaker(
 }
 
 /// 删除笔记内说话人(原始逐字稿 chips):表项移除,名下段落回到未标注。
-/// 只动本笔记,不碰人物库。录制中拒绝(与段落编辑同模式,不做活动会话变体:
-/// 删除是低频清理动作,录完再删没有代价);Aing 中拒绝(管线随后整写会引用
-/// speakers 的产物)。
+/// 只动本笔记,不碰人物库。Aing 中拒绝(管线随后整写会引用 speakers 的产物)。
+/// 录制中的笔记走 writer 单写者路径(2026-11-03 用户要求录制中与录完后能力对齐):
+/// 之后实时聚类再往这个 id 上分的段也一律不归属。
 #[tauri::command]
 fn delete_note_speaker(
     app: AppHandle,
+    state: State<AppState>,
     note_id: String,
     speaker_id: String,
 ) -> Result<(), String> {
+    if is_active_note(&state, &note_id) {
+        // 录制中的笔记不会同时在 Aing,只需挡持锁的后台任务。
+        admit_note(&app, &note_id, occupancy::Intent::LiveEdit)?;
+        return app.state::<lifecycle::LifecycleHandle>().request(
+            lifecycle::machine::Msg::DeleteActiveSpeaker { note_id, speaker_id },
+        );
+    }
     admit_note(&app, &note_id, occupancy::Intent::EditOutsideAing)?;
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::DeleteSpeaker { id: note_id, speaker_id },

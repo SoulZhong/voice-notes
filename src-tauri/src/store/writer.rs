@@ -3,7 +3,7 @@ use super::{
     SpeakerMeta, SCHEMA_VERSION, SEGMENT_SUPPRESSIONS_FILE,
 };
 use chrono::{DateTime, Datelike, Local, Timelike};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,12 +27,32 @@ pub struct NoteWriter {
     /// 仍可能有带 loser 标签的在途段(如回声 hold 队列里的)在重写**之后**才落盘,
     /// 成为表里查无此人的孤儿标签;finalize 用这份映射把孤儿段追认到 winner。
     merged: BTreeMap<String, String>,
+    /// 录制中用户亲手定下的人物关联(Some = 关联到该人,None = 取消关联)。实时识别的
+    /// 种子命中(SpeakersChanged)与停录快照(store_centroids)都不得覆写这些说话人的
+    /// person_id——否则用户刚选好的人,几秒后就被下一次归簇事件改回去。
+    user_person: BTreeMap<String, Option<String>>,
+    /// 录制中关联的库侧补课单:录制中声纹库禁写,样本/回灌留到停录 finalize 之后,
+    /// 由调用方逐条重走 `speaker_link::link_speaker_with`(与录完后选人同一入口)。
+    pending_links: BTreeMap<String, PendingLink>,
+    /// 录制中删除的说话人。删除后同簇的新段一律不归属、不再进表(实时聚类不知道
+    /// 用户删了它,还会继续往这个 id 上分段)。
+    deleted: BTreeSet<String>,
     /// 本会话新建标记：create() 置 true，resume() 置 false。
     /// 用于 abort_or_finalize 区分：零段新建空笔记删除；零段既有笔记保留（不丢内容）。
     created_this_session: bool,
     /// 笔记目录跨进程写锁:create/resume 时获取,随 NoteWriter 一起落幕。
     /// 拿不到锁 = 另一实例正在录制/编辑本笔记,开录失败并明确报错。
     _lock: super::notelock::NoteLock,
+}
+
+/// 录制中选人留给停录后补走的库侧参数(与录完后选人的 assign_note_speaker_person
+/// 入参同形:试听段与勾选段)。录制中不提供试听,目前两者恒空,留着是为了补走时
+/// 与录完后同一入口、同一签名。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PendingLink {
+    pub person_id: String,
+    pub audited_seq: Option<u64>,
+    pub selected_seqs: Vec<u64>,
 }
 
 /// 默认标题:「周X时段的会议」。列表副标题已有精确「日期时间 · 时长」,标题再放
@@ -177,6 +197,9 @@ impl NoteWriter {
             speakers: BTreeMap::new(),
             base_ms: 0,
             merged: BTreeMap::new(),
+            user_person: BTreeMap::new(),
+            pending_links: BTreeMap::new(),
+            deleted: BTreeSet::new(),
             created_this_session: true,
             _lock: lock,
         })
@@ -257,6 +280,9 @@ impl NoteWriter {
             speakers,
             base_ms,
             merged: BTreeMap::new(),
+            user_person: BTreeMap::new(),
+            pending_links: BTreeMap::new(),
+            deleted: BTreeSet::new(),
             created_this_session: false,
             _lock: lock,
         })
@@ -311,11 +337,75 @@ impl NoteWriter {
     /// 由后续 persist/finalize 统一写出）。缺项自动建（种子命中可能先于 sync_speakers
     /// 建表，例如种子解析先于本场首次归簇事件到达）。
     /// lib.rs 已接线：SpeakersChanged（种子命中）与 Snapshot（停止入库回填）两处都会调用。
+    ///
+    /// 用户录制中亲手定过关联(选人/取消关联)或删掉的说话人一律跳过:这里的调用方是
+    /// 实时识别的种子命中,它是"系统猜的",不能压过用户刚做的决定。
     pub fn set_speaker_person(&mut self, id: &str, person: &str) {
+        if self.user_person.contains_key(id) || self.deleted.contains(id) {
+            return;
+        }
         self.speakers
             .entry(id.to_string())
             .or_insert_with(SpeakerMeta::blank)
             .person_id = Some(person.to_string());
+    }
+
+    /// 实时聚类给出的说话人 id → 实际落盘归属:录制中被用户删掉的说话人,其后的段
+    /// 一律不归属(与录完后删除「名下段落回到未标注」同口径)。
+    pub fn live_speaker(&self, speaker: Option<&str>) -> Option<String> {
+        speaker.filter(|s| !self.deleted.contains(*s)).map(String::from)
+    }
+
+    /// 借 SpeakerTable 的领域规则改内存表(与录完后同一套关联/解除规则),失败时内存表不变。
+    fn edit_table(
+        &mut self,
+        f: impl FnOnce(&mut super::speaker_table::SpeakerTable) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut t = super::speaker_table::SpeakerTable::from_map(self.speakers.clone());
+        f(&mut t)?;
+        self.speakers = t.into_map();
+        Ok(())
+    }
+
+    /// 录制中选人:说话人关联到库人物(已经过 redirects 归一),规则同录完后的
+    /// 关联——写 person_id、清本地名与建议。库侧(样本/回灌)记入补课单,停录后补走。
+    /// 落盘 speakers.json。
+    pub fn link_speaker_live(&mut self, id: &str, person_id: &str, link: PendingLink) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.deleted.contains(id), "说话人已删除: {id}");
+        self.edit_table(|t| t.link(id, person_id))?;
+        self.user_person.insert(id.to_string(), Some(person_id.to_string()));
+        self.pending_links.insert(id.to_string(), link);
+        self.persist_speakers()
+    }
+
+    /// 录制中取消关联:规则同录完后的解除关联(本地名等于那人库名才清)。这次录制里
+    /// 选过人的,补课单一并撤掉——库还没写过,没有东西要退。落盘 speakers.json。
+    pub fn unlink_speaker_live(
+        &mut self,
+        id: &str,
+        library_name: impl FnOnce(&str) -> Option<String>,
+    ) -> anyhow::Result<()> {
+        self.edit_table(|t| t.unlink(id, library_name))?;
+        self.user_person.insert(id.to_string(), None);
+        self.pending_links.remove(id);
+        self.persist_speakers()
+    }
+
+    /// 录制中删除说话人:名下已落盘段回到未标注,表项移除;之后同簇新段也不再归属
+    /// (见 live_speaker)。写序同 NoteStore::delete_speaker:先改段、再删表。
+    pub fn delete_speaker_live(&mut self, id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(self.speakers.contains_key(id), "未知说话人: {id}");
+        self.rewrite_speaker_segments(id, None)?;
+        self.deleted.insert(id.to_string());
+        self.speakers.remove(id);
+        self.user_person.remove(id);
+        self.pending_links.remove(id);
+        self.persist_speakers()
+    }
+
+    /// 取走录制中关联的库侧补课单(finalize 成功后由调用方逐条补走)。
+    pub fn take_pending_links(&mut self) -> BTreeMap<String, PendingLink> {
+        std::mem::take(&mut self.pending_links)
     }
 
     /// 追加一条定稿段。失败时段留在待写队列并返回 Err（调用方发 storage 降级事件），
@@ -335,7 +425,7 @@ impl NoteWriter {
             text: text.into(),
             start_ms,
             end_ms,
-            speaker: speaker.map(String::from),
+            speaker: self.live_speaker(speaker),
             rms,
             multi: None,
         };
@@ -422,6 +512,10 @@ impl NoteWriter {
     /// 张表说明此前确曾被 sync_speakers/set_speaker_person 记录过，是曾命中或已关联的人。
     pub fn store_centroids(&mut self, snaps: &[crate::diar::registry::ClusterSnapshot]) {
         for s in snaps {
+            if self.deleted.contains(&s.id) {
+                continue;
+            }
+            let user_decided = self.user_person.contains_key(&s.id);
             match self.speakers.get_mut(&s.id) {
                 Some(entry) => {
                     entry.centroid = Some(s.centroid.clone());
@@ -429,7 +523,7 @@ impl NoteWriter {
                     // 防库侧复利膨胀),故落盘与续录恢复的权重是"最近一场增量"而非历史累计
                     // ——续录时质心漂移会比累计权重快,身份判定仍由阈值把守(backlog 复盘)。
                     entry.count = s.count;
-                    if let Some(person) = &s.person {
+                    if let Some(person) = s.person.as_ref().filter(|_| !user_decided) {
                         entry.person_id = Some(person.clone());
                     }
                 }
@@ -483,6 +577,9 @@ impl NoteWriter {
     pub fn sync_speakers(&mut self, infos: &[(String, Vec<String>)]) -> anyhow::Result<()> {
         let mut changed = false;
         for (id, sources) in infos {
+            if self.deleted.contains(id) {
+                continue; // 录制中已被用户删除:实时聚类不知情,不让它再进表
+            }
             let entry = self.speakers.entry(id.clone()).or_insert_with(|| {
                 changed = true;
                 SpeakerMeta::blank()
@@ -505,34 +602,27 @@ impl NoteWriter {
     /// （不可解析行原样保留，避免吞掉损坏但仍有诊断价值的行）到临时文件后原子替换；
     /// speakers 表移除 loser、sources 并入 winner（winner 已有名字保留，否则继承 loser 的名字），原子写。
     pub fn merge_speaker(&mut self, loser: &str, winner: &str) -> anyhow::Result<()> {
-        self.flush_pending()?;
         // 先记合并史再重写:即使下方重写失败,finalize 的孤儿清理仍知道去向。
         self.merged.insert(loser.to_string(), winner.to_string());
 
-        let path = self.dir.join("segments.jsonl");
-        // 读失败（瞬时 IO 错误）绝不能当空串：否则下方原子替换会把整场转写
-        // 覆写成空文件，静默丢失全部内容。中止合并，内存 speakers 表此时未动。
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("读 segments.jsonl 失败（合并中止，避免清空）: {e}"))?;
-        let mut out = String::new();
-        for line in content.lines() {
-            match serde_json::from_str::<SegmentRecord>(line) {
-                Ok(mut rec) => {
-                    if rec.speaker.as_deref() == Some(loser) {
-                        rec.speaker = Some(winner.to_string());
-                    }
-                    out.push_str(&serde_json::to_string(&rec)?);
-                }
-                Err(_) => out.push_str(line), // 不可解析行原样保留
-            }
-            out.push('\n');
+        // 并进了录制中被用户删掉的说话人:等于 loser 也一并删掉——段落回到未标注,
+        // 而不是归到一个表里已经没有的 id 上。
+        if self.deleted.contains(winner) {
+            self.rewrite_speaker_segments(loser, None)?;
+            self.deleted.insert(loser.to_string());
+            self.speakers.remove(loser);
+            self.user_person.remove(loser);
+            self.pending_links.remove(loser);
+            return write_speakers_atomic(&self.dir, &self.speakers);
         }
-        let tmp = self.dir.join("segments.jsonl.tmp");
-        std::fs::write(&tmp, out)?;
-        // 先丢句柄再 rename:同 rewrite_segment(Codex P1)——Windows 上带开着的追加
-        // 句柄替换目标可能共享冲突;句柄已 flush,提前关闭无损,下次 flush_pending 重开。
-        self.file = None;
-        std::fs::rename(&tmp, &path)?;
+        self.rewrite_speaker_segments(loser, Some(winner))?;
+        // 用户对 loser 定过的关联随簇并入 winner(winner 自己有用户决定的以 winner 为准)。
+        if let Some(choice) = self.user_person.remove(loser) {
+            self.user_person.entry(winner.to_string()).or_insert(choice);
+        }
+        if let Some(link) = self.pending_links.remove(loser) {
+            self.pending_links.entry(winner.to_string()).or_insert(link);
+        }
 
         if let Some(loser_meta) = self.speakers.remove(loser) {
             let winner_entry =
@@ -554,7 +644,45 @@ impl NoteWriter {
                 }
             }
         }
+        // 用户的决定压过上面的对称继承(继承来的可能是种子命中猜的人)。
+        if let Some(choice) = self.user_person.get(winner).cloned() {
+            if let Some(w) = self.speakers.get_mut(winner) {
+                w.person_id = choice;
+            }
+        }
         write_speakers_atomic(&self.dir, &self.speakers)
+    }
+
+    /// 把 segments.jsonl 里归属 `from` 的段全部改成 `to`(None = 未标注)。先 flush_pending
+    /// 保证 jsonl 完整,逐行重写到临时文件后原子替换(不可解析行原样保留,避免吞掉损坏但
+    /// 仍有诊断价值的行)。读失败中止,绝不以空内容覆写。
+    fn rewrite_speaker_segments(&mut self, from: &str, to: Option<&str>) -> anyhow::Result<()> {
+        self.flush_pending()?;
+        let path = self.dir.join("segments.jsonl");
+        // 读失败（瞬时 IO 错误）绝不能当空串：否则下方原子替换会把整场转写
+        // 覆写成空文件，静默丢失全部内容。中止，内存 speakers 表此时未动。
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("读 segments.jsonl 失败（改写中止，避免清空）: {e}"))?;
+        let mut out = String::new();
+        for line in content.lines() {
+            match serde_json::from_str::<SegmentRecord>(line) {
+                Ok(mut rec) => {
+                    if rec.speaker.as_deref() == Some(from) {
+                        rec.speaker = to.map(String::from);
+                    }
+                    out.push_str(&serde_json::to_string(&rec)?);
+                }
+                Err(_) => out.push_str(line), // 不可解析行原样保留
+            }
+            out.push('\n');
+        }
+        let tmp = self.dir.join("segments.jsonl.tmp");
+        std::fs::write(&tmp, out)?;
+        // 先丢句柄再 rename:同 rewrite_segment(Codex P1)——Windows 上带开着的追加
+        // 句柄替换目标可能共享冲突;句柄已 flush,提前关闭无损,下次 flush_pending 重开。
+        self.file = None;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     /// 录制中段编辑共用骨架:flush 待写队列 → 按 seq 定位并做 expected_text 乐观
@@ -657,7 +785,11 @@ impl NoteWriter {
                                 }
                                 cur = next.clone();
                             }
-                            if cur != spk && self.speakers.contains_key(&cur) {
+                            if self.deleted.contains(&cur) {
+                                // 追到的是录制中被用户删掉的说话人:回到未标注,不补表项。
+                                rec.speaker = None;
+                                changed = true;
+                            } else if cur != spk && self.speakers.contains_key(&cur) {
                                 rec.speaker = Some(cur);
                                 changed = true;
                             } else {
@@ -1964,5 +2096,163 @@ mod tests {
         let m2 = crate::store::notes::read_meta(&note_dir).unwrap();
         assert_eq!(m2.title, "评审会");
         assert_eq!(m2.attendees, vec!["李四".to_string()]);
+    }
+
+    // ── 录制中说话人编辑(2026-11-03,与录完后能力对齐) ──
+
+    fn seg_speakers(w: &NoteWriter) -> Vec<Option<String>> {
+        std::fs::read_to_string(w.dir().join("segments.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<SegmentRecord>(l).unwrap().speaker)
+            .collect()
+    }
+
+    fn two_speakers(tmp: &std::path::Path) -> NoteWriter {
+        let mut w = NoteWriter::create(tmp, now()).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
+        w.append_final("system", "乙说", 2000, 4000, Some("S2"), None).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()]), ("S2".into(), vec!["system".into()])])
+            .unwrap();
+        w
+    }
+
+    fn link(person: &str) -> PendingLink {
+        PendingLink { person_id: person.into(), audited_seq: None, selected_seqs: vec![] }
+    }
+
+    fn snap(id: &str, person: Option<&str>) -> crate::diar::registry::ClusterSnapshot {
+        crate::diar::registry::ClusterSnapshot {
+            id: id.into(),
+            centroid: vec![0.0; 4],
+            count: 1,
+            sources: ["mic".to_string()].into_iter().collect(),
+            person: person.map(String::from),
+            total_ms: 0,
+        }
+    }
+
+    /// 选人:写关联、清本地名(与录完后关联同规则)、记补课单;之后实时识别的种子命中
+    /// 与停录快照都不得把人改掉——用户刚选好的人几秒后被打回原形是这次要防的事。
+    #[test]
+    fn live_link_sticks_against_seed_hits_and_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = two_speakers(tmp.path());
+        w.set_speaker_name("S1", "张三");
+        w.link_speaker_live("S1", "P7", link("P7")).unwrap();
+        let m = &w.speakers()["S1"];
+        assert_eq!(m.person_id.as_deref(), Some("P7"));
+        assert_eq!(m.name, "", "关联清本地名,展示走库名");
+
+        w.set_speaker_person("S1", "P9"); // 种子命中猜的是别人
+        w.store_centroids(&[snap("S1", Some("P9"))]);
+        assert_eq!(w.speakers()["S1"].person_id.as_deref(), Some("P7"));
+
+        // 落盘与内存一致(录制中崩溃也不丢这次选人)
+        let disk: std::collections::BTreeMap<String, SpeakerMeta> =
+            serde_json::from_str(&std::fs::read_to_string(w.dir().join("speakers.json")).unwrap()).unwrap();
+        assert_eq!(disk["S1"].person_id.as_deref(), Some("P7"));
+
+        let pending = w.take_pending_links();
+        assert_eq!(pending.get("S1"), Some(&link("P7")));
+        assert!(w.take_pending_links().is_empty(), "取走即清空,停录只补一次");
+    }
+
+    /// 取消关联:断开、撤补课单,且实时识别不再把人关联回来。
+    #[test]
+    fn live_unlink_drops_pending_and_blocks_relink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = two_speakers(tmp.path());
+        w.link_speaker_live("S2", "P3", link("P3")).unwrap();
+        w.unlink_speaker_live("S2", |_| Some("李四".into())).unwrap();
+        assert_eq!(w.speakers()["S2"].person_id, None);
+        assert!(w.take_pending_links().is_empty(), "库还没写过,没有东西要补");
+
+        w.set_speaker_person("S2", "P3");
+        w.store_centroids(&[snap("S2", Some("P3"))]);
+        assert_eq!(w.speakers()["S2"].person_id, None, "用户否掉的人不得被自动关联回来");
+    }
+
+    /// 取消一个种子命中的关联:本地名是那人的库名(种子命中会用库名兜底)才清,
+    /// 用户自己起的名字不动——与录完后解除关联同规则。
+    #[test]
+    fn live_unlink_of_seed_hit_clears_library_name_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = two_speakers(tmp.path());
+        w.set_speaker_person("S1", "P5");
+        w.set_speaker_name("S1", "王五");
+        w.unlink_speaker_live("S1", |_| Some("王五".into())).unwrap();
+        assert_eq!(w.speakers()["S1"].name, "");
+
+        w.set_speaker_person("S2", "P6");
+        w.set_speaker_name("S2", "老赵");
+        w.unlink_speaker_live("S2", |_| Some("赵六".into())).unwrap();
+        assert_eq!(w.speakers()["S2"].name, "老赵");
+    }
+
+    /// 删除:已落盘段回到未标注、表项移除;实时聚类还会往这个 id 上分段,
+    /// 之后的段与归簇事件都不得让它复活。
+    #[test]
+    fn live_delete_unassigns_now_and_later() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = two_speakers(tmp.path());
+        w.link_speaker_live("S2", "P3", link("P3")).unwrap();
+        w.delete_speaker_live("S2").unwrap();
+        assert_eq!(seg_speakers(&w), vec![Some("S1".into()), None]);
+        assert!(!w.speakers().contains_key("S2"));
+        assert!(w.take_pending_links().is_empty(), "删掉的人不再补入库");
+
+        w.append_final("system", "乙又说", 4000, 6000, Some("S2"), None).unwrap();
+        w.sync_speakers(&[("S2".into(), vec!["system".into()])]).unwrap();
+        w.set_speaker_person("S2", "P3");
+        w.store_centroids(&[snap("S2", Some("P3"))]);
+        assert_eq!(seg_speakers(&w), vec![Some("S1".into()), None, None]);
+        assert!(!w.speakers().contains_key("S2"), "删除后不得被归簇事件建回来");
+        assert_eq!(w.live_speaker(Some("S2")), None);
+        assert_eq!(w.live_speaker(Some("S1")).as_deref(), Some("S1"));
+
+        // finalize 的孤儿清理也不得把它补回表里
+        w.finalize(now()).unwrap();
+        assert!(!w.speakers().contains_key("S2"));
+    }
+
+    /// 实时聚类把一个簇并进了用户删掉的说话人:等于一起删,段回未标注而不是挂到不存在的 id。
+    #[test]
+    fn diar_merge_into_deleted_speaker_deletes_loser_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = two_speakers(tmp.path());
+        w.delete_speaker_live("S2").unwrap();
+        w.merge_speaker("S1", "S2").unwrap();
+        assert_eq!(seg_speakers(&w), vec![None, None]);
+        assert!(w.speakers().is_empty());
+        w.append_final("mic", "甲又说", 4000, 6000, Some("S1"), None).unwrap();
+        assert_eq!(seg_speakers(&w).last().cloned().flatten(), None);
+    }
+
+    /// 实时聚类合并:用户对 loser 的选人随簇并入 winner,压过种子猜的人;补课单跟着走。
+    #[test]
+    fn diar_merge_carries_user_link_to_winner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = two_speakers(tmp.path());
+        w.set_speaker_person("S1", "P9"); // winner 是种子猜的
+        w.link_speaker_live("S2", "P7", link("P7")).unwrap(); // loser 是用户选的
+        w.merge_speaker("S2", "S1").unwrap();
+        assert_eq!(w.speakers()["S1"].person_id.as_deref(), Some("P7"));
+        assert_eq!(seg_speakers(&w), vec![Some("S1".into()), Some("S1".into())]);
+        let pending = w.take_pending_links();
+        assert_eq!(pending.get("S1"), Some(&link("P7")));
+        assert!(!pending.contains_key("S2"));
+    }
+
+    #[test]
+    fn live_edits_refuse_unknown_or_deleted_speakers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = two_speakers(tmp.path());
+        assert!(w.link_speaker_live("S9", "P1", link("P1")).is_err());
+        assert!(w.unlink_speaker_live("S9", |_| None).is_err());
+        assert!(w.delete_speaker_live("S9").is_err());
+        w.delete_speaker_live("S2").unwrap();
+        assert!(w.link_speaker_live("S2", "P1", link("P1")).is_err());
+        assert!(w.delete_speaker_live("S2").is_err());
     }
 }

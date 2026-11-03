@@ -197,6 +197,13 @@ pub enum Msg {
     AbortSession { note_id: String },
     SetTitle { note_id: String, title: String },
     RenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
+    /// 录制中选人(关联库人物;person_id 已由命令壳经 redirects 归一)。与改名同类:
+    /// writer 语义消息,只改本场说话人表;库侧样本留到停录后补走。
+    LinkActiveSpeaker { note_id: String, speaker_id: String, link: crate::store::writer::PendingLink },
+    /// 录制中取消关联。
+    UnlinkActiveSpeaker { note_id: String, speaker_id: String },
+    /// 录制中删除说话人(名下段落回到未标注,之后同簇新段也不再归属)。
+    DeleteActiveSpeaker { note_id: String, speaker_id: String },
     /// 录制中段编辑(与 SetTitle/RenameActiveSpeaker 同类:writer 语义消息,与录制
     /// 主时间轴正交,不改会话态)。note_id 供 actor 与槽内 writer 对账——判定活动
     /// 在命令线程、执行在 actor 线程,中间可能已停录/换会话,绝不能误写新会话。
@@ -254,6 +261,12 @@ pub enum Effect {
     DoSetTitle { note_id: String, title: String },
     /// runner 落活动会话说话人改名(persist+speakers 快照 emit)。
     DoRenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
+    /// runner 落录制中选人(writer 关联 + 记补课单 + speakers 快照 emit)。
+    DoLinkActiveSpeaker { note_id: String, speaker_id: String, link: crate::store::writer::PendingLink },
+    /// runner 落录制中取消关联。
+    DoUnlinkActiveSpeaker { note_id: String, speaker_id: String },
+    /// runner 落录制中删除说话人。
+    DoDeleteActiveSpeaker { note_id: String, speaker_id: String },
     /// runner 用槽内 writer 改写活动会话的段文本(重写 segments.jsonl + emit
     /// "segment_edited")。note_id 与槽内不符则报错回执,绝不误写新会话。
     DoEditActiveSegment { note_id: String, seq: u64, expected_text: String, new_text: String },
@@ -326,8 +339,8 @@ pub fn handle(state: &LifecycleState, msg: &Msg) -> (LifecycleState, Vec<Effect>
             (with_session(Idle), effects)
         }
         // —— P2 新增:writer 语义消息 ——
-        // AdoptWriter/Pipeline/SetTitle/RenameActiveSpeaker/EditActiveSegment/
-        // SetActiveSegmentSpeaker/AbortSession 均不改会话态
+        // AdoptWriter/Pipeline/SetTitle/RenameActiveSpeaker/Link/Unlink/DeleteActiveSpeaker/
+        // EditActiveSegment/SetActiveSegmentSpeaker/AbortSession 均不改会话态
         // (writer 归属、说话人表、标题、段文本都是 runner 侧状态,内核只转发一个 Do* 指令),
         // 也从不产生 ShadowMismatch——它们与「录制中/停止中」这条主时间轴正交,
         // 任何状态下发生都不构成对账矛盾。
@@ -410,6 +423,22 @@ pub fn handle(state: &LifecycleState, msg: &Msg) -> (LifecycleState, Vec<Effect>
                 speaker_id: speaker_id.clone(),
                 name: name.clone(),
             }],
+        ),
+        Msg::LinkActiveSpeaker { note_id, speaker_id, link } => (
+            state.clone(),
+            vec![DoLinkActiveSpeaker {
+                note_id: note_id.clone(),
+                speaker_id: speaker_id.clone(),
+                link: link.clone(),
+            }],
+        ),
+        Msg::UnlinkActiveSpeaker { note_id, speaker_id } => (
+            state.clone(),
+            vec![DoUnlinkActiveSpeaker { note_id: note_id.clone(), speaker_id: speaker_id.clone() }],
+        ),
+        Msg::DeleteActiveSpeaker { note_id, speaker_id } => (
+            state.clone(),
+            vec![DoDeleteActiveSpeaker { note_id: note_id.clone(), speaker_id: speaker_id.clone() }],
         ),
         Msg::EditActiveSegment { note_id, seq, expected_text, new_text } => (
             state.clone(),
@@ -721,6 +750,57 @@ mod tests {
                     fx.as_slice(),
                     [Effect::DoRenameActiveSpeaker { note_id, speaker_id, name }]
                         if note_id == "n1" && speaker_id == "spk1" && name == "张三"
+                ),
+                "state={s:?} fx={fx:?}"
+            );
+
+            let link = crate::store::writer::PendingLink {
+                person_id: "P3".into(),
+                audited_seq: None,
+                selected_seqs: vec![],
+            };
+            let (next, fx) = handle(
+                s,
+                &Msg::LinkActiveSpeaker {
+                    note_id: "n1".into(),
+                    speaker_id: "spk1".into(),
+                    link: link.clone(),
+                },
+            );
+            assert_eq!(&next, s, "LinkActiveSpeaker 不应改变状态:state={s:?}");
+            assert!(
+                matches!(
+                    fx.as_slice(),
+                    [Effect::DoLinkActiveSpeaker { note_id, speaker_id, link: l }]
+                        if note_id == "n1" && speaker_id == "spk1" && *l == link
+                ),
+                "state={s:?} fx={fx:?}"
+            );
+
+            let (next, fx) = handle(
+                s,
+                &Msg::UnlinkActiveSpeaker { note_id: "n1".into(), speaker_id: "spk1".into() },
+            );
+            assert_eq!(&next, s, "UnlinkActiveSpeaker 不应改变状态:state={s:?}");
+            assert!(
+                matches!(
+                    fx.as_slice(),
+                    [Effect::DoUnlinkActiveSpeaker { note_id, speaker_id }]
+                        if note_id == "n1" && speaker_id == "spk1"
+                ),
+                "state={s:?} fx={fx:?}"
+            );
+
+            let (next, fx) = handle(
+                s,
+                &Msg::DeleteActiveSpeaker { note_id: "n1".into(), speaker_id: "spk1".into() },
+            );
+            assert_eq!(&next, s, "DeleteActiveSpeaker 不应改变状态:state={s:?}");
+            assert!(
+                matches!(
+                    fx.as_slice(),
+                    [Effect::DoDeleteActiveSpeaker { note_id, speaker_id }]
+                        if note_id == "n1" && speaker_id == "spk1"
                 ),
                 "state={s:?} fx={fx:?}"
             );
