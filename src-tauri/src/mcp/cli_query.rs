@@ -77,7 +77,7 @@ const NOTES_USAGE: &str = "用法: voice-notes notes <list|search|get|retitle|re
   search  <关键词> [--limit N] [--json]\n\
   get     <note-id> [--format md|txt|json] [--json]   # 默认 md;json = 逐句结构化;--json 是 --format json 的别名\n\
   get     … [--raw]  # 忽略修订稿,取原始逐字稿\n\
-  retitle [--dry-run] [--agent claude|codex|gemini|cursor] [--model M]\n\
+  retitle [--dry-run] [--agent claude|codex|gemini|cursor|pi] [--model M]\n\
           # AI 为仍是默认标题的会议生成主题标题(手动命名的绝不动);\n\
           # 缺省按 App 设置选执行体,--agent 强制走本机 Agent CLI\n\
   reaing  <note-id> | --all   # 触发「重新 Aing」(经运行中的 App,后台串行);\n\
@@ -294,7 +294,7 @@ fn run_retitle(args: &[String]) -> Result<i32, String> {
             // 显式指定 agent:bin 覆盖取该 kind 自己的档案(执行体分层后按 kind 定位,
             // 不再误用全局单一 bin 覆盖)。
             let kind = crate::refine::agent::AgentKind::from_key(&key)
-                .ok_or_else(|| format!("未知 agent: {key}(可用 claude|codex|gemini|cursor)"))?;
+                .ok_or_else(|| format!("未知 agent: {key}(可用 claude|codex|gemini|cursor|pi)"))?;
             let bin_override = s
                 .agent_profiles
                 .iter()

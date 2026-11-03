@@ -91,7 +91,7 @@ pub fn cli_main(args: &[String]) -> i32 {
             eprintln!(
                 "用法: voice-notes mcp <serve|register|unregister|status>\n\
                  serve                 以 stdio MCP 服务运行(供 Agent spawn)\n\
-                 register [--agent X]  注册到本机 Agent(X: claude-code|claude-desktop|cursor|codex|gemini|auto)\n\
+                 register [--agent X]  注册到本机 Agent(X: claude-code|claude-desktop|cursor|codex|gemini|pi|auto)\n\
                  unregister [--agent X]\n\
                  status [--json]       各 Agent 检测/注册状态"
             );
@@ -152,7 +152,7 @@ fn run_registry_cli(sub: &str, args: &[String]) -> i32 {
     let agent = match parse_agent(args) {
         Ok(a) => a.unwrap_or_else(|| "auto".into()),
         Err(()) => {
-            eprintln!("--agent 需要一个值(claude-code|claude-desktop|cursor|codex|gemini|auto)");
+            eprintln!("--agent 需要一个值(claude-code|claude-desktop|cursor|codex|gemini|pi|auto)");
             return 2;
         }
     };

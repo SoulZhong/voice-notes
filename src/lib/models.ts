@@ -26,7 +26,7 @@ export type LlmProfile = {
   api_key: string;
 };
 
-/** 本机 Agent 档案:kind ∈ claude|codex|gemini|cursor;bin 空 = 自动探测。 */
+/** 本机 Agent 档案:kind ∈ claude|codex|gemini|cursor|pi;bin 空 = 自动探测。 */
 export type AgentProfile = {
   kind: string;
   bin: string;

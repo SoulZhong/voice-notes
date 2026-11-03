@@ -256,7 +256,7 @@
       agentTesting = false;
     }
   }
-  /** 四家 CLI 探测结果(key → 路径或 null);onMount 拉一次,切到 agent 模式时展示。 */
+  /** 五家 CLI 探测结果(key → 路径或 null);onMount 拉一次,切到 agent 模式时展示。 */
   let agentProbe = $state<Record<string, string | null>>({});
   const agentMissing = $derived(!refineAgentBin.trim() && !agentProbe[refineAgent]);
   // modelHint 存 i18n 键,渲染处 t() 取值。
@@ -265,6 +265,7 @@
     { key: "codex", label: "Codex", modelHint: "ai.aing.agentModelHint.codex" },
     { key: "gemini", label: "Gemini", modelHint: "ai.aing.agentModelHint.gemini" },
     { key: "cursor", label: "Cursor", modelHint: "ai.aing.agentModelHint.cursor" },
+    { key: "pi", label: "Pi", modelHint: "ai.aing.agentModelHint.pi" },
   ];
   const selectedAgentOption = $derived(AGENT_OPTIONS.find((a) => a.key === refineAgent) ?? AGENT_OPTIONS[0]);
   /** 家目录缩写为 ~,长路径在 row-desc 里不至于喧宾夺主。 */
@@ -463,12 +464,13 @@
     return next;
   }
 
-  /** MCP 注册键 → 执行体 kind:可作 Aing 执行体的四家;其余(桌面端/第三方)仅注册接入。 */
+  /** MCP 注册键 → 执行体 kind:可作 Aing 执行体的五家;其余(桌面端/第三方)仅注册接入。 */
   const EXEC_KIND: Record<string, string> = {
     "claude-code": "claude",
     codex: "codex",
     gemini: "gemini",
     cursor: "cursor",
+    pi: "pi",
   };
   /** 智能体 tab 当前页(与在线模型同构,2026-08-11 冒烟反馈按智能体整合)。 */
   let selectedAgentKey = $state("claude-code");
@@ -476,7 +478,7 @@
   function selectAgentTab(key: string) {
     selectedAgentKey = key;
     const kind = EXEC_KIND[key];
-    if (kind) selectAgentKind(kind); // 执行体四家:同步装载该家 bin/model 编辑缓冲
+    if (kind) selectAgentKind(kind); // 执行体五家:同步装载该家 bin/model 编辑缓冲
   }
 
   /** Agent 卡:切编辑哪家 CLI(纯 UI 态,不落盘)/字段失焦保存该家档案。 */
@@ -635,7 +637,7 @@
 
   <!-- 执行体选项(功能区两个选择器共用):在线模型档案 + 本机 Agent,
        未就绪状态直接标注在选项文本里,不让用户选完才发现不可用。
-       forRelations:关系补建后端结构性只放行 Claude/Gemini(工具面收敛,见
+       forRelations:关系补建后端结构性只放行 Claude/Gemini/Pi(工具面收敛,见
        AgentRelationExecutor::new),其余 Agent 禁选并标注原因,不让用户选完
        跑一次预览/补建才发现必败(codex 2026-08-11 P2)。 -->
   {#snippet executorOptions(forRelations: boolean)}
@@ -650,7 +652,7 @@
     {/if}
     <optgroup label={t("ai.exec.groupAgent")}>
       {#each AGENT_OPTIONS as a (a.key)}
-        {@const relationsBlocked = forRelations && a.key !== "claude" && a.key !== "gemini"}
+        {@const relationsBlocked = forRelations && !["claude", "gemini", "pi"].includes(a.key)}
         <option value={"agent:" + a.key} disabled={relationsBlocked}>
           {a.label}{relationsBlocked
             ? ` · ${t("ai.exec.relationsUnsupported")}`
@@ -858,7 +860,7 @@
       {/if}
       <!-- 智能体 tab(与在线模型同构,2026-08-11 冒烟反馈):每家一页,探测/模型/
            CLI 路径/测试/MCP 注册/技能全在本家面板;绿点 = 已注册。可作 Aing 执行体
-           的四家(Claude Code/Codex/Gemini/Cursor)额外露出模型与路径配置。 -->
+           的五家(Claude Code/Codex/Gemini/Cursor/Pi)额外露出模型与路径配置。 -->
       <div class="provider-tabs" role="tablist">
         {#each mcpAgents as a (a.key)}
           <button

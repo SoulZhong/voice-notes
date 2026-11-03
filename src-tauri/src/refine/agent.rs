@@ -1,4 +1,4 @@
-//! A2 Aing 的 Agent provider:spawn 本机 Agent CLI(Claude Code / Codex / Gemini),
+//! A2 Aing 的 Agent provider:spawn 本机 Agent CLI(Claude Code / Codex / Gemini / Pi),
 //! 让它经自家 MCP server(`voice-notes mcp serve`)完成文本与图谱写回。Cursor CLI
 //! 仍可探测/生成标题，但其 headless 模式无法结构性关闭 write/shell 与用户级 MCP，
 //! 因而完整 Aing fail closed。与 llm.rs 的 HTTP provider 并列,由 lib.rs 按设置选择。
@@ -11,8 +11,8 @@
 //!
 //! 每次调用在系统临时目录建一次性工作区(scratch dir)作为子进程 cwd:
 //! - 隔离:避免 Agent 把用户某个项目目录当工作区,加载到无关的项目级配置/记忆;
-//! - 注入:Gemini 的 `.gemini/settings.json` 写进一次性工作区；Claude 用内联
-//!   --mcp-config + --strict-mcp-config，Codex 用 -c 覆盖，均不碰用户全局配置。
+//! - 注入:Gemini 的 `.gemini/settings.json`、Pi 的 `.pi/mcp.json` 写进一次性工作区；
+//!   Claude 用内联 --mcp-config + --strict-mcp-config，Codex 用 -c 覆盖，均不碰用户全局配置。
 
 use super::prompts;
 use crate::store::{load_refined, RefinedDoc, RefinedParagraph};
@@ -34,6 +34,8 @@ pub enum AgentKind {
     Codex,
     Gemini,
     Cursor,
+    /// Pi coding agent(pi.dev,`pi` CLI)。
+    Pi,
 }
 
 impl AgentKind {
@@ -44,6 +46,7 @@ impl AgentKind {
             "codex" => Some(Self::Codex),
             "gemini" => Some(Self::Gemini),
             "cursor" => Some(Self::Cursor),
+            "pi" => Some(Self::Pi),
             _ => None,
         }
     }
@@ -54,6 +57,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
             Self::Cursor => "cursor",
+            Self::Pi => "pi",
         }
     }
 
@@ -64,6 +68,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
             Self::Cursor => "cursor-agent",
+            Self::Pi => "pi",
         }
     }
 }
@@ -126,13 +131,14 @@ pub fn resolve_bin(kind: AgentKind, override_path: &str) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-/// 探测全部四家的解析结果,供设置页展示「已检测到/未检测到」。
+/// 探测全部五家的解析结果,供设置页展示「已检测到/未检测到」。
 pub fn probe_all() -> Vec<(&'static str, Option<String>)> {
     [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Gemini,
         AgentKind::Cursor,
+        AgentKind::Pi,
     ]
     .into_iter()
     .map(|k| (k.key(), resolve_bin(k, "").map(|p| p.display().to_string())))
@@ -208,6 +214,112 @@ fn mcp_servers_json(exe: &Path) -> serde_json::Value {
             }
         }
     })
+}
+
+/// pi 每次调用都带的静默开关:print 模式一发即退;不落会话文件;不读 AGENTS.md/CLAUDE.md;
+/// 不加载用户扩展/技能/提示模板/主题——输出稳定、启动快,用户扩展往 stderr 打的
+/// Warning 也随之消失(本来也不会被当失败:成败只看退出码与盘上终态)。
+const PI_BASE_ARGS: [&str; 7] = [
+    "-p",
+    "--no-session",
+    "--no-extensions",
+    "--no-skills",
+    "--no-context-files",
+    "--no-prompt-templates",
+    "--no-themes",
+];
+
+/// pi 把 MCP 工具命名为 `mcp__<server>__<tool>`,server 名里字母数字下划线以外的字符
+/// 一律换成 `_`——所以 voice-notes 的工具在 pi 里叫 mcp__voice_notes__*。
+fn pi_tool_allowlist(tools: &[&str]) -> String {
+    tools
+        .iter()
+        .map(|t| format!("mcp__voice_notes__{t}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// pi 用户级 MCP 配置路径(与 pi 自己的 getAgentDir 同口径:PI_CODING_AGENT_DIR 优先)。
+fn pi_user_mcp_path() -> Option<PathBuf> {
+    let dir = match std::env::var_os("PI_CODING_AGENT_DIR").filter(|v| !v.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => crate::mcp::home_dir().ok()?.join(".pi").join("agent"),
+    };
+    Some(dir.join("mcp.json"))
+}
+
+/// pi 没有 Claude 那样的 --strict-mcp-config:用户级 ~/.pi/agent/mcp.json 总会加载。
+/// 做法:在一次性工作区写项目级 `.pi/mcp.json`(配合 --approve 才会读),其中
+/// - voice-notes 条目 exposure=direct(工具直接声明给模型,不走 codemode 脚本);
+/// - 用户级每个其它 server 写一条只含 `enabled:false` 的覆盖——pi 规定无 command/url
+///   的项目条目只覆盖 enabled,这样它们不连接、不起进程、不进系统提示;
+/// - autoEnableCodemode=false,不激活 codemode 工具。
+///
+/// 真正的结构性边界是 argv 里的 `--tools` 白名单(带 mcp__ 前缀的条目会剔除其余 MCP
+/// 工具,内置 read/bash/edit/write 不在白名单也一并关掉);这里的覆盖是减少无关连接。
+fn pi_workspace_mcp(
+    exe: &Path,
+    extra_env: &[(&str, String)],
+    user_mcp_text: Option<&str>,
+) -> serde_json::Value {
+    let mut cfg = mcp_servers_json(exe);
+    let entry = &mut cfg["mcpServers"]["voice-notes"];
+    entry["exposure"] = serde_json::json!("direct");
+    for (k, v) in extra_env {
+        entry["env"][*k] = serde_json::Value::String(v.clone());
+    }
+    let user_names: Vec<String> = user_mcp_text
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .and_then(|v| {
+            v.get("mcpServers")?
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+        })
+        .unwrap_or_default();
+    for name in user_names {
+        // pi 视 - 与 _ 为同名;用户自己注册过的 voice-notes 由上面的完整条目整体替换。
+        if name.replace('-', "_") == "voice_notes" {
+            continue;
+        }
+        cfg["mcpServers"][name] = serde_json::json!({ "enabled": false });
+    }
+    cfg["autoEnableCodemode"] = serde_json::json!(false);
+    cfg
+}
+
+/// pi 的 Aing/关系补建命令:工作区 `.pi/mcp.json` + 工具白名单。tools 为 voice-notes
+/// 上允许的工具短名;extra_env 追加进 MCP server 条目的 env。
+fn pi_mcp_command(
+    cmd: &mut Command,
+    model: &str,
+    prompt: &str,
+    exe: &Path,
+    scratch: &Path,
+    tools: &[&str],
+    mut extra_env: Vec<(&str, String)>,
+) -> anyhow::Result<()> {
+    // e2e 经 VN_APP_DATA 把 serve 子进程指到隔离数据根;pi 是否把父进程环境透传给
+    // stdio server 不作假设,显式写进条目(调用方显式给的值优先)。生产不设此变量。
+    if let Ok(v) = std::env::var("VN_APP_DATA") {
+        if !v.is_empty() && !extra_env.iter().any(|(k, _)| *k == "VN_APP_DATA") {
+            extra_env.push(("VN_APP_DATA", v));
+        }
+    }
+    let user_text = pi_user_mcp_path().and_then(|p| std::fs::read_to_string(p).ok());
+    let cfg = pi_workspace_mcp(exe, &extra_env, user_text.as_deref());
+    let dir = scratch.join(".pi");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("mcp.json"), serde_json::to_vec_pretty(&cfg)?)?;
+    // --no-extensions 也会关掉内置 MCP 扩展,须 `-e builtin:mcp` 显式装回(显式 -e 不受
+    // --no-extensions 影响);--approve 让 pi 信任并读取工作区的 .pi/mcp.json。
+    cmd.args(PI_BASE_ARGS)
+        .args(["--approve", "-e", "builtin:mcp", "--tools"])
+        .arg(pi_tool_allowlist(tools));
+    if !model.is_empty() {
+        cmd.args(["--model", model]);
+    }
+    cmd.arg("--").arg(prompt);
+    Ok(())
 }
 
 /// 组装一次 Aing 调用:返回配置好参数/cwd 的 Command。scratch 已存在;按 kind 落好
@@ -306,6 +418,22 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph",
                 "Cursor Agent 当前无法把工具结构性限制为 voice-notes 四个 Aing 工具；为防止文件/shell 或用户级 MCP 绕过约束，本次 Aing 已安全拒绝"
             );
         }
+        AgentKind::Pi => {
+            pi_mcp_command(
+                &mut cmd,
+                model,
+                prompt,
+                exe,
+                scratch,
+                &[
+                    "get_note",
+                    "apply_refined_texts",
+                    "get_aing_context",
+                    "apply_aing_graph",
+                ],
+                vec![("VN_MCP_AGENT_MODE", "1".into())],
+            )?;
+        }
     }
     Ok(cmd)
 }
@@ -381,6 +509,24 @@ fn relation_command(
         AgentKind::Cursor => anyhow::bail!(
             "Cursor Agent 无法把工具结构性限制为两个关系 MCP 工具，本次补建已安全拒绝"
         ),
+        AgentKind::Pi => {
+            // --tools 白名单只放两只关系工具;关系补建要求模型非空(provenance 对账)。
+            pi_mcp_command(
+                &mut cmd,
+                model,
+                prompt,
+                exe,
+                scratch,
+                &["get_aing_context", "apply_aing_graph"],
+                vec![
+                    ("VN_MCP_AGENT_MODE", "1".into()),
+                    (
+                        "VN_APP_DATA",
+                        isolated_app_data.to_string_lossy().into_owned(),
+                    ),
+                ],
+            )?;
+        }
     }
     Ok(cmd)
 }
@@ -395,7 +541,7 @@ impl AgentRelationExecutor {
     pub fn new(kind: AgentKind, bin_override: &str, model: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(!model.trim().is_empty(), "Agent relation model 未配置");
         anyhow::ensure!(
-            matches!(kind, AgentKind::Claude | AgentKind::Gemini),
+            matches!(kind, AgentKind::Claude | AgentKind::Gemini | AgentKind::Pi),
             "{} Agent 无法结构性限制为两个关系 MCP 工具，本次补建已安全拒绝",
             kind.key()
         );
@@ -672,6 +818,14 @@ fn title_command(
                 cmd.args(["--model", model]);
             }
         }
+        AgentKind::Pi => {
+            // 文本模式 stdout 只有最终答复(实测无横幅、无工具日志);零工具零 MCP。
+            cmd.args(PI_BASE_ARGS).args(["--no-tools", "--no-mcp"]);
+            if !model.is_empty() {
+                cmd.args(["--model", model]);
+            }
+            cmd.arg("--").arg(prompt);
+        }
     }
     cmd
 }
@@ -726,6 +880,13 @@ fn identify_command(kind: AgentKind, bin: &Path, model: &str, scratch: &Path) ->
         }
         AgentKind::Cursor => {
             anyhow::bail!("Cursor print 模式无法结构性关闭 write/shell 工具,identify 已安全拒绝");
+        }
+        AgentKind::Pi => {
+            // -p 不给消息参数 → 从 stdin 读 prompt;--no-tools 关内置与扩展工具,--no-mcp 零 MCP。
+            cmd.args(PI_BASE_ARGS).args(["--no-tools", "--no-mcp"]);
+            if !model.is_empty() {
+                cmd.args(["--model", model]);
+            }
         }
     }
     Ok(cmd)
@@ -1264,9 +1425,11 @@ mod tests {
             AgentKind::Codex,
             AgentKind::Gemini,
             AgentKind::Cursor,
+            AgentKind::Pi,
         ] {
             assert_eq!(AgentKind::from_key(k.key()), Some(k));
         }
+        assert_eq!(AgentKind::Pi.bin_name(), "pi");
         assert_eq!(AgentKind::from_key("bogus"), None);
         assert_eq!(
             AgentKind::Cursor.bin_name(),
@@ -1474,6 +1637,181 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         );
     }
 
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+    }
+
+    #[test]
+    fn refine_command_pi_allowlists_four_tools_via_workspace_mcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = refine_command(
+            AgentKind::Pi,
+            Path::new("/bin/echo"),
+            "openai-codex/gpt-6.1-terra",
+            "P",
+            Path::new("/app/voice-notes"),
+            tmp.path(),
+        )
+        .unwrap();
+        let args = args_of(&cmd);
+        assert_eq!(
+            flag_value(&args, "--tools"),
+            Some(
+                "mcp__voice_notes__get_note,mcp__voice_notes__apply_refined_texts,\
+mcp__voice_notes__get_aing_context,mcp__voice_notes__apply_aing_graph"
+            ),
+            "pi 工具名里 server 名的连字符会变下划线: {args:?}"
+        );
+        for flag in [
+            "-p",
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--approve",
+        ] {
+            assert!(args.contains(&flag.to_string()), "缺 {flag}: {args:?}");
+        }
+        assert_eq!(
+            flag_value(&args, "-e"),
+            Some("builtin:mcp"),
+            "--no-extensions 后须显式装回内置 MCP"
+        );
+        assert!(
+            !args.contains(&"--no-mcp".to_string()),
+            "Aing 靠 MCP 写回,不能关"
+        );
+        assert_eq!(
+            flag_value(&args, "--model"),
+            Some("openai-codex/gpt-6.1-terra")
+        );
+        assert_eq!(
+            &args[args.len() - 2..],
+            ["--", "P"],
+            "prompt 在 -- 之后,免被当成选项"
+        );
+
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join(".pi/mcp.json")).unwrap())
+                .unwrap();
+        let vn = &cfg["mcpServers"]["voice-notes"];
+        assert_eq!(vn["command"], "/app/voice-notes");
+        assert_eq!(vn["args"], serde_json::json!(["mcp", "serve"]));
+        assert_eq!(
+            vn["exposure"], "direct",
+            "工具须直接声明给模型,不走 codemode"
+        );
+        assert_eq!(cfg["autoEnableCodemode"], false);
+
+        // 模型留空 → 不传 --model,pi 用自己的默认模型。
+        let tmp2 = tempfile::tempdir().unwrap();
+        let cmd = refine_command(
+            AgentKind::Pi,
+            Path::new("/bin/echo"),
+            "",
+            "P",
+            Path::new("/app/voice-notes"),
+            tmp2.path(),
+        )
+        .unwrap();
+        assert!(!args_of(&cmd).contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn pi_workspace_mcp_disables_every_user_level_server() {
+        let user = r#"{"mcpServers":{
+            "axiomos":{"url":"https://x/mcp","headers":{"A":"b"},"exposure":"direct"},
+            "voice_notes":{"command":"/old/vn","args":["mcp","serve"]},
+            "fs":{"command":"npx"}}}"#;
+        let cfg = pi_workspace_mcp(
+            Path::new("/app/vn"),
+            &[("VN_MCP_AGENT_MODE", "1".into())],
+            Some(user),
+        );
+        let servers = cfg["mcpServers"].as_object().unwrap();
+        assert_eq!(
+            servers["axiomos"],
+            serde_json::json!({ "enabled": false }),
+            "覆盖只含 enabled,不复制凭据"
+        );
+        assert_eq!(servers["fs"], serde_json::json!({ "enabled": false }));
+        assert!(
+            !servers.contains_key("voice_notes"),
+            "用户自己的 voice-notes 由完整条目替换,不禁用"
+        );
+        assert_eq!(servers["voice-notes"]["command"], "/app/vn");
+        // 用户配置缺失/坏档:只有自家条目,不报错。
+        for bad in [None, Some("not json"), Some("{}")] {
+            let cfg = pi_workspace_mcp(Path::new("/app/vn"), &[], bad);
+            assert_eq!(cfg["mcpServers"].as_object().unwrap().len(), 1, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn relation_command_pi_exposes_exactly_two_graph_tools_and_isolates_data_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_data = tmp.path().join("isolated-app-data");
+        let cmd = relation_command(
+            AgentKind::Pi,
+            Path::new("/bin/echo"),
+            "pi-model",
+            "P",
+            Path::new("/app/voice-notes"),
+            tmp.path(),
+            &app_data,
+        )
+        .unwrap();
+        let args = args_of(&cmd);
+        assert_eq!(
+            flag_value(&args, "--tools"),
+            Some("mcp__voice_notes__get_aing_context,mcp__voice_notes__apply_aing_graph")
+        );
+        assert_eq!(flag_value(&args, "--model"), Some("pi-model"));
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join(".pi/mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["mcpServers"]["voice-notes"]["env"]["VN_APP_DATA"],
+            app_data.to_string_lossy().as_ref(),
+            "MCP server 条目本身必须带隔离数据根"
+        );
+        assert!(AgentRelationExecutor::new(AgentKind::Pi, "/bin/echo", "m").is_ok());
+    }
+
+    #[test]
+    fn title_command_pi_is_tool_free_and_prompt_is_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = title_command(
+            AgentKind::Pi,
+            Path::new("/bin/echo"),
+            "",
+            "-起个标题",
+            tmp.path(),
+        );
+        let args = args_of(&cmd);
+        for flag in [
+            "-p",
+            "--no-tools",
+            "--no-mcp",
+            "--no-session",
+            "--no-extensions",
+            "--no-context-files",
+        ] {
+            assert!(args.contains(&flag.to_string()), "缺 {flag}: {args:?}");
+        }
+        assert!(!args.contains(&"--model".to_string()));
+        assert_eq!(&args[args.len() - 2..], ["--", "-起个标题"]);
+        assert!(!tmp.path().join(".pi").exists(), "标题不需要任何工作区配置");
+    }
+
     #[test]
     fn cursor_refine_fails_closed_without_a_structural_tool_allowlist() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1499,7 +1837,12 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
 
     #[test]
     fn every_supported_refine_command_selects_the_agent_only_mcp_surface() {
-        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini] {
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Gemini,
+            AgentKind::Pi,
+        ] {
             let tmp = tempfile::tempdir().unwrap();
             let cmd = refine_command(
                 kind,
@@ -1546,6 +1889,16 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
                             "get_aing_context",
                             "apply_aing_graph"
                         ])
+                    );
+                }
+                AgentKind::Pi => {
+                    let cfg: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(tmp.path().join(".pi/mcp.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        cfg["mcpServers"]["voice-notes"]["env"]["VN_MCP_AGENT_MODE"],
+                        "1"
                     );
                 }
                 AgentKind::Claude => {}
@@ -1857,9 +2210,9 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
     }
 
     #[test]
-    fn probe_all_covers_four_agents() {
+    fn probe_all_covers_five_agents() {
         let keys: Vec<&str> = probe_all().into_iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec!["claude", "codex", "gemini", "cursor"]);
+        assert_eq!(keys, vec!["claude", "codex", "gemini", "cursor", "pi"]);
     }
 
     /// 真机 e2e(默认 ignore):真 claude 走完整 run_refine 链路——spawn → 自家
@@ -1889,7 +2242,75 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("VN_APP_DATA", tmp.path()); // serve 子进程经环境继承同一数据根
         let note_id = "20260712-090000";
-        let note_dir = tmp.path().join("notes").join(note_id);
+        let note_dir = e2e_refine_fixture(tmp.path(), note_id);
+
+        let ctx = crate::ailog::Ctx {
+            data_root: tmp.path().to_path_buf(),
+            note_id: note_id.into(),
+        };
+        run_refine(
+            &note_dir,
+            note_id,
+            AgentKind::Claude,
+            &bin,
+            "haiku",
+            Some(&ctx),
+        )
+        .expect("真 claude Aing 应成功(需已登录)");
+        e2e_assert_refined_with_ailog(tmp.path(), &note_dir, note_id, "claude");
+        std::env::remove_var("VN_APP_DATA");
+    }
+
+    /// 真机 e2e(默认 ignore):真 pi 走完整 run_refine 链路,与 claude 版同一断言。
+    /// 运行:VN_SELF_EXE=<voice-notes 二进制> [VN_PI_MODEL=provider/id] cargo test \
+    ///       --features devtools --lib e2e_pi_refine -- --ignored --nocapture
+    /// 模型留空 = pi 默认模型。
+    #[test]
+    #[ignore]
+    fn e2e_pi_refine_leaves_full_ailog_trail() {
+        let Ok(self_exe) = std::env::var("VN_SELF_EXE") else {
+            eprintln!("跳过:未设 VN_SELF_EXE(需指向 voice-notes 二进制)");
+            return;
+        };
+        assert!(
+            Path::new(&self_exe).is_file(),
+            "VN_SELF_EXE 不存在: {self_exe}"
+        );
+        let Some(bin) = resolve_bin(AgentKind::Pi, "") else {
+            eprintln!("跳过:本机未检测到 pi CLI");
+            return;
+        };
+        let model = std::env::var("VN_PI_MODEL").unwrap_or_default();
+        let _guard = crate::mcp::ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("VN_APP_DATA", tmp.path());
+        let note_id = "20260712-090000";
+        let note_dir = e2e_refine_fixture(tmp.path(), note_id);
+        let ctx = crate::ailog::Ctx {
+            data_root: tmp.path().to_path_buf(),
+            note_id: note_id.into(),
+        };
+        let started = std::time::Instant::now();
+        let r = run_refine(&note_dir, note_id, AgentKind::Pi, &bin, &model, Some(&ctx));
+        eprintln!("pi run_refine 用时 {:?}: {r:?}", started.elapsed());
+        r.expect("真 pi Aing 应成功(需已登录)");
+        let after = load_refined(&note_dir).unwrap();
+        for p in &after.paragraphs {
+            eprintln!("修订后: {}", p.text);
+        }
+        e2e_assert_refined_with_ailog(tmp.path(), &note_dir, note_id, "pi");
+
+        // 标题一发一收(零工具零 MCP)也顺带真跑一次。
+        let title = gen_title(AgentKind::Pi, &bin, &model, &after.paragraphs, None);
+        eprintln!("pi 标题: {title:?}");
+        assert!(title.is_ok(), "{title:?}");
+        std::env::remove_var("VN_APP_DATA");
+    }
+
+    fn e2e_refine_fixture(root: &Path, note_id: &str) -> PathBuf {
+        let note_dir = root.join("notes").join(note_id);
         std::fs::create_dir_all(&note_dir).unwrap();
         std::fs::write(
             note_dir.join("meta.json"),
@@ -1926,22 +2347,11 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
             ),
         )
         .unwrap();
+        note_dir
+    }
 
-        let ctx = crate::ailog::Ctx {
-            data_root: tmp.path().to_path_buf(),
-            note_id: note_id.into(),
-        };
-        run_refine(
-            &note_dir,
-            note_id,
-            AgentKind::Claude,
-            &bin,
-            "haiku",
-            Some(&ctx),
-        )
-        .expect("真 claude Aing 应成功(需已登录)");
-
-        let after = load_refined(&note_dir).unwrap();
+    fn e2e_assert_refined_with_ailog(root: &Path, note_dir: &Path, note_id: &str, provider: &str) {
+        let after = load_refined(note_dir).unwrap();
         assert_eq!(after.stages.llm, "done");
         assert_eq!(after.paragraphs.len(), 3);
         assert!(
@@ -1951,7 +2361,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         );
 
         // 日志两侧齐:本进程的 agent_refine + serve 子进程的 mcp_apply。
-        let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
+        let v = crate::ailog::query(root, &crate::ailog::Filter::default());
         eprintln!("=== AI 日志({} 条)===", v["total"]);
         for e in v["entries"].as_array().unwrap() {
             eprintln!("{}", serde_json::to_string_pretty(e).unwrap());
@@ -1962,7 +2372,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
             .find(|e| e["kind"] == "agent_refine")
             .expect("缺 agent_refine 条目");
         assert_eq!(agent["status"], "ok");
-        assert_eq!(agent["provider"], "claude");
+        assert_eq!(agent["provider"], provider);
         assert!(agent["request"]["prompt"]
             .as_str()
             .unwrap()
@@ -1977,7 +2387,6 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
             !apply["request"]["updates"].as_array().unwrap().is_empty(),
             "写回应含逐段修订全文"
         );
-        std::env::remove_var("VN_APP_DATA");
     }
     // ─────────── Agent identify 执行体测试 ───────────
 
@@ -2030,6 +2439,12 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         let settings = std::fs::read_to_string(tmp.path().join(".gemini/settings.json")).unwrap();
         assert!(settings.contains("\"coreTools\":[]"));
         assert!(settings.contains("\"mcpServers\":{}"));
+        // Pi:零工具零 MCP,无消息参数 = stdin 读 prompt。
+        let cmd = identify_command(AgentKind::Pi, bin, "", tmp.path()).unwrap();
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"--no-tools".to_string()) && args.contains(&"--no-mcp".to_string()), "{args:?}");
+        assert!(args.contains(&"--no-session".to_string()), "{args:?}");
+        assert!(args.iter().all(|a| a.starts_with('-')), "prompt 绝不进 argv: {args:?}");
         // Cursor:构造即拒。
         assert!(identify_command(AgentKind::Cursor, bin, "", tmp.path()).is_err());
     }

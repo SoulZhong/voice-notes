@@ -124,6 +124,7 @@ fn configured_provider(settings: &Settings) -> anyhow::Result<(&'static str, Str
                     k,
                     crate::refine::agent::AgentKind::Claude
                         | crate::refine::agent::AgentKind::Gemini
+                        | crate::refine::agent::AgentKind::Pi
                 ),
                 "{kind} Agent 无法结构性限制为两个关系 MCP 工具，本次补建已安全拒绝"
             );
