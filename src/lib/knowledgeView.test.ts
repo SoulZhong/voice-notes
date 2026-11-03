@@ -14,6 +14,7 @@ import {
   graphDragPosition,
   graphSimulationTickBudget,
   legacyFallbackGraph,
+  mergeCooccurrenceEdges,
   nextExpandedIds,
   pathEmphasis,
   preserveGraphExplorationState,
@@ -794,7 +795,7 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("const fixture = await semanticGraphDebugFixture()");
     expect(route).toContain("debugFixtureSession = fixture.session_id");
     expect(route).toContain("semanticGraphDebugRelationDetail");
-    expect(route).toContain('import { onDestroy, onMount } from "svelte"');
+    expect(route).toMatch(/import \{ onDestroy, onMount\b[^}]*\} from "svelte"/);
     expect(route).toContain("const releaseDebugFixtureOnce = createDebugFixtureReleaseOnce(");
     expect(route).toContain("onDestroy(() => {");
     expect(route).toContain("debugFixtureDisposed = true");
@@ -1084,5 +1085,20 @@ describe("exploratory graph UI source contract", () => {
     expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel (?::global\()?input[\s\S]*min-height:\s*44px/);
     expect(finePointerStyles).not.toMatch(/\.graph-global\s*\{[^}]*min-height:\s*44px/s);
     expect(finePointerStyles).not.toMatch(/\.gchip\s*\{[^}]*min-inline-size:\s*44px/s);
+  });
+});
+
+describe("cooccurrence expansion (#732)", () => {
+  it("merges on-demand neighbor edges without duplicating an unordered pair", () => {
+    const base = [{ a: "e:a", b: "e:b", weight: 3 }];
+    const extra = [
+      { a: "e:b", b: "e:a", weight: 1 },
+      { a: "e:a", b: "e:c", weight: 1 },
+    ];
+    expect(mergeCooccurrenceEdges(base, extra)).toEqual([
+      { a: "e:a", b: "e:b", weight: 3 },
+      { a: "e:a", b: "e:c", weight: 1 },
+    ]);
+    expect(mergeCooccurrenceEdges(base, [])).toBe(base);
   });
 });

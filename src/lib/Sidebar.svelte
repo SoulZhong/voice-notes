@@ -150,6 +150,17 @@
       return e.name.toLowerCase().includes(q) || e.aliases.some((a) => a.toLowerCase().includes(q));
     }),
   );
+  // 只渲染前 200 行(已按出现篇数降序):真实库 7000+ 个实体一次铺满 DOM,打开图谱页时
+  // 侧栏这一下就阻塞约 440ms(#732)。搜索仍在全量里找;当前选中的实体不在前 200 也补上。
+  const GRAPH_LIST_CAP = 200;
+  const graphListed = $derived.by(() => {
+    const head = graphShown.slice(0, GRAPH_LIST_CAP);
+    if (graphSelected && !head.some((e) => e.id === graphSelected)) {
+      const current = graphShown.find((e) => e.id === graphSelected);
+      if (current) head.push(current);
+    }
+    return head;
+  });
   const graphNotesShown = $derived(
     graphNotes.filter((note) => {
       const q = graphFilter.query.trim().toLowerCase();
@@ -714,7 +725,7 @@
         <p class="hint">{graphEnts.length === 0 ? t("shell.graph.emptyEntities") : t("shell.graph.noMatchEntities")}</p>
       {/if}
       <ul class="list">
-        {#each graphShown as e (e.id)}
+        {#each graphListed as e (e.id)}
           <li class="entity-row">
             <a class="item entity" class:current={graphSelected === e.id} href={entityHref(e)}>
               <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
@@ -726,6 +737,9 @@
           </li>
         {/each}
       </ul>
+      {#if graphShown.length > GRAPH_LIST_CAP}
+        <p class="hint">{t("shell.graph.moreEntities", { n: graphShown.length - GRAPH_LIST_CAP })}</p>
+      {/if}
     {:else}
       {#if graphNotesShown.length === 0}
         <p class="hint">{noteGraphState.status === "error" ? t("shell.graph.notesLoadFailed") : graphNotes.length === 0 ? t("shell.graph.emptyNotes") : t("shell.notes.noMatch")}</p>

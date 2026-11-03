@@ -150,6 +150,10 @@ export function kindSoft(kind: string): string {
 export const graphEntities = () => invoke<EntitySummary[]>("graph_entities");
 /** 力导图数据(实体视角:节点=实体,边=共现的共享笔记数)。 */
 export const graphData = () => invoke<GraphData>("graph_data");
+/** 展开一个实体:共享篇数前 `limit` 个邻居(跳过 `exclude`),含只共享 1 篇的。
+    `graph_data` 默认只给共享 ≥2 篇的边,只共享 1 篇的边只从这里来(#732)。 */
+export const graphNeighbors = (entityId: string, exclude: string[], limit = 8) =>
+  invoke<EdgeRow[]>("graph_neighbors", { entityId, exclude, limit });
 /** 力导图数据(文章视角:节点=笔记[name=标题、note_count=该笔记实体数],边=两篇笔记
     共享的实体数)。实体视角的对偶,复用同一 GraphData/ForceGraph。 */
 export const noteGraphData = () => invoke<GraphData>("note_graph_data");

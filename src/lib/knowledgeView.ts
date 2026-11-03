@@ -1,5 +1,5 @@
 import { t } from "$lib/i18n/index.svelte";
-import type { EntitySummary, GraphData, RenderEdge } from "./graph";
+import type { EdgeRow, EntitySummary, GraphData, RenderEdge } from "./graph";
 import type {
   KnowledgeFilter,
   KnowledgePath,
@@ -604,6 +604,23 @@ export function legacyFallbackGraph(
     semantic_edges: [],
     cooccurrence_edges: legacy.edges,
   };
+}
+
+/** 共现边按无序端点对去重合并:`extra`(展开时按需取回的)补进 `base`(默认下发的),
+ *  同一对以 `base` 为准。 */
+export function mergeCooccurrenceEdges(base: EdgeRow[], extra: EdgeRow[]): EdgeRow[] {
+  if (extra.length === 0) return base;
+  const key = (edge: EdgeRow) =>
+    compareStrings(edge.a, edge.b) <= 0 ? `${edge.a}\u0000${edge.b}` : `${edge.b}\u0000${edge.a}`;
+  const seen = new Set(base.map(key));
+  const merged = [...base];
+  for (const edge of extra) {
+    const k = key(edge);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    merged.push(edge);
+  }
+  return merged;
 }
 
 export function semanticRequestFailureMessage(hasLegacyFallback: boolean): string {
