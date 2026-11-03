@@ -31,3 +31,21 @@ describe("全量扫描下的旧类名冲突", () => {
     expect(css).toContain('@source not inline("{container,hidden,inline,ring}");');
   });
 });
+
+describe("经典皮肤预览卡与 :root 一致", () => {
+  it("[data-vn-theme-preview=classic] 的每个 token 与 :root 同值", () => {
+    const app = runtime.process.getBuiltinModule("fs").readFileSync(`${runtime.process.cwd()}/src/app.css`, "utf8");
+    const block = (sel: string) => {
+      const i = app.indexOf(sel);
+      return app.slice(i, app.indexOf("}", i));
+    };
+    const root = block(":root {");
+    const preview = block('[data-vn-theme-preview="classic"] {');
+    const decls = [...preview.matchAll(/^\s*(--[\w-]+):\s*([^;]+);/gm)];
+    expect(decls.length).toBeGreaterThan(10);
+    for (const [, k, v] of decls) {
+      const m = root.match(new RegExp(`^\\s*${k}:\\s*([^;]+);`, "m"));
+      expect(m?.[1], k).toBe(v);
+    }
+  });
+});

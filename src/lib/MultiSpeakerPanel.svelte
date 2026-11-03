@@ -332,7 +332,11 @@
                   {:else}
                     <span class="tag">{t("speakers.multi.unknownOrigin")}</span>
                     <label class="row-check inline">
-                      <Checkbox bind:checked={extraDelete[sp.path]} />
+                      <!-- 不用 bind:extraDelete[path]:键初始不存在,传 undefined 给 $bindable(false) 会抛 props_invalid_value(Codex P1) -->
+                      <Checkbox
+                        checked={extraDelete[sp.path] ?? false}
+                        onCheckedChange={(v) => (extraDelete[sp.path] = v)}
+                      />
                       {t("speakers.delete")}
                     </label>
                   {/if}

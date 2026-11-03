@@ -213,15 +213,17 @@
           spacing={1}
           class={segGroupClass}
           aria-label={t("hooks.field.kind.label")}
-          value={cfg.kind}
-          onValueChange={(v) => {
-            // 单选分段:再点已选项会被 bits 报成空值,视为不变(旧单选框也无法取消)
-            if (!v || v === cfg!.kind) return;
-            cfg!.kind = v as HookKind;
-            cfg!.webhook_type =
-              v === "feishu" || v === "wecom" ? v : "generic";
-            testResult = null;
-          }}
+          bind:value={
+            // 单选分段:再点已选项 bits 会写入空串;函数绑定的 setter 拒收,getter 仍给原值,
+            // 控件不会停在「无选中」(单向 value + onValueChange 拦不住,Codex P2)。
+            () => cfg!.kind,
+            (v) => {
+              if (!v || v === cfg!.kind) return;
+              cfg!.kind = v as HookKind;
+              cfg!.webhook_type = v === "feishu" || v === "wecom" ? v : "generic";
+              testResult = null;
+            }
+          }
         >
           {#each [
             ["shell", "Shell"],
@@ -274,12 +276,14 @@
               spacing={1}
               class={segGroupClass}
               aria-label={t("hooks.field.style.label")}
-              value={cfg.webhook_message_style}
-              onValueChange={(v) => {
-                if (!v || v === cfg!.webhook_message_style) return;
-                cfg!.webhook_message_style = v as "text" | "rich";
-                testResult = null;
-              }}
+              bind:value={
+                () => cfg!.webhook_message_style,
+                (v) => {
+                  if (!v || v === cfg!.webhook_message_style) return;
+                  cfg!.webhook_message_style = v as "text" | "rich";
+                  testResult = null;
+                }
+              }
             >
               {#each [["rich", cfg.kind === "feishu" ? t("hooks.style.rich") : "Markdown"], ["text", t("hooks.style.plain")]] as [v, label] (v)}
                 <ToggleGroup.Item value={v} class={segItemClass}>{label}</ToggleGroup.Item>

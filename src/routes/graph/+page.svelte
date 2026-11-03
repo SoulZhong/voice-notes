@@ -598,6 +598,9 @@
       closeCtxMenu();
       return;
     }
+    // 弹层(Select/AlertDialog/Popover…)已经处理过这次 Esc:bits-ui 在 document 冒泡阶段对原事件
+    // preventDefault。不看这一位的话,关一个下拉会连带关掉抽屉、丢掉没提交的编辑(Codex P2)。
+    if (event.defaultPrevented) return;
     if (document.querySelector("dialog[open]")) return;
     if (relationId) closeRelation();
     else if (selected) closeEntity();
@@ -605,7 +608,14 @@
   }
 </script>
 
-<svelte:window onkeydown={handleEscape} />
+<!-- 菜单开着时在菜单外再右键:先关掉旧菜单(捕获阶段,早于节点自己的右键处理),节点右键随后会在
+     新位置重新打开。DropdownMenu 的「点外面关闭」不认右键,原遮罩是显式处理 oncontextmenu 的(Codex P2)。 -->
+<svelte:window
+  onkeydown={handleEscape}
+  oncontextmenucapture={(e) => {
+    if (ctxMenu && !(e.target as Element | null)?.closest?.('[data-slot="dropdown-menu-content"]')) closeCtxMenu();
+  }}
+/>
 
 <div class="graph-main">
   {#if graphFilter.mode === "note" && !debugFixtureRequested}
@@ -799,7 +809,7 @@
 
 {#if ctxMenu}
   <!-- 右键菜单:锚在鼠标位置的零尺寸触发点上;Esc 仍由本页 handleEscape 统一处理(只关菜单,
-       不连带关详情),所以内容层关掉 bits 自带的 Esc 行为。点外面/右键外面 → onOpenChange 关。 -->
+       不连带关详情),所以内容层关掉 bits 自带的 Esc 行为。点外面 → onOpenChange 关;右键外面见 svelte:window。 -->
   <DropdownMenu.Root open={true} onOpenChange={(open) => { if (!open) closeCtxMenu(); }}>
     <DropdownMenu.Trigger>
       {#snippet child({ props })}

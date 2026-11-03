@@ -99,12 +99,16 @@
       type="single"
       spacing={1}
       class="flex-none rounded-md bg-[var(--surface-press)] p-0.5"
-      value={kind || ALL_KIND}
-      onValueChange={(v) => {
-        if (!v) return; // 再点已选项:保持不变
-        const next = v === ALL_KIND ? "" : v;
-        if (next !== kind) setKind(next);
-      }}
+      bind:value={
+        // 函数绑定:再点已选项时 bits 会写入空串,setter 拒收、getter 仍给原值,控件不会变成「无选中」
+        // (单向 value + onValueChange 拦不住:bits 先改内部值再回调,Codex P2)。
+        () => kind || ALL_KIND,
+        (v) => {
+          if (!v) return;
+          const next = v === ALL_KIND ? "" : v;
+          if (next !== kind) setKind(next);
+        }
+      }
     >
       {#each KIND_TABS as tab (tab.key)}
         <ToggleGroup.Item

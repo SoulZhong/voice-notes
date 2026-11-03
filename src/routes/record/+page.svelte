@@ -1274,9 +1274,6 @@
         sideOffset={4}
         role="menu"
         class="w-auto min-w-32 gap-0 p-1 text-[0.85rem]"
-        onEscapeKeydown={(e) => {
-          if ((e.target as Element | null)?.closest?.("[data-spk-rename]")) e.preventDefault();
-        }}
       >
         {#each speakerIds as sid (sid)}
           <Button variant="ghost" size="sm" class={spkItemCls} role="menuitem" onclick={() => pickSpeaker(line, sid)}>
@@ -1295,7 +1292,11 @@
               onkeydown={(e) => {
                 if (e.isComposing) return;
                 if (e.key === "Enter") commitRename(line);
-                if (e.key === "Escape") renamingSeq = null;
+                if (e.key === "Escape") {
+                  // 只退出改名、不关菜单:在输入框上截住冒泡,菜单的 Esc 层(document 冒泡阶段)收不到。
+                  e.stopPropagation();
+                  renamingSeq = null;
+                }
               }}
               onblur={() => commitRename(line)}
             />

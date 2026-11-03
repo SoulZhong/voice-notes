@@ -115,6 +115,29 @@
  * 对比度底线同 classic:ink-faint 对 canvas ≥ 4.5:1 级(时间戳/占位不发虚)。
  * ============================================================ */
 
+/* 皮肤预览卡里的「经典」:当前皮肤是 Paper/Nord 时,卡片也得显示经典的真值,不能继承当前皮肤
+   (Codex P3)。只列各皮肤会覆盖的那几组;取值与上面 :root 一致,改 :root 时同步改这里
+   (tailwindGuard.test.ts 有一致性断言)。 */
+[data-vn-theme-preview="classic"] {
+  --canvas: light-dark(#fafafa, #07080a);
+  --surface: light-dark(#f1f1f2, #0d0d0d);
+  --surface-soft: light-dark(#ebebec, #121212);
+  --surface-press: light-dark(#e3e3e5, #1a1b1c);
+  --hairline: light-dark(#e4e5e6, #242728);
+  --hairline-strong: light-dark(#c9cacc, #3a3d40);
+  --ink: light-dark(#18191a, #f4f4f6);
+  --ink-secondary: light-dark(#5c5d5f, #9c9c9d);
+  --ink-faint: light-dark(#737476, #6a6b6c);
+  --accent: light-dark(#0f7fd1, #57c1ff);
+  --accent-pressed: light-dark(#0c6ab0, #3fa9e8);
+  --accent-tint: light-dark(rgba(15, 127, 209, 0.1), rgba(87, 193, 255, 0.15));
+  --accent-tint-soft: light-dark(rgba(15, 127, 209, 0.05), rgba(87, 193, 255, 0.08));
+  --on-accent: light-dark(#ffffff, #07080a);
+  --primary: light-dark(#18191a, #ffffff);
+  --primary-pressed: light-dark(#2c2d2f, #e8e8e8);
+  --on-primary: light-dark(#ffffff, #18191a);
+}
+
 /* Paper:暖灰低彩,亮色近纸、暗色对应暖深灰;长时间阅读整理用。不宣称护眼。 */
 :root[data-vn-theme="paper"],
 [data-vn-theme-preview="paper"] {

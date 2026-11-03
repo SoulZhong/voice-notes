@@ -227,6 +227,42 @@ try {
     await page.screenshot({ path: join(out, "flow-memo-panel.png") });
     await page.close();
   });
+  // 8. Codex 复审回归:单选分段再点已选项,不能变成「无选中」(bits 先改内部值再回调)
+  await scenario("单选分段:再点已选项仍保持选中", async () => {
+    const { page, errors } = await openPage("/ai/logs", { family: "classic", mode: "light" });
+    const on = () => page.$$eval('[data-slot="toggle-group-item"][data-state="on"]', (els) => els.length);
+    assert((await on()) === 1, "初始应恰有一项选中");
+    await page.click('[data-slot="toggle-group-item"][data-state="on"]');
+    await new Promise((r) => setTimeout(r, 200));
+    assert((await on()) === 1, "再点已选项后变成了无选中");
+    const bad = errors.filter((e) => !benign(e));
+    assert(bad.length === 0, "页面错误:\n" + bad.join("\n"));
+    await page.close();
+  });
+
+  // 9. Codex 复审回归:设置页开关切换一次只保存一次,且值正确
+  await scenario("设置页开关:切一次只落盘一次", async () => {
+    const { page } = await openPage("/settings", { family: "nord", mode: "dark" });
+    const before = (await calls(page, "set_settings")).length;
+    const sw = await page.$$('[data-slot="switch"]');
+    assert(sw.length > 3, "设置页开关太少,疑似没渲染");
+    // 「菜单栏常驻」走 set_settings 落盘(自启/统计等走各自命令,不在此断言范围)
+    const handle = await page.evaluateHandle(() => {
+      const row = [...document.querySelectorAll(".row")].find((r) => r.textContent?.includes("菜单栏常驻"));
+      return row?.querySelector('[data-slot="switch"]') ?? null;
+    });
+    const target = handle.asElement();
+    assert(target, "没找到「菜单栏常驻」开关");
+    const was = await target.evaluate((el) => el.getAttribute("data-state"));
+    await target.click();
+    await new Promise((r) => setTimeout(r, 300));
+    const after = await calls(page, "set_settings");
+    assert(after.length - before === 1, `切一次开关落盘了 ${after.length - before} 次`);
+    assert(JSON.stringify(after.at(-1).args).includes(`"tray_enabled":${was !== "checked"}`), "落盘的 tray_enabled 值不对");
+    const now = await target.evaluate((el) => el.getAttribute("data-state"));
+    assert(now !== was, "开关状态没变");
+    await page.close();
+  });
 } finally {
   await browser.close();
   vite.kill();

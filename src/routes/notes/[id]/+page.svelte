@@ -4356,7 +4356,7 @@
     left: 50%;
     transform: translateX(-50%);
     bottom: 18px;
-    z-index: 55;
+    z-index: 45; /* 低于模态层(z-50):多人处理面板打开时浮条必须被遮罩盖住、点不到(Codex P2) */
     display: flex;
     gap: 14px;
     align-items: center;

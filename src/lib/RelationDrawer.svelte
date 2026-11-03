@@ -204,7 +204,9 @@
 
   function handleEscape(event: KeyboardEvent) {
     // 否决确认框开着时 Esc 只关确认框(bits-ui 自己处理),不连带关抽屉。
-    if (event.key === "Escape" && !suppressOpen && !document.querySelector("dialog[open]")) onClose();
+    // defaultPrevented:确认框/下拉等 bits 弹层已处理这次 Esc(它在 document 冒泡阶段 preventDefault,
+    // 而确认框此刻已同步关掉、suppressOpen 已回 false,只看 suppressOpen 拦不住)。
+    if (event.key === "Escape" && !event.defaultPrevented && !suppressOpen && !document.querySelector("dialog[open]")) onClose();
   }
 </script>
 

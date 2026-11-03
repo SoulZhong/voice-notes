@@ -28,7 +28,7 @@
       {disabled}
       onclick={() => onSelect(f)}
     >
-      <span class="mock" data-vn-theme-preview={f === "classic" ? undefined : f} class:classic={f === "classic"}>
+      <span class="mock" data-vn-theme-preview={f}>
         <span class="side"><i></i><i></i><i></i></span>
         <span class="body">
           <span class="line w80"></span>
