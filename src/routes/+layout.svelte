@@ -1,5 +1,6 @@
 <script lang="ts">
   import "../app.css";
+  import "$lib/ui/tailwind.css";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
@@ -32,10 +33,14 @@
 
   let { children } = $props();
 
-  // 备注浮窗(/memo-panel)是另一个 webview 窗口:只要主题与语言,**不跑**主窗口的任何
-  // 启动副作用(录制监听会在停录时 goto 笔记页、播放态上报会把主窗口的播放态冲掉、
-  // 升级检查/欢迎页/侧栏都不属于浮窗)。按窗口加载时的路径判定,浮窗不会在内部导航。
-  const bare = typeof window !== "undefined" && window.location.pathname.startsWith("/memo-panel");
+  // 两个「裸」路由不挂侧栏、不跑主窗口的启动副作用(录制监听会在停录时 goto 笔记页、播放态
+  // 上报会冲掉主窗口的播放态、升级检查/欢迎页/侧栏都不属于它们),只设主题与语言:
+  // - /memo-panel:备注浮窗,另一个 webview 窗口;
+  // - /ui-gallery:开发用主题预览台,不在 Tauri 里也要能打开(无头浏览器截图)。
+  // 按窗口加载时的路径判定,两者都不会在内部导航到别的路由。
+  const bare =
+    typeof window !== "undefined" && /^\/(memo-panel|ui-gallery)(\/|$)/.test(window.location.pathname);
+  const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
   // 迷你播放浮层的显示判定复用同一个纯函数(与 MiniPlayer.svelte 内部判定同源),
   // 避免这里再造一份、和浮层实际是否渲染不同步——那样安全区可能在浮层没显示时白留一块空白,
@@ -140,12 +145,13 @@
 
   onMount(() => {
     if (bare) {
-      getSettings()
-        .then((s) => {
-          applyTheme(s.theme);
-          i18n.setChoice(s.ui_lang);
-        })
-        .catch(() => {});
+      if (inTauri)
+        getSettings()
+          .then((s) => {
+            applyTheme(s.theme, s.theme_family);
+            i18n.setChoice(s.ui_lang);
+          })
+          .catch(() => {});
       return;
     }
     // 分析初始化放最前:页面浏览与异常捕获越早装上覆盖面越大。
@@ -164,7 +170,7 @@
     // 主题保持默认(等价跟随系统),语言保持 i18n 默认(zh,与历史行为一致)
     getSettings()
       .then((s) => {
-        applyTheme(s.theme);
+        applyTheme(s.theme, s.theme_family);
         i18n.setChoice(s.ui_lang);
       })
       .catch(() => {});

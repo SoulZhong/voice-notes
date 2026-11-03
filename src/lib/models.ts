@@ -57,6 +57,8 @@ export type Settings = {
   speaker_model: string;
   // "system" | "light" | "dark";具体枚举/校验留给后续任务,这里先补字段让 applyTheme 能读到值
   theme: string;
+  /** 皮肤:"classic" | "paper" | "nord"(UI 改版 #730);未知值按 classic。 */
+  theme_family: string;
   // UI 语言:"system" | "zh" | "en"。注意与 language_filter(转写乱码过滤)无关。
   ui_lang: string;
   /** 麦克风采集路径逃生舱:"aec"(默认,普通输入 + 软件 AEC)/ "vpio"(通话模式,系统级

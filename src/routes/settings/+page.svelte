@@ -4,7 +4,8 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import { recording } from "$lib/recording.svelte";
-  import { applyTheme } from "$lib/theme";
+  import { applyTheme, normalizeFamily, type ThemeFamily } from "$lib/theme";
+  import ThemeFamilyPicker from "$lib/ThemeFamilyPicker.svelte";
   import { i18n, t } from "$lib/i18n/index.svelte";
   import { acceleratorFromEvent, displayShortcut } from "$lib/shortcut";
   import {
@@ -144,6 +145,7 @@
   // 勾选/选中改到新态),本地 state 显式改回旧值必触发 DOM 对齐——与 asrChoice 同理。
   /** 外观主题 radio:"light" | "dark" | "system"。 */
   let themeChoice = $state("system");
+  let familyChoice = $state<ThemeFamily>("classic");
   /** UI 语言 radio:"system" | "zh" | "en"。 */
   let langChoice = $state("system");
   /** 设置开关的本地镜像(为什么用本地 state 见上方注释)。 */
@@ -344,6 +346,7 @@
   /** 把后端真值同步到各本地镜像(初始化 / 保存失败回弹后重新对齐 DOM)。 */
   function syncLocalFromSettings(s: Settings) {
     themeChoice = s.theme;
+    familyChoice = normalizeFamily(s.theme_family);
     langChoice = s.ui_lang;
     langFilter = s.language_filter;
     autoInputPick = s.auto_input_pick;
@@ -556,9 +559,10 @@
     try {
       const fresh = await getSettings();
       fresh.theme = themeChoice;
+      fresh.theme_family = familyChoice;
       await setSettings(fresh);
       settings = fresh;
-      applyTheme(themeChoice);
+      applyTheme(themeChoice, familyChoice);
     } catch (e) {
       error = t("settings.theme.switchFailed", { e });
       settings = await getSettings().catch(() => settings);
@@ -931,6 +935,20 @@
           value={themeChoice}
           onSelect={(id) => {
             themeChoice = id;
+            changeTheme();
+          }}
+        />
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.themeFamily.label")}</span>
+          <span class="row-desc">{t("settings.themeFamily.desc")}</span>
+        </div>
+        <ThemeFamilyPicker
+          value={familyChoice}
+          disabled={!settings}
+          onSelect={(f) => {
+            familyChoice = f;
             changeTheme();
           }}
         />

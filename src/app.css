@@ -106,6 +106,60 @@
 }
 
 /* ============================================================
+ * 主题家族(皮肤)× 明暗(UI 改版 #730)
+ *
+ * 皮肤与明暗是两件事:皮肤由根元素 data-vn-theme 选(classic 即上面 :root 的取值,
+ * 不另写),明暗仍由 color-scheme 驱动 light-dark()。每套皮肤只改「表面阶梯 + 文字 +
+ * 发丝线 + accent + primary」这几组;录制红、danger/warning/success、说话人色在所有
+ * 皮肤里保持一致——它们是语义信号,换肤不能换掉意思。
+ * 对比度底线同 classic:ink-faint 对 canvas ≥ 4.5:1 级(时间戳/占位不发虚)。
+ * ============================================================ */
+
+/* Paper:暖灰低彩,亮色近纸、暗色对应暖深灰;长时间阅读整理用。不宣称护眼。 */
+:root[data-vn-theme="paper"],
+[data-vn-theme-preview="paper"] {
+  --canvas: light-dark(#f7f4ee, #161411);
+  --surface: light-dark(#efebe3, #1d1a16);
+  --surface-soft: light-dark(#e8e3d9, #23201b);
+  --surface-press: light-dark(#dfd9cd, #2b2721);
+  --hairline: light-dark(#e1dbcf, #2f2a24);
+  --hairline-strong: light-dark(#c6bdac, #48413a);
+  --ink: light-dark(#2a2621, #ede7dd);
+  --ink-secondary: light-dark(#625a50, #a99f92);
+  --ink-faint: light-dark(#776e62, #857b6f);
+  --accent: light-dark(#2f5f8c, #8fb6d9);
+  --accent-pressed: light-dark(#264e74, #7aa3c8);
+  --accent-tint: light-dark(rgba(47, 95, 140, 0.1), rgba(143, 182, 217, 0.15));
+  --accent-tint-soft: light-dark(rgba(47, 95, 140, 0.05), rgba(143, 182, 217, 0.08));
+  --on-accent: light-dark(#ffffff, #161411);
+  --primary: light-dark(#2a2621, #ede7dd);
+  --primary-pressed: light-dark(#3d3832, #d9d2c6);
+  --on-primary: light-dark(#f7f4ee, #161411);
+}
+
+/* Nord:冷灰蓝,克制的层级;蓝只给 accent,不侵占录制红与说话人色域。 */
+:root[data-vn-theme="nord"],
+[data-vn-theme-preview="nord"] {
+  --canvas: light-dark(#eceff4, #2b303b);
+  --surface: light-dark(#e3e8ef, #333a47);
+  --surface-soft: light-dark(#dbe1ea, #3a4251);
+  --surface-press: light-dark(#d1d8e3, #434c5e);
+  --hairline: light-dark(#d3d9e3, #3f4757);
+  --hairline-strong: light-dark(#afb9c9, #586379);
+  --ink: light-dark(#2e3440, #eceff4);
+  --ink-secondary: light-dark(#4c566a, #c2cad8);
+  --ink-faint: light-dark(#5f6a7f, #939eb3);
+  --accent: light-dark(#4c6f9c, #88c0d0);
+  --accent-pressed: light-dark(#3e5c83, #74adbe);
+  --accent-tint: light-dark(rgba(76, 111, 156, 0.12), rgba(136, 192, 208, 0.16));
+  --accent-tint-soft: light-dark(rgba(76, 111, 156, 0.06), rgba(136, 192, 208, 0.08));
+  --on-accent: light-dark(#ffffff, #2b303b);
+  --primary: light-dark(#3b4252, #eceff4);
+  --primary-pressed: light-dark(#4c566a, #d8dee9);
+  --on-primary: light-dark(#eceff4, #2b303b);
+}
+
+/* ============================================================
  * 全局基调(质感层):标题字级统一、交互过渡、按钮微阴影。
  * 元素级选择器只放"每个组件都该有、且无组件差异"的规则。
  * ============================================================ */

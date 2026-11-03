@@ -187,6 +187,8 @@ pub struct Settings {
     pub speaker_model: String,
     /// 外观主题,消费任务:主题切换。"system"/"light"/"dark"。
     pub theme: String,
+    /// 皮肤(UI 改版 #730):classic / paper / nord。与明暗(theme)正交;未知值前端回退 classic。
+    pub theme_family: String,
     /// UI 语言:"system"(跟随系统)/"zh"/"en"。前端界面与托盘/后端用户可见文案共用。
     /// 注意与 language_filter(转写乱码过滤)语义无关。
     pub ui_lang: String,
@@ -323,6 +325,8 @@ struct SettingsRepr {
     speaker_model: String,
     #[serde(default = "default_theme")]
     theme: String,
+    #[serde(default = "default_theme_family")]
+    theme_family: String,
     #[serde(default = "default_ui_lang")]
     ui_lang: String,
     #[serde(default = "default_true")]
@@ -465,6 +469,7 @@ impl From<SettingsRepr> for Settings {
             dashscope_api_key: r.dashscope_api_key,
             speaker_model: r.speaker_model,
             theme: r.theme,
+            theme_family: r.theme_family,
             ui_lang: r.ui_lang,
             language_filter: r.language_filter,
             auto_input_pick: r.auto_input_pick,
@@ -573,6 +578,10 @@ fn default_speaker_match() -> String {
     crate::diar::registry::SPEAKER_MATCH_NEAREST.into()
 }
 
+fn default_theme_family() -> String {
+    "classic".into()
+}
+
 fn default_theme() -> String {
     "system".into()
 }
@@ -632,6 +641,7 @@ impl Default for Settings {
             dashscope_api_key: String::new(),
             speaker_model: default_speaker_model(),
             theme: default_theme(),
+            theme_family: default_theme_family(),
             ui_lang: default_ui_lang(),
             language_filter: true,
             auto_input_pick: true,
