@@ -1,0 +1,276 @@
+/* ============================================================
+ * shadcn-svelte Blocks 风格层(UI 改版 #730 二期)
+ *
+ * 只改风格不改布局:参照 shadcn-svelte.com/blocks(new-york v4 + neutral 色板)——
+ * 黑白灰中性色、浅灰侧栏 + 圆角选中、黑色主按钮、白底描边卡片 + 极浅投影、10px 基础圆角。
+ * 整层挂在根元素 data-vn-style="shadcn" 下(app.html 首帧默认打开),去掉即回旧外观,
+ * 便于逐页对照;确认后再拿掉门控、并入 app.css。
+ *
+ * 本文件不进 @layer:未分层规则天然压过 utilities 层里的 Tailwind 工具类;
+ * 选择器带 :root[data-vn-style] 前缀,特异度也高于 Svelte 作用域类,能直接改页面局部样式。
+ * ============================================================ */
+
+/* ---------- 形状与阴影(所有皮肤) ---------- */
+:root[data-vn-style="shadcn"] {
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  /* shadow-xs / shadow-md(Tailwind 4 原值) */
+  --shadow-btn: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-popover: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --sc-card-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --sc-sidebar: light-dark(#fafafa, #171717);
+  --sc-sidebar-accent: light-dark(#f0f0f0, #262626);
+  --sc-card: light-dark(#ffffff, #171717);
+}
+
+/* ---------- 经典皮肤换 neutral 色板(纸张/北极保留各自色板,只吃形状) ---------- */
+:root[data-vn-style="shadcn"]:not([data-vn-theme="paper"]):not([data-vn-theme="nord"]) {
+  --canvas: light-dark(#ffffff, #0a0a0a);
+  --surface: light-dark(#fafafa, #171717);
+  --surface-soft: light-dark(#f5f5f5, #1f1f1f);
+  --surface-press: light-dark(#f0f0f0, #262626);
+  --hairline: light-dark(#e5e5e5, #2a2a2a);
+  --hairline-strong: light-dark(#d4d4d4, #3a3a3a);
+  --ink: light-dark(#0a0a0a, #fafafa);
+  --ink-secondary: light-dark(#525252, #b5b5b5);
+  --ink-faint: light-dark(#737373, #8f8f8f);
+  /* shadcn 是单色系统:选中/开关/进度/链接都用前景色,不用品牌蓝 */
+  --accent: light-dark(#171717, #e5e5e5);
+  --accent-pressed: light-dark(#404040, #d4d4d4);
+  --accent-tint: light-dark(rgb(0 0 0 / 0.06), rgb(255 255 255 / 0.09));
+  --accent-tint-soft: light-dark(rgb(0 0 0 / 0.03), rgb(255 255 255 / 0.05));
+  --on-accent: light-dark(#fafafa, #171717);
+  --primary: light-dark(#171717, #e5e5e5);
+  --primary-pressed: light-dark(#2e2e2e, #d4d4d4);
+  --on-primary: light-dark(#fafafa, #171717);
+}
+
+/* ---------- 组件:补上 shadcn v4 的细节(描边按钮/输入框的 shadow-xs、主按钮圆角) ---------- */
+:root[data-vn-style="shadcn"] [data-slot="button"].border-border,
+:root[data-vn-style="shadcn"] [data-slot="input"],
+:root[data-vn-style="shadcn"] [data-slot="textarea"],
+:root[data-vn-style="shadcn"] [data-slot="select-trigger"] {
+  box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+}
+:root[data-vn-style="shadcn"] [data-slot="button"] {
+  border-radius: var(--radius-md);
+}
+:root[data-vn-style="shadcn"] [data-slot="button"]:active:not([aria-haspopup]) {
+  translate: none;
+}
+:root[data-vn-style="shadcn"] :is([data-slot="popover-content"], [data-slot="dropdown-menu-content"], [data-slot="context-menu-content"], [data-slot="select-content"]) {
+  border: 1px solid var(--hairline);
+  box-shadow: var(--shadow-popover);
+}
+:root[data-vn-style="shadcn"] :is([data-slot="dialog-content"], [data-slot="alert-dialog-content"]) {
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-xl);
+  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+}
+
+/* ============================================================
+ * 页面层
+ * ============================================================ */
+
+/* 页面标题:text-2xl font-semibold tracking-tight */
+:root[data-vn-style="shadcn"] h1 {
+  font-weight: 600;
+  letter-spacing: -0.025em;
+}
+
+/* 侧栏:sidebar 底色 + 右描边;菜单项 rounded-md,选中 sidebar-accent + font-medium */
+:root[data-vn-style="shadcn"] .sidebar {
+  background: var(--sc-sidebar);
+  border-right-color: var(--hairline);
+}
+:root[data-vn-style="shadcn"] .sidebar .panel {
+  background: var(--sc-sidebar);
+  border-left-color: var(--hairline);
+}
+:root[data-vn-style="shadcn"] .sidebar .tab-rail {
+  background: var(--sc-sidebar);
+}
+:root[data-vn-style="shadcn"] .sidebar .vtab {
+  border: 0;
+  border-radius: var(--radius-md);
+  margin: 1px 3px;
+  width: calc(100% - 6px);
+  color: var(--ink-secondary);
+}
+:root[data-vn-style="shadcn"] .sidebar .vtab.active {
+  background: var(--sc-sidebar-accent);
+  margin-right: 3px;
+  color: var(--ink);
+  font-weight: 500;
+}
+:root[data-vn-style="shadcn"] .sidebar .vtab:hover:not(.active) {
+  background: var(--sc-sidebar-accent);
+  color: var(--ink);
+}
+:root[data-vn-style="shadcn"] .sidebar .item {
+  border-radius: var(--radius-md);
+}
+:root[data-vn-style="shadcn"] .sidebar .item:hover:not(.current),
+:root[data-vn-style="shadcn"] .sidebar .item.current {
+  background: var(--sc-sidebar-accent);
+}
+:root[data-vn-style="shadcn"] .sidebar .item.current .title {
+  font-weight: 500;
+}
+/* 侧栏「开始录制」:黑色药丸 → shadcn 主按钮(rounded-md) */
+:root[data-vn-style="shadcn"] [data-vn-cta="record"] {
+  border-radius: var(--radius-md);
+  box-shadow: var(--sc-card-shadow);
+}
+
+/* 卡片:灰底块 → 白底 + 描边 + rounded-xl + shadow-xs(shadcn Card) */
+:root[data-vn-style="shadcn"] :is(
+    .rows,
+    .quickstart,
+    .flow-card,
+    .card,
+    .panel.card,
+    .related.card,
+    .player
+  ):not(.sidebar *) {
+  background: var(--sc-card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--sc-card-shadow);
+}
+
+/* 笔记正文:不套卡片,直接落在内容区 */
+:root[data-vn-style="shadcn"] main .transcript:not(.live-transcript) {
+  background: transparent;
+  border-radius: 0;
+  padding: 4px 0;
+}
+
+/* 分段控件:shadcn Tabs 观感——bg-muted 轨道 + 选中段 bg-background shadow-sm,无描边 */
+:root[data-vn-style="shadcn"] [data-slot="toggle-group"] {
+  border: 0;
+  border-radius: var(--radius-lg);
+  padding: 3px;
+  background: light-dark(#f5f5f5, #262626);
+  box-shadow: none;
+}
+:root[data-vn-style="shadcn"] [data-slot="toggle-group-item"] {
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--ink-secondary);
+}
+:root[data-vn-style="shadcn"] [data-slot="toggle-group-item"][data-state="on"] {
+  background: light-dark(#ffffff, #0a0a0a);
+  color: var(--ink);
+  box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+}
+
+/* 侧栏搜索:白底描边输入框(sidebar 里的 SidebarInput) */
+:root[data-vn-style="shadcn"] .sidebar input[type="search"][data-slot="input"] {
+  background: var(--canvas);
+  border: 1px solid var(--hairline);
+}
+
+/* ============================================================
+ * 质感第二轮(对照 shadcn-svelte.com/view/dashboard-01、sidebar-07 实拍)
+ * ============================================================ */
+
+/* 字体:拉丁字形用 Geist(Blocks 同款),中文回落苹方;根字号 15 收一点密度 */
+:root[data-vn-style="shadcn"] {
+  font-size: 15px;
+  --font-sans: "Geist Variable", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv11", "ss01";
+}
+:root[data-vn-style="shadcn"] .shell,
+:root[data-vn-style="shadcn"] body {
+  font-family: var(--font-sans);
+}
+
+/* 内嵌内容区(sidebar variant="inset"):整窗是侧栏灰,内容区是浮起的白色圆角面板 */
+:root[data-vn-style="shadcn"] .shell {
+  background: var(--sc-sidebar);
+}
+:root[data-vn-style="shadcn"] .shell > .main {
+  margin: 8px 8px 8px 0;
+  border-radius: 12px;
+  background: var(--canvas);
+  box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.08), 0 1px 2px -1px rgb(0 0 0 / 0.06);
+  outline: 1px solid light-dark(transparent, var(--hairline));
+}
+:root[data-vn-style="shadcn"] .sidebar,
+:root[data-vn-style="shadcn"] .sidebar .panel {
+  border-right: 0;
+  border-left: 0;
+}
+
+/* 层级:分组标题 = 12px 灰色 medium(SidebarGroupLabel);菜单项 14px,选中 medium */
+:root[data-vn-style="shadcn"] :is(.section-title, .group-label) {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-faint);
+  letter-spacing: 0;
+}
+:root[data-vn-style="shadcn"] .sidebar .item .title {
+  font-size: 14px;
+  font-weight: 400;
+}
+:root[data-vn-style="shadcn"] .sidebar .item.current .title {
+  font-weight: 500;
+}
+:root[data-vn-style="shadcn"] .sidebar .item .meta {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+:root[data-vn-style="shadcn"] .sidebar .vtab {
+  font-size: 13px;
+}
+:root[data-vn-style="shadcn"] [data-vn-cta="record"] {
+  height: 34px;
+  font-size: 14px;
+  font-weight: 500;
+}
+/* 设置行:标签 14 medium,说明 13 muted */
+:root[data-vn-style="shadcn"] .row-label {
+  font-size: 14px;
+  font-weight: 500;
+}
+:root[data-vn-style="shadcn"] .row-desc {
+  font-size: 13px;
+  color: var(--ink-faint);
+}
+:root[data-vn-style="shadcn"] h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+/* 组件字号统一 14/13(根字号改小后 text-sm 会偏小) */
+:root[data-vn-style="shadcn"] [data-slot="button"]:is(.bg-primary, .border-border, .bg-secondary):not([class*="text-["]),
+:root[data-vn-style="shadcn"] [data-slot="input"],
+:root[data-vn-style="shadcn"] [data-slot="select-trigger"] {
+  font-size: 14px;
+}
+:root[data-vn-style="shadcn"] [data-slot="toggle-group-item"] {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* 卡片:Blocks 的 section-cards 渐变(from-primary/5 to-card)与 shadow-xs */
+:root[data-vn-style="shadcn"] :is(.rows, .quickstart, .flow-card, .card, .panel.card, .related.card):not(.sidebar *) {
+  background: linear-gradient(to top, light-dark(rgb(0 0 0 / 0.025), rgb(255 255 255 / 0.025)), transparent 60%), var(--sc-card);
+}
+
+/* 页面说明段:CardDescription 口径(14px muted, 1.6 行高) */
+:root[data-vn-style="shadcn"] main :is(.intro, .desc) {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink-secondary);
+}
+/* 空态:虚线描边、无填充(shadcn Empty) */
+:root[data-vn-style="shadcn"] main .empty {
+  background: transparent;
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--radius-xl);
+}

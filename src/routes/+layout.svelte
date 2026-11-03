@@ -1,6 +1,8 @@
 <script lang="ts">
   import "../app.css";
   import "$lib/ui/tailwind.css";
+  import "@fontsource-variable/geist";
+  import "$lib/ui/shadcn.css";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";

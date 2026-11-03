@@ -14,6 +14,8 @@
         var mode = a && ["system", "light", "dark"].indexOf(a.mode) >= 0 ? a.mode : "system";
         var dark = mode === "dark" || (mode === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
         var r = document.documentElement;
+        // shadcn Blocks 风格层(#730 二期,src/lib/ui/shadcn.css):默认打开;localStorage "vn.style"="legacy" 可回旧外观对照。
+        r.dataset.vnStyle = localStorage.getItem("vn.style") === "legacy" ? "legacy" : "shadcn";
         r.dataset.vnTheme = fam;
         r.dataset.vnMode = dark ? "dark" : "light";
         if (mode !== "system") r.style.colorScheme = mode;

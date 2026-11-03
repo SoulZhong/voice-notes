@@ -543,6 +543,7 @@
     ><XIcon /></Button>
   {/if}
   <Button
+    data-vn-cta="record"
     class={cn(
       "h-9 w-full gap-2 rounded-full text-[0.9rem] shadow-(--shadow-btn) hover:bg-(color:--primary-pressed) disabled:opacity-60",
       recording.isLive && "text-(color:--record)",
@@ -582,9 +583,10 @@
       <li class="new-hook-row">
         <Button
           href="/hooks/new"
+          variant="outline"
           class={cn(
-            "mt-3.5 h-9 w-full gap-2 rounded-full bg-ring text-[0.9rem] font-semibold text-(color:--on-accent) shadow-(--shadow-btn) hover:bg-(color:--accent-pressed)",
-            $page.url.pathname === "/hooks/new" && "bg-(color:--accent-pressed)",
+            "mt-3.5 h-9 w-full gap-2 bg-background text-[0.9rem] font-medium text-foreground no-underline hover:text-foreground hover:no-underline",
+            $page.url.pathname === "/hooks/new" && "bg-muted",
           )}
         >
           <svg class="new-hook-icon" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
