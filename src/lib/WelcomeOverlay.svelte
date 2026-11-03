@@ -15,6 +15,23 @@
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import { t } from "$lib/i18n/index.svelte";
   import { uiMode } from "$lib/uiMode.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import { Checkbox } from "$lib/ui/components/checkbox";
+  import * as Dialog from "$lib/ui/components/dialog";
+  import * as ToggleGroup from "$lib/ui/components/toggle-group";
+
+  // 控件外观(UI 改版):主按钮 = primary 药丸;次要出口 = 弱文字幽灵钮。
+  const primaryBtn = "h-8 rounded-full px-5 text-[0.9rem] shadow-(--shadow-btn) hover:bg-(color:--primary-pressed) disabled:opacity-60";
+  const linkBtn = "h-auto px-2.5 py-1 text-[0.9rem] font-normal text-muted-foreground hover:text-foreground";
+  // 凭证输入沿用设置页「识别方式」区的内嵌式:surface-press 底、无边,聚焦浮出 canvas 底 + accent 边。
+  /** 两张等宽选择卡:surface 底 + 发丝线,左对齐多行(覆盖 Button 的单行居中)。 */
+  const choiceCard =
+    "h-auto w-full flex-col items-start gap-0 whitespace-normal rounded-lg border-border bg-card px-4 py-3.5 text-left font-normal hover:border-input hover:bg-muted dark:bg-card dark:hover:bg-muted";
+  /** 分段项:选中抬成 canvas 底 + 微投影。 */
+  const segItem =
+    "h-7 flex-1 rounded-[calc(var(--radius-md)-2px)] text-[0.85rem] text-muted-foreground hover:bg-transparent data-[state=on]:bg-background data-[state=on]:text-foreground data-[state=on]:shadow-(--shadow-btn)";
+  const rowInput = "border-transparent bg-accent text-[0.9rem] md:text-[0.9rem] dark:bg-accent focus-visible:bg-background dark:focus-visible:bg-background";
 
   let {
     status,
@@ -206,11 +223,19 @@
   }
 </script>
 
-<div class="overlay">
+<!-- 首启欢迎层用 Dialog 外壳(全屏、不可关):拿到模态语义与焦点圈定,背后的侧栏不再能被
+     Tab 走到。Esc / 点外面都不关——引导只能经下方按钮走完或从「高级设置」出口离开,与旧实现一致。 -->
+<Dialog.Root open={true}>
+<Dialog.Content
+  showCloseButton={false}
+  escapeKeydownBehavior="ignore"
+  interactOutsideBehavior="ignore"
+  class="top-0 left-0 z-[100] flex h-screen w-screen max-w-none translate-x-0 translate-y-0 items-center justify-center overflow-y-auto rounded-none bg-background p-0 text-[length:inherit] ring-0 data-open:zoom-in-100 data-closed:zoom-out-100 sm:max-w-none"
+>
   <div class="panel">
     <div class="hero">
       <div class="mark"><span class="dot"></span></div>
-      <h1>voice-notes</h1>
+      <Dialog.Title>{#snippet child({ props })}<h1 {...props}>voice-notes</h1>{/snippet}</Dialog.Title>
       <p class="tagline">{t("shell.welcome.tagline")}</p>
     </div>
 
@@ -229,14 +254,14 @@
       <div class="choose">
         <h2>{t("shell.welcome.chooseTitle")}</h2>
         <div class="choice-cards">
-          <button type="button" class="choice-card" onclick={() => (phase = "download")}>
+          <Button variant="outline" class={choiceCard} onclick={() => (phase = "download")}>
             <strong>{t("shell.welcome.localTitle")}</strong>
             <p>{t("shell.welcome.localDesc")}</p>
-          </button>
-          <button type="button" class="choice-card" onclick={() => (phase = "cloud-setup")}>
+          </Button>
+          <Button variant="outline" class={choiceCard} onclick={() => (phase = "cloud-setup")}>
             <strong>{t("shell.welcome.cloudTitle")}</strong>
             <p>{t("shell.welcome.cloudDesc")}</p>
-          </button>
+          </Button>
         </div>
         <p class="hints">{t("shell.welcome.changeLater")}</p>
       </div>
@@ -248,36 +273,32 @@
       <div class="cloud-setup">
         <h2>{t("shell.welcome.cloudSetupTitle")}</h2>
         <p class="hints">{t("shell.welcome.cloudSetupHint")}</p>
-        <div class="seg">
-          <label class="seg-item">
-            <input
-              type="radio"
-              name="welcome-cloudprovider"
-              value="volcano"
-              bind:group={cloudProvider}
-              onchange={() => {
-                // 凭证一经改动,上次测试结果即作废,须重测才能完成
-                invalidateCloudTest();
-              }}
-            />{t("shell.welcome.providerVolcano")}
-          </label>
-          <label class="seg-item">
-            <input
-              type="radio"
-              name="welcome-cloudprovider"
-              value="aliyun"
-              bind:group={cloudProvider}
-              onchange={() => {
-                invalidateCloudTest();
-              }}
-            />{t("shell.welcome.providerAliyun")}
-          </label>
-        </div>
+        <!-- 二选一分段:单选 ToggleGroup。再点已选项不取消(空值丢弃),与原单选框语义一致;
+             只有真的换了服务商才作废上次测试结果。 -->
+        <ToggleGroup.Root
+          type="single"
+          size="sm"
+          spacing={2}
+          class="seg w-full"
+          bind:value={
+            () => cloudProvider,
+            (v) => {
+              if (v !== "volcano" && v !== "aliyun") return;
+              if (v === cloudProvider) return;
+              cloudProvider = v;
+              // 凭证一经改动,上次测试结果即作废,须重测才能完成
+              invalidateCloudTest();
+            }
+          }
+        >
+          <ToggleGroup.Item value="volcano" class={segItem}>{t("shell.welcome.providerVolcano")}</ToggleGroup.Item>
+          <ToggleGroup.Item value="aliyun" class={segItem}>{t("shell.welcome.providerAliyun")}</ToggleGroup.Item>
+        </ToggleGroup.Root>
         {#if cloudProvider === "volcano"}
           <label class="field">
             <span>APP ID</span>
-            <input
-              class="row-input"
+            <Input
+              class={rowInput}
               placeholder={t("shell.welcome.volcAppIdPlaceholder")}
               bind:value={volcAppKey}
               oninput={() => {
@@ -287,8 +308,8 @@
           </label>
           <label class="field">
             <span>Access Token</span>
-            <input
-              class="row-input"
+            <Input
+              class={rowInput}
               type="password"
               placeholder="Access Token"
               bind:value={volcAccessKey}
@@ -300,8 +321,8 @@
         {:else}
           <label class="field">
             <span>API Key</span>
-            <input
-              class="row-input"
+            <Input
+              class={rowInput}
               type="password"
               placeholder="DashScope API Key"
               bind:value={dashKey}
@@ -317,13 +338,13 @@
           </p>
         {/if}
         <div class="connect-actions">
-          <button class="btn-primary" disabled={testingCloud} onclick={doTestCloud}>
+          <Button class={primaryBtn} disabled={testingCloud} onclick={doTestCloud}>
             {testingCloud ? t("shell.welcome.testing") : t("shell.welcome.testConnection")}
-          </button>
-          <button class="btn-primary" disabled={!cloudTestPassed} onclick={completeCloudSetup}>{t("shell.welcome.done")}</button>
+          </Button>
+          <Button class={primaryBtn} disabled={!cloudTestPassed} onclick={completeCloudSetup}>{t("shell.welcome.done")}</Button>
         </div>
         <div class="foot">
-          <button type="button" class="link" onclick={backToChoose}>{t("shell.welcome.back")}</button>
+          <Button variant="ghost" class={linkBtn} onclick={backToChoose}>{t("shell.welcome.back")}</Button>
         </div>
       </div>
     {:else if phase === "learn"}
@@ -347,7 +368,7 @@
           <span>{t("shell.welcome.promptLabel")}</span>
           <p>{t("shell.welcome.promptExample")}</p>
         </div>
-        <button class="btn-primary next" onclick={showConnect}>{t("shell.welcome.chooseConnect")}</button>
+        <div class="next"><Button class={primaryBtn} onclick={showConnect}>{t("shell.welcome.chooseConnect")}</Button></div>
       </div>
     {:else}
       <div class="connect">
@@ -358,7 +379,7 @@
         {#if agents.length}
           {#each agents as a (a.key)}
             <label class="agent-row">
-              <input type="checkbox" bind:checked={picked[a.key]} disabled={registerLocked} />
+              <Checkbox bind:checked={picked[a.key]} disabled={registerLocked} />
               <span>{a.name}</span>
               {#if outcomes}
                 {@const o = outcomes.find((x) => x.key === a.key)}
@@ -367,8 +388,8 @@
             </label>
           {/each}
           <div class="connect-actions">
-            <button class="btn-primary" disabled={registerLocked} onclick={registerPicked}>{t("shell.welcome.registerSelected")}</button>
-            <button class="link" disabled={registering} onclick={() => finish("/record")}>{t("shell.welcome.skipConnect")}</button>
+            <Button class={primaryBtn} disabled={registerLocked} onclick={registerPicked}>{t("shell.welcome.registerSelected")}</Button>
+            <Button variant="ghost" class={linkBtn} disabled={registering} onclick={() => finish("/record")}>{t("shell.welcome.skipConnect")}</Button>
           </div>
         {:else}
           <div class="no-agent">
@@ -376,8 +397,8 @@
             <p>{t("shell.welcome.noAgentBody")}</p>
           </div>
           <div class="connect-actions">
-            <button class="btn-primary" onclick={() => finish("/ai")}>{t("shell.welcome.viewConnect")}</button>
-            <button class="link" onclick={() => finish("/record")}>{t("shell.welcome.startRecordingFirst")}</button>
+            <Button class={primaryBtn} onclick={() => finish("/ai")}>{t("shell.welcome.viewConnect")}</Button>
+            <Button variant="ghost" class={linkBtn} onclick={() => finish("/record")}>{t("shell.welcome.startRecordingFirst")}</Button>
           </div>
         {/if}
         <p class="privacy">{t("shell.welcome.privacy")}</p>
@@ -385,22 +406,13 @@
     {/if}
 
     <div class="foot">
-      {#if phase === "choose" || phase === "download"}<button class="link" onclick={advanced}>{t("shell.welcome.advanced")}</button>{/if}
+      {#if phase === "choose" || phase === "download"}<Button variant="ghost" class={linkBtn} onclick={advanced}>{t("shell.welcome.advanced")}</Button>{/if}
     </div>
   </div>
-</div>
+</Dialog.Content>
+</Dialog.Root>
 
 <style>
-  .overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    background: var(--canvas);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow-y: auto;
-  }
   .panel {
     width: min(30rem, calc(100vw - 3rem));
     padding: 1rem;
@@ -461,55 +473,16 @@
     text-align: center;
     margin-top: 1.2rem;
   }
-  .link {
-    background: none;
-    border: none;
-    padding: 0.3em 0.6em;
-    font-size: 0.9rem;
-    color: var(--ink-secondary);
-    cursor: pointer;
-    border-radius: var(--radius-sm);
-  }
-  .link:hover {
-    color: var(--ink);
-    background: var(--surface-soft);
-  }
   .connect { text-align: left; }
   .connect h2, .learn h2, .choose h2, .cloud-setup h2 { margin: 0 0 0.4rem; font-size: 1.1rem; text-align: center; }
   /* choose:两张等宽卡片,复用 prompt-example 的 surface 底色语言 */
   .choice-cards { display: grid; gap: 0.7rem; margin: 1rem 0 0.6rem; }
-  .choice-card {
-    text-align: left;
-    background: var(--surface);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    padding: 0.85rem 1rem;
-    cursor: pointer;
-    font: inherit;
-    color: inherit;
-  }
-  .choice-card:hover { background: var(--surface-soft); border-color: var(--hairline-strong); }
-  .choice-card strong { display: block; font-size: 0.94rem; font-weight: 600; }
-  .choice-card p { margin: 0.3rem 0 0; color: var(--ink-secondary); font-size: 0.82rem; line-height: 1.5; }
+  .choice-cards strong { display: block; font-size: 0.94rem; font-weight: 600; }
+  .choice-cards p { margin: 0.3rem 0 0; color: var(--ink-secondary); font-size: 0.82rem; line-height: 1.5; }
   /* cloud-setup:凭证输入,样式照搬设置页「识别方式」区(seg/row-input/mtest-*) */
-  .cloud-setup .seg { display: flex; gap: 2px; background: var(--surface-press); border-radius: var(--radius-md); padding: 2px; margin: 1rem 0 0; }
-  .cloud-setup .seg-item {
-    position: relative; flex: 1; text-align: center;
-    padding: 0.32em 0.7em; font-size: 0.85rem; font-weight: 500;
-    color: var(--ink-secondary); border-radius: calc(var(--radius-md) - 2px); cursor: pointer;
-  }
-  .cloud-setup .seg-item:hover { color: var(--ink); }
-  .cloud-setup .seg-item:has(input:checked) { background: var(--canvas); color: var(--ink); box-shadow: var(--shadow-btn); }
-  .cloud-setup .seg-item input { position: absolute; opacity: 0; pointer-events: none; }
+  .cloud-setup :global(.seg) { display: flex; gap: 2px; background: var(--surface-press); border-radius: var(--radius-md); padding: 2px; margin: 1rem 0 0; }
   .field { display: block; margin: 0.7rem 0 0; }
   .field span { display: block; font-size: 0.8rem; color: var(--ink-secondary); margin-bottom: 0.3rem; }
-  .row-input {
-    width: 100%; box-sizing: border-box;
-    padding: 0.42em 0.65em; border: none; border-radius: var(--radius-md);
-    background: var(--surface-press); color: var(--ink); font-size: 0.9rem;
-  }
-  .row-input:focus { outline: none; background: var(--canvas); box-shadow: 0 0 0 1px var(--accent); }
-  .row-input::placeholder { color: var(--ink-faint); }
   .test-result { font-size: 0.82rem; margin: 0.7rem 0 0; text-align: center; }
   .test-result.ok { color: var(--success); }
   .test-result.bad { color: var(--danger-ink); }
@@ -524,7 +497,7 @@
   .prompt-example { background: var(--surface); border-radius: var(--radius-lg); padding: 0.7rem 0.85rem; }
   .prompt-example span { color: var(--ink-faint); font-size: 0.74rem; }
   .prompt-example p { margin: 0.25rem 0 0; color: var(--ink-secondary); font-size: 0.84rem; line-height: 1.5; }
-  .next { display: block; margin: 1rem auto 0; }
+  .next { display: flex; justify-content: center; margin: 1rem 0 0; }
   .agent-row {
     display: flex; align-items: center; gap: 0.6rem;
     padding: 0.55rem 0.4rem; border-radius: var(--radius-sm);
@@ -537,23 +510,4 @@
   .no-agent strong { font-size: 0.9rem; }
   .no-agent p, .privacy { color: var(--ink-secondary); font-size: 0.8rem; line-height: 1.5; margin: 0.35rem 0 0; }
   .privacy { text-align: center; color: var(--ink-faint); margin-top: 0.9rem; }
-  /* button-primary:本组件此前无主按钮类,样式对齐 ModelDownloadCard/settings 页的 primary 药丸 */
-  .btn-primary {
-    border-radius: var(--radius-full);
-    border: 1px solid transparent;
-    padding: 0.5em 1.4em;
-    font-size: 0.9rem;
-    font-weight: 500;
-    cursor: pointer;
-    background: var(--primary);
-    color: var(--on-primary);
-    box-shadow: var(--shadow-btn);
-  }
-  .btn-primary:hover {
-    background: var(--primary-pressed);
-  }
-  .btn-primary:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
 </style>

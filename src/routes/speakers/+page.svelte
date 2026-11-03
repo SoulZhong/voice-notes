@@ -34,6 +34,11 @@
   import { recording } from "$lib/recording.svelte";
   import PersonPickList from "$lib/PersonPickList.svelte";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import * as Popover from "$lib/ui/components/popover";
+  import * as RadioGroup from "$lib/ui/components/radio-group";
+  import { cn } from "$lib/ui/utils";
 
   // 主从结构的落地页:人物索引在侧栏,本页概览引导之下常驻「分析说话人」区——
   // 队列由共享 store + 人物表现算,全量渲染;处理完的项随重算自然从列表消失。
@@ -344,6 +349,14 @@
       errKey,
     );
   }
+
+  // 试听胶囊:outline 小按钮 + 胶囊外形;播放中用焦点蓝描边/文字(旧 .chip.playing)。
+  function chipClass(playing: boolean): string {
+    return cn(
+      "h-auto rounded-full px-[0.6em] py-[0.15em] text-[0.75rem] font-normal text-muted-foreground",
+      playing && "border-ring text-ring hover:text-ring",
+    );
+  }
 </script>
 
 {#snippet auditionIcon(active: boolean)}
@@ -390,9 +403,10 @@
                读屏能念),按钮又自带可见文字,title 在这种情况下不是可靠的可及名字,
                不给就只剩一个日期、听不出这是播放还是停止。label 里包含可见文字本身,
                满足 WCAG 2.5.3(label in name)。aria-pressed 暴露"正在播"这个开关态。 -->
-          <button
-            class="chip"
-            class:playing={playingKey === path}
+          <Button
+            variant="outline"
+            size="xs"
+            class={chipClass(playingKey === path)}
             title={playingKey === path ? t("speakers.stop") : t("speakers.auditionSample")}
             aria-label={`${playingKey === path ? t("speakers.stop") : t("speakers.auditionSample")} ${sampleLabel}`}
             aria-pressed={playingKey === path}
@@ -400,7 +414,7 @@
           >
             {@render auditionIcon(playingKey === path)}
             {sampleLabel}
-          </button>
+          </Button>
         {:else}
           <span class="hint">{t("speakers.noSamples")}</span>
         {/each}
@@ -444,9 +458,10 @@
         </div>
         <div class="samples">
           {#each r.loser_sample_paths as path, i (path)}
-            <button
-              class="chip"
-              class:playing={playingKey === path}
+            <Button
+              variant="outline"
+              size="xs"
+              class={chipClass(playingKey === path)}
               title={playingKey === path ? t("speakers.stop") : t("speakers.auditionPreMerge")}
               aria-label={`${playingKey === path ? t("speakers.stop") : t("speakers.auditionPreMerge")} ${t("speakers.snapshotN", { n: i + 1 })}`}
               aria-pressed={playingKey === path}
@@ -454,7 +469,7 @@
             >
               {@render auditionIcon(playingKey === path)}
               {t("speakers.snapshotN", { n: i + 1 })}
-            </button>
+            </Button>
           {:else}
             <span class="hint">{t("speakers.noSnapshots")}</span>
           {/each}
@@ -469,9 +484,10 @@
           <div class="snap-listen">
             <span class="snap-label">{t("speakers.snapshotAtMerge")}</span>
             {#each r.winner_sample_paths as path, i (path)}
-              <button
-                class="chip"
-                class:playing={playingKey === path}
+              <Button
+                variant="outline"
+                size="xs"
+                class={chipClass(playingKey === path)}
                 title={playingKey === path ? t("speakers.stop") : t("speakers.auditionMergeSample")}
                 aria-label={`${playingKey === path ? t("speakers.stop") : t("speakers.auditionMergeSample")} ${t("speakers.snapshotN", { n: i + 1 })}`}
                 aria-pressed={playingKey === path}
@@ -479,7 +495,7 @@
               >
                 {@render auditionIcon(playingKey === path)}
                 {t("speakers.snapshotN", { n: i + 1 })}
-              </button>
+              </Button>
             {/each}
           </div>
         {/if}
@@ -490,11 +506,11 @@
     {/if}
     <div class="acts">
       {#if r.invalid_reason}
-        <button class="mini accent" disabled={busy || live} onclick={() => doRestore(r)}>{t("speakers.restoreSplit")}</button>
-        <button class="mini" disabled={busy || live} onclick={() => doAck(r)}>{t("speakers.gotIt")}</button>
+        <Button variant="default" size="sm" disabled={busy || live} onclick={() => doRestore(r)}>{t("speakers.restoreSplit")}</Button>
+        <Button variant="outline" size="sm" disabled={busy || live} onclick={() => doAck(r)}>{t("speakers.gotIt")}</Button>
       {:else}
-        <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>{t("speakers.ok")}</button>
-        <button class="mini" disabled={busy || live} onclick={() => doUndo(r.journal_id, `r:${r.journal_id}`)}>{t("speakers.undo")}</button>
+        <Button variant="default" size="sm" disabled={busy || live} onclick={() => doAck(r)}>{t("speakers.ok")}</Button>
+        <Button variant="outline" size="sm" disabled={busy || live} onclick={() => doUndo(r.journal_id, `r:${r.journal_id}`)}>{t("speakers.undo")}</Button>
       {/if}
     </div>
     {#if r.invalid_reason}
@@ -545,7 +561,7 @@
         </span>
         {#if tidy.loading}<span class="refreshing">{t("speakers.comparing")}</span>{/if}
         <span class="head-spacer"></span>
-        <button class="mini plain" disabled={tidy.loading} onclick={() => void tidy.refresh()}>{t("speakers.reTidy")}</button>
+        <Button variant="ghost" size="sm" disabled={tidy.loading} onclick={() => void tidy.refresh()}>{t("speakers.reTidy")}</Button>
       </div>
 
       {#if live}
@@ -557,8 +573,8 @@
       {#if tidy.lastManual}
         <div class="undo-strip">
           {t("speakers.mergedLabel", { label: tidy.lastManual.label })}
-          <button class="mini" disabled={busy || live} onclick={() => doUndo(tidy.lastManual!.journalId)}>{t("speakers.undo")}</button>
-          <button class="mini plain" onclick={() => (tidy.lastManual = null)}>{t("speakers.ok")}</button>
+          <Button variant="outline" size="sm" disabled={busy || live} onclick={() => doUndo(tidy.lastManual!.journalId)}>{t("speakers.undo")}</Button>
+          <Button variant="ghost" size="sm" onclick={() => (tidy.lastManual = null)}>{t("speakers.ok")}</Button>
         </div>
       {/if}
 
@@ -588,9 +604,9 @@
                     <p class="hint">{t("speakers.identifyAutoConflict")}</p>
                   {/if}
                   <div class="acts">
-                    <button class="mini accent" disabled={busy} onclick={() => doAckIdentify(s)}>{t("speakers.ok")}</button>
+                    <Button variant="default" size="sm" disabled={busy} onclick={() => doAckIdentify(s)}>{t("speakers.ok")}</Button>
                     {#if s.revertible}
-                      <button class="mini" disabled={busy || live} onclick={() => doUndoIdentify(s)}>{t("speakers.undo")}</button>
+                      <Button variant="outline" size="sm" disabled={busy || live} onclick={() => doUndoIdentify(s)}>{t("speakers.undo")}</Button>
                     {/if}
                   </div>
                   {@render cardError(tidyItemKey(item))}
@@ -615,10 +631,10 @@
                   </p>
                 {/if}
                 <div class="acts">
-                  <button class="mini accent" disabled={busy || live} onclick={() => doApplyIdentify(s)}>
+                  <Button variant="default" size="sm" disabled={busy || live} onclick={() => doApplyIdentify(s)}>
                     {s.is_new ? t("speakers.identifyApplyNew") : t("speakers.identifyApply")}
-                  </button>
-                  <button class="mini" disabled={busy} onclick={() => doRejectIdentify(s)}>{t("speakers.identifyReject")}</button>
+                  </Button>
+                  <Button variant="outline" size="sm" disabled={busy} onclick={() => doRejectIdentify(s)}>{t("speakers.identifyReject")}</Button>
                 </div>
                 {@render cardError(tidyItemKey(item))}
               </section>
@@ -634,12 +650,12 @@
                   {#if target.overridden}
                     <!-- 相似度只对系统建议对成立,换了人再挂着就是误导 -->
                     <span class="sim">{t("speakers.manualOverride")}</span>
-                    <button
-                      class="mini plain"
+                    <Button
+                      variant="ghost" size="sm"
                       onclick={() => {
                         const { [skey]: _, ...rest } = tidy.sugOverride;
                         tidy.sugOverride = rest;
-                      }}>{t("speakers.restoreSuggestion")}</button>
+                      }}>{t("speakers.restoreSuggestion")}</Button>
                   {:else}
                     <span class="sim" class:strong={isStrong(s)}>
                       {t("speakers.similarity", {
@@ -656,23 +672,41 @@
                   <div class="switch-anchor">
                     {@render personPane(target.id, target.name)}
                     <!-- 猜错人时就地换目标,不必忽略后绕去详情页「合并到…」 -->
-                    <button
-                      class="switch-btn"
-                      title={t("speakers.switchTitle")}
-                      onclick={() => {
-                        confirmClean = false;
-                        sugPickQuery = "";
-                        sugPickFor = sugPickFor === skey ? null : skey;
-                      }}>{t("speakers.switchPerson")}</button>
-                    {#if sugPickFor === skey}
-                      {@const q = sugPickQuery.trim()}
-                      <button class="menu-scrim" aria-label={t("speakers.closeMenu")} onclick={() => (sugPickFor = null)}></button>
-                      <div class="menu">
+                    <!-- 弹层:点外面/Esc 由 Popover 关(onOpenChange),开合仍归 sugPickFor 一处管 -->
+                    <Popover.Root
+                      open={sugPickFor === skey}
+                      onOpenChange={(open) => {
+                        if (open) {
+                          confirmClean = false;
+                          sugPickQuery = "";
+                          sugPickFor = skey;
+                        } else if (sugPickFor === skey) {
+                          sugPickFor = null;
+                        }
+                      }}
+                    >
+                      <Popover.Trigger>
+                        {#snippet child({ props })}
+                          <Button
+                            {...props}
+                            variant="ghost"
+                            size="xs"
+                            class="absolute top-[0.45rem] right-[0.55rem] h-auto rounded-sm px-[0.3em] py-[0.1em] text-[0.75rem] font-normal text-[var(--ink-faint)] hover:bg-[var(--accent-tint)] hover:text-ring"
+                            title={t("speakers.switchTitle")}
+                          >{t("speakers.switchPerson")}</Button>
+                        {/snippet}
+                      </Popover.Trigger>
+                      <Popover.Content
+                        align="end"
+                        class="max-h-64 w-auto min-w-64 gap-1 overflow-y-auto p-[0.35rem]"
+                        aria-label={t("speakers.mergeInto", { name: plabel(s.loser, s.loser_name) })}
+                      >
+                        {@const q = sugPickQuery.trim()}
                         <div class="menu-title">
                           {t("speakers.mergeInto", { name: plabel(s.loser, s.loser_name) })}
                         </div>
                         <!-- svelte-ignore a11y_autofocus -->
-                        <input class="pick-input" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={sugPickQuery} />
+                        <Input class="mb-1" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={sugPickQuery} />
                         <PersonPickList
                           people={people.filter((p) => p.id !== s.loser && p.id !== target.id)}
                           query={sugPickQuery}
@@ -684,19 +718,24 @@
                         />
                         {#if q && !people.some((p) => p.name === q)}
                           <!-- 库里没这个人:就地命名,不必出弹层绕去详情页 -->
-                          <button class="create-row" disabled={busy} onclick={() => doNameAsNew(s, q)}>
+                          <Button
+                            variant="ghost"
+                            class="h-auto w-full justify-start rounded-t-none border-t border-t-border px-[0.55rem] py-[0.38rem] font-normal text-ring"
+                            disabled={busy}
+                            onclick={() => doNameAsNew(s, q)}
+                          >
                             {t("speakers.createAndName", { name: q })}
-                          </button>
+                          </Button>
                         {/if}
-                      </div>
-                    {/if}
+                      </Popover.Content>
+                    </Popover.Root>
                   </div>
                 </div>
                 <p class="hint">{t("speakers.sugHint")}</p>
                 <div class="acts">
-                  <button class="mini accent" disabled={busy || live} onclick={() => doMergeSuggestion(s, target.id, target.name)}>{t("speakers.merge")}</button>
+                  <Button variant="default" size="sm" disabled={busy || live} onclick={() => doMergeSuggestion(s, target.id, target.name)}>{t("speakers.merge")}</Button>
                   <!-- 忽略是本地处置(dismissed 元数据),后端录制中也放行,不必陪绑置灰 -->
-                  <button class="mini" disabled={busy} onclick={() => doIgnoreSuggestion(s)}>{t("speakers.ignore")}</button>
+                  <Button variant="outline" size="sm" disabled={busy} onclick={() => doIgnoreSuggestion(s)}>{t("speakers.ignore")}</Button>
                 </div>
                 {@render cardError(tidyItemKey(item))}
               </section>
@@ -706,28 +745,29 @@
               <section class="card">
                 <div class="card-tag">{t("speakers.tagDup")}</div>
                 <div class="card-title">{t("speakers.dupTitle", { name: item.name, n: g.length })}</div>
-                <div class="panes wrap">
+                <!-- 单选组 = 旧 .panes.wrap 的横排换行布局 -->
+                <RadioGroup.Root
+                  class="flex flex-wrap items-start gap-[0.8rem]"
+                  name={"dup-" + item.name}
+                  value={primary}
+                  onValueChange={(v) => { if (v) dupPrimary = { ...dupPrimary, [item.name]: v }; }}
+                >
                   {#each g as p (p.id)}
                     <div class="dup-item" class:primary={p.id === primary}>
                       {@render personPane(p.id, p.name)}
                       <label class="pick">
-                        <input
-                          type="radio"
-                          name={"dup-" + item.name}
-                          checked={p.id === primary}
-                          onchange={() => (dupPrimary = { ...dupPrimary, [item.name]: p.id })}
-                        />
+                        <RadioGroup.Item value={p.id} />
                         {t("speakers.asPrimary")}
                       </label>
                     </div>
                   {/each}
-                </div>
+                </RadioGroup.Root>
                 <p class="hint">{t("speakers.dupHint")}</p>
                 <div class="acts">
-                  <button class="mini accent" disabled={busy || live} onclick={() => doMergeDup(item.name, g)}>
+                  <Button variant="default" size="sm" disabled={busy || live} onclick={() => doMergeDup(item.name, g)}>
                     {t("speakers.mergeAllPrimary")}
-                  </button>
-                  <button class="mini" disabled={busy} onclick={() => doDismiss(item)}>{t("speakers.ignore")}</button>
+                  </Button>
+                  <Button variant="outline" size="sm" disabled={busy} onclick={() => doDismiss(item)}>{t("speakers.ignore")}</Button>
                 </div>
                 {@render cardError(tidyItemKey(item))}
               </section>
@@ -741,18 +781,18 @@
                 </div>
                 <p class="hint warn-text">{t("speakers.nosampleHint")}</p>
                 <div class="acts">
-                  <button class="mini danger" disabled={busy || live} onclick={() => doDeleteNoSample(p)}>{t("speakers.delete")}</button>
-                  <button class="mini" disabled={busy} onclick={() => doDismiss(item)}>{t("speakers.keep")}</button>
+                  <Button variant="destructive" size="sm" disabled={busy || live} onclick={() => doDeleteNoSample(p)}>{t("speakers.delete")}</Button>
+                  <Button variant="outline" size="sm" disabled={busy} onclick={() => doDismiss(item)}>{t("speakers.keep")}</Button>
                   {#if nosampleN > 1 && tidyItemKey(item) === firstNosampleKey}
                     <span class="spacer"></span>
                     {#if confirmClean}
                       <span class="warn-text">{t("speakers.cleanConfirmWarn", { n: nosampleN })}</span>
-                      <button class="mini danger" disabled={busy || live} onclick={doCleanAll}>{t("speakers.confirmClean")}</button>
-                      <button class="mini plain" onclick={() => (confirmClean = false)}>{t("speakers.cancel")}</button>
+                      <Button variant="destructive" size="sm" disabled={busy || live} onclick={doCleanAll}>{t("speakers.confirmClean")}</Button>
+                      <Button variant="ghost" size="sm" onclick={() => (confirmClean = false)}>{t("speakers.cancel")}</Button>
                     {:else}
-                      <button class="mini plain" disabled={busy || live} onclick={() => (confirmClean = true)}>
+                      <Button variant="ghost" size="sm" disabled={busy || live} onclick={() => (confirmClean = true)}>
                         {t("speakers.cleanAll", { n: nosampleN })}
-                      </button>
+                      </Button>
                     {/if}
                   {/if}
                 </div>
@@ -766,13 +806,13 @@
         {#if archived.length > 0}
           <div class="archive">
             <div class="archive-head">
-              <button class="archive-toggle" onclick={() => (archiveOpen = !archiveOpen)}>
+              <Button variant="outline" size="sm" aria-expanded={archiveOpen} onclick={() => (archiveOpen = !archiveOpen)}>
                 {archiveOpen ? t("speakers.collapse") : t("speakers.expand")}
                 {t("speakers.archivedCount", { n: archived.length })}
-              </button>
+              </Button>
               <span class="hint">{t("speakers.archiveHint")}</span>
               <span class="spacer"></span>
-              <button class="mini plain" disabled={busy || live} onclick={ackAllInvalid}>{t("speakers.ackAll")}</button>
+              <Button variant="ghost" size="sm" disabled={busy || live} onclick={ackAllInvalid}>{t("speakers.ackAll")}</Button>
             </div>
             {#if archiveOpen}
               <div class="stack">
@@ -885,18 +925,6 @@
     gap: 0.6rem;
     margin-bottom: 0.8rem;
   }
-  .archive-toggle {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink);
-    border-radius: var(--radius-md);
-    font-size: 0.82rem;
-    padding: 0.25em 0.75em;
-    cursor: pointer;
-  }
-  .archive-toggle:hover {
-    background: var(--surface-soft);
-  }
   /* 粘性:长队列滚到深处时顶部通知(试听失败/批量操作错误/录制中提示)仍在
      视野内——否则底部操作失败表现为"点了没反应"。tint 在暗色下半透明,叠一层
      canvas 垫底,悬浮时不透出下方卡片。 */
@@ -978,9 +1006,6 @@
     align-items: flex-start;
     gap: 0.8rem;
   }
-  .panes.wrap {
-    flex-wrap: wrap;
-  }
   .arrow {
     color: var(--ink-faint);
     flex: none;
@@ -1058,19 +1083,6 @@
   .pane-head + .samples {
     margin-top: 0.4rem;
   }
-  .chip {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink-secondary);
-    border-radius: var(--radius-full);
-    font-size: 0.75rem;
-    padding: 0.15em 0.6em;
-    cursor: pointer;
-  }
-  .chip:hover {
-    background: var(--surface);
-    color: var(--ink);
-  }
   /* 试听图标:尺寸用 em 跟随 chip 字号,vertical-align 显式压到与相邻日期文字
      对齐——此前的 ▶/◼ 字符靠各平台自己的字形基线对齐,高低不一正是要修的问题。 */
   .audition-icon {
@@ -1078,10 +1090,6 @@
     height: 0.85em;
     vertical-align: -0.09em;
     margin-right: 0.15em;
-  }
-  .chip.playing {
-    border-color: var(--accent);
-    color: var(--accent);
   }
   .meets {
     display: flex;
@@ -1109,10 +1117,6 @@
     padding: 0.3rem 0.7rem 0.5rem;
     cursor: pointer;
   }
-  .pick input {
-    accent-color: var(--accent);
-    margin: 0;
-  }
   .acts {
     display: flex;
     align-items: center;
@@ -1122,43 +1126,6 @@
   }
   .spacer {
     flex: 1;
-  }
-  .mini {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink);
-    border-radius: var(--radius-md);
-    font-size: 0.82rem;
-    padding: 0.25em 0.75em;
-    cursor: pointer;
-  }
-  .mini:hover:not(:disabled) {
-    background: var(--surface-soft);
-  }
-  .mini:disabled {
-    color: var(--ink-faint);
-    cursor: default;
-  }
-  .mini.accent {
-    border-color: var(--accent);
-    color: var(--accent);
-    font-weight: 500;
-  }
-  .mini.accent:hover:not(:disabled) {
-    background: var(--accent-tint);
-  }
-  .mini.danger {
-    border-color: var(--danger);
-    color: var(--danger);
-    font-weight: 500;
-  }
-  .mini.danger:hover:not(:disabled) {
-    background: var(--danger);
-    color: var(--on-record);
-  }
-  .mini.plain {
-    border-color: transparent;
-    color: var(--ink-secondary);
   }
   .hint {
     color: var(--ink-faint);
@@ -1188,88 +1155,11 @@
     display: flex;
     flex-direction: column;
   }
-  .switch-btn {
-    position: absolute;
-    top: 0.45rem;
-    right: 0.55rem;
-    border: none;
-    background: none;
-    color: var(--ink-faint);
-    font-size: 0.75rem;
-    padding: 0.1em 0.3em;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-  }
-  .switch-btn:hover {
-    color: var(--accent);
-    background: var(--accent-tint);
-  }
-  .menu-scrim {
-    position: fixed;
-    inset: 0;
-    z-index: 9;
-    border: 0;
-    padding: 0;
-    background: transparent;
-    cursor: default;
-  }
-  .menu {
-    position: absolute;
-    top: 2rem;
-    right: 0.4rem;
-    z-index: 10;
-    min-width: 16rem;
-    max-height: 16rem;
-    overflow-y: auto;
-    background: var(--surface-press);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-    padding: 0.35rem;
-  }
   .menu-title {
     color: var(--ink-secondary);
     font-size: 0.78rem;
     line-height: 1.45;
     padding: 0.25rem 0.5rem 0.35rem;
-  }
-  .pick-input {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 0.35rem 0.5rem;
-    margin-bottom: 0.25rem;
-    background: transparent;
-    border: none;
-    border-bottom: 1px solid var(--hairline);
-    outline: none;
-    font: inherit;
-    font-size: 0.85rem;
-    color: var(--ink);
-  }
-  .pick-input::placeholder {
-    color: var(--ink-faint);
-  }
-  /* 新建行:menu 行形态,accent 色标识"这是创建动作"而非候选 */
-  .create-row {
-    display: block;
-    width: 100%;
-    padding: 0.38rem 0.55rem;
-    background: none;
-    border: none;
-    border-top: 1px solid var(--hairline);
-    border-radius: 0 0 var(--radius-md) var(--radius-md);
-    color: var(--accent);
-    font: inherit;
-    font-size: 0.85rem;
-    text-align: left;
-    cursor: pointer;
-  }
-  .create-row:hover:not(:disabled) {
-    background: var(--surface-soft);
-  }
-  .create-row:disabled {
-    color: var(--ink-faint);
-    cursor: default;
   }
 </style>
 

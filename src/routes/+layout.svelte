@@ -30,6 +30,10 @@
   import { playback, shouldShowMiniPlayer, startPlaybackSubscriptions } from "$lib/playback.svelte";
   import { gapStorm, startGapStormSubscription } from "$lib/gapStorm.svelte";
   import { initAnalytics } from "$lib/analytics";
+  import { Button } from "$lib/ui/components/button";
+
+  // 升级横幅里的两个文字按钮:accent 链接式(横幅底是 warning 色,链接蓝与之区分),字号随横幅。
+  const bannerLink = "h-auto px-1 py-0 text-[length:inherit] font-normal text-ring underline hover:text-(color:--accent-pressed)";
 
   let { children } = $props();
 
@@ -218,18 +222,19 @@
             <span class="forge-label">{updateProg?.label ?? t("shell.update.updating")}</span>
           </span>
         {:else}
-          <button
-            class="link"
+          <Button
+            variant="link"
+            class={bannerLink}
             onclick={openUpdate}
             disabled={!updateFailed && updateBlocked}
             title={!updateFailed && updateBlocked ? t("shell.update.blockedTitle") : undefined}
           >
             {updateFailed ? t("shell.update.openRelease") : t("shell.update.oneClick")}
-          </button>
+          </Button>
         {/if}
         <!-- 更新中禁「知道了」:横幅一收,下载安装仍在后台跑,几分钟后应用
              无预警重启,用户会以为闪退。 -->
-        <button class="link" onclick={dismissUpdateBanner} disabled={updating}>{t("shell.update.dismiss")}</button>
+        <Button variant="link" class={bannerLink} onclick={dismissUpdateBanner} disabled={updating}>{t("shell.update.dismiss")}</Button>
       </div>
     {/if}
     {@render children()}
@@ -296,15 +301,6 @@
     background: var(--accent);
     margin-right: 0.2em;
     flex: none;
-  }
-  .update-banner .link {
-    background: none;
-    border: none;
-    color: var(--accent);
-    text-decoration: underline;
-    cursor: pointer;
-    padding: 0 0.2em;
-    font-size: inherit;
   }
   /* —— 锻造激光进度条:更新=把新版本锻出来 —— */
   .forge {

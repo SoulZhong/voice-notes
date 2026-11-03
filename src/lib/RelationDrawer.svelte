@@ -11,6 +11,11 @@
     task10GovernanceApi,
   } from "./knowledgeGovernance";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import { Textarea } from "$lib/ui/components/textarea";
+  import * as Select from "$lib/ui/components/select";
+  import * as AlertDialog from "$lib/ui/components/alert-dialog";
 
   let {
     relationId,
@@ -47,10 +52,25 @@
   let endAt = $state("");
   let subjectName = $state("");
   let objectName = $state("");
-  let suppressDialog = $state<HTMLDialogElement>();
+  let suppressOpen = $state(false);
   let generation = 0;
   let loadedRelationId = "";
   const entityFilter = { ...DEFAULT_KNOWLEDGE_FILTER, include_history: true };
+  const PREDICATE_OPTIONS = [
+    { value: "participates_in", key: "governance.predicate.participatesIn" },
+    { value: "responsible_for", key: "governance.predicate.responsibleFor" },
+    { value: "belongs_to", key: "governance.predicate.belongsTo" },
+    { value: "uses", key: "governance.predicate.uses" },
+    { value: "depends_on", key: "governance.predicate.dependsOn" },
+    { value: "produces", key: "governance.predicate.produces" },
+    { value: "assigned_to", key: "governance.predicate.assignedTo" },
+    { value: "occurs_at", key: "governance.predicate.occursAt" },
+    { value: "custom", key: "governance.predicate.custom" },
+  ] as const;
+  const predicateOptionLabel = (value: string) => {
+    const option = PREDICATE_OPTIONS.find((o) => o.value === value);
+    return option ? t(option.key) : value;
+  };
 
   async function refreshAndReload() {
     await onChanged();
@@ -156,7 +176,7 @@
 
   async function suppressRelation() {
     if (!detail) return;
-    suppressDialog?.close();
+    suppressOpen = false;
     await runOperation(
       t("governance.relation.suppressing"),
       t("governance.relation.suppressed"),
@@ -183,7 +203,8 @@
   }
 
   function handleEscape(event: KeyboardEvent) {
-    if (event.key === "Escape" && !document.querySelector("dialog[open]")) onClose();
+    // 否决确认框开着时 Esc 只关确认框(bits-ui 自己处理),不连带关抽屉。
+    if (event.key === "Escape" && !suppressOpen && !document.querySelector("dialog[open]")) onClose();
   }
 </script>
 
@@ -195,7 +216,7 @@
       <p class="eyebrow">{t("governance.relation.eyebrow")}</p>
       <h2 id="relation-drawer-title">{t("governance.relation.title")}</h2>
     </div>
-    <button class="close" type="button" aria-label={t("governance.relation.closeAria")} onclick={onClose}>×</button>
+    <Button variant="ghost" size="icon" class="shrink-0 rounded-full text-lg text-muted-foreground" aria-label={t("governance.relation.closeAria")} onclick={onClose}>×</Button>
   </header>
 
   {#if loading}
@@ -275,37 +296,38 @@
       <section class="section actions" aria-labelledby="relation-actions">
       <h3 id="relation-actions">{t("governance.relation.actionsTitle")}</h3>
       <div class="primary-actions">
-        <button type="button" disabled={working} onclick={() => runOperation(t("governance.relation.confirming"), t("governance.relation.confirmed"), buildConfirmRelation(relation.id))}>{t("governance.relation.confirm")}</button>
-        <button class="danger" type="button" disabled={working} onclick={() => suppressDialog?.showModal()}>{t("governance.suppressReject")}</button>
+        <Button variant="outline" size="sm" disabled={working} onclick={() => runOperation(t("governance.relation.confirming"), t("governance.relation.confirmed"), buildConfirmRelation(relation.id))}>{t("governance.relation.confirm")}</Button>
+        <Button variant="destructive" size="sm" disabled={working} onclick={() => (suppressOpen = true)}>{t("governance.suppressReject")}</Button>
       </div>
 
       <details>
         <summary>{t("governance.relation.editSummary")}</summary>
         <form onsubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
           <label for="relation-subject">{t("governance.relation.subjectId")}</label>
-          <input id="relation-subject" bind:value={subjectId} disabled={working} aria-describedby="relation-feedback" />
-          <button class="swap" type="button" disabled={working} onclick={swapDirection}>{t("governance.relation.swap")}</button>
+          <Input id="relation-subject" bind:value={subjectId} disabled={working} aria-describedby="relation-feedback" />
+          <Button variant="outline" size="sm" class="justify-self-start" disabled={working} onclick={swapDirection}>{t("governance.relation.swap")}</Button>
           <label for="relation-object">{t("governance.relation.objectId")}</label>
-          <input id="relation-object" bind:value={objectId} disabled={working} aria-describedby="relation-feedback" />
+          <Input id="relation-object" bind:value={objectId} disabled={working} aria-describedby="relation-feedback" />
           <label for="relation-predicate">{t("governance.relation.type")}</label>
-          <select id="relation-predicate" bind:value={predicateType} disabled={working}>
-            <option value="participates_in">{t("governance.predicate.participatesIn")}</option><option value="responsible_for">{t("governance.predicate.responsibleFor")}</option>
-            <option value="belongs_to">{t("governance.predicate.belongsTo")}</option><option value="uses">{t("governance.predicate.uses")}</option>
-            <option value="depends_on">{t("governance.predicate.dependsOn")}</option><option value="produces">{t("governance.predicate.produces")}</option>
-            <option value="assigned_to">{t("governance.predicate.assignedTo")}</option><option value="occurs_at">{t("governance.predicate.occursAt")}</option>
-            <option value="custom">{t("governance.predicate.custom")}</option>
-          </select>
+          <Select.Root type="single" bind:value={predicateType} disabled={working}>
+            <Select.Trigger id="relation-predicate" class="w-full">{predicateOptionLabel(predicateType)}</Select.Trigger>
+            <Select.Content>
+              {#each PREDICATE_OPTIONS as option (option.value)}
+                <Select.Item value={option.value}>{t(option.key)}</Select.Item>
+              {/each}
+            </Select.Content>
+          </Select.Root>
           {#if predicateType === "custom"}
             <label for="relation-custom-label">{t("governance.relation.customLabel")}</label>
-            <input id="relation-custom-label" bind:value={predicateLabel} disabled={working} aria-describedby="relation-feedback" />
+            <Input id="relation-custom-label" bind:value={predicateLabel} disabled={working} aria-describedby="relation-feedback" />
           {/if}
           <label for="relation-valid-from">{t("governance.relation.validFromInput")}</label>
-          <input id="relation-valid-from" bind:value={validFrom} disabled={working} aria-describedby="relation-feedback" />
+          <Input id="relation-valid-from" bind:value={validFrom} disabled={working} aria-describedby="relation-feedback" />
           <label for="relation-valid-to">{t("governance.relation.validToInput")}</label>
-          <input id="relation-valid-to" bind:value={validTo} disabled={working} aria-describedby="relation-feedback" />
+          <Input id="relation-valid-to" bind:value={validTo} disabled={working} aria-describedby="relation-feedback" />
           <label for="relation-note">{t("governance.relation.note")}</label>
-          <textarea id="relation-note" bind:value={relationNote} disabled={working}></textarea>
-          <button type="submit" disabled={working || !subjectId.trim() || !objectId.trim() || !predicateType.trim() || (predicateType === "custom" && !predicateLabel.trim())}>{t("governance.relation.save")}</button>
+          <Textarea id="relation-note" class="resize-y" bind:value={relationNote} disabled={working} />
+          <Button type="submit" size="sm" class="justify-self-start" disabled={working || !subjectId.trim() || !objectId.trim() || !predicateType.trim() || (predicateType === "custom" && !predicateLabel.trim())}>{t("governance.relation.save")}</Button>
         </form>
       </details>
 
@@ -316,8 +338,8 @@
           if (endAt.trim()) void runOperation(t("governance.relation.ending"), t("governance.relation.ended"), buildEndRelation(relation.id, endAt.trim()));
         }}>
           <label for="relation-end">{t("governance.relation.endAt")}</label>
-          <input id="relation-end" bind:value={endAt} disabled={working} aria-describedby="relation-feedback" />
-          <button type="submit" disabled={working || !endAt.trim()}>{t("governance.relation.end")}</button>
+          <Input id="relation-end" bind:value={endAt} disabled={working} aria-describedby="relation-feedback" />
+          <Button type="submit" variant="outline" size="sm" class="justify-self-start" disabled={working || !endAt.trim()}>{t("governance.relation.end")}</Button>
         </form>
         <p class="unavailable">{t("governance.relation.noRestoreNote")}</p>
       </details>
@@ -329,22 +351,26 @@
     <div class="feedback-row">
       <p id="relation-feedback" class:error={Boolean(controller.error)} aria-live="polite">{status}</p>
       <div>
-        {#if controller.refreshError}<button type="button" disabled={working} onclick={() => controller.retryRefresh().then(() => { status = t("governance.refreshed"); }).catch(() => { status = controller.refreshError; })}>{t("governance.retryRefresh")}</button>{/if}
-        {#if controller.lastOperationId}<button type="button" disabled={working} onclick={undoLast}>{t("governance.relation.undoLast")}</button>{/if}
+        {#if controller.refreshError}<Button variant="outline" size="sm" disabled={working} onclick={() => controller.retryRefresh().then(() => { status = t("governance.refreshed"); }).catch(() => { status = controller.refreshError; })}>{t("governance.retryRefresh")}</Button>{/if}
+        {#if controller.lastOperationId}<Button variant="outline" size="sm" disabled={working} onclick={undoLast}>{t("governance.relation.undoLast")}</Button>{/if}
       </div>
     </div>
   {/if}
 </article>
 
 {#if !readOnly}
-  <dialog bind:this={suppressDialog} class="confirm-dialog" aria-labelledby="suppress-title" aria-describedby="suppress-description">
-    <h2 id="suppress-title">{t("governance.relation.suppressTitle")}</h2>
-    <p id="suppress-description">{t("governance.relation.suppressBody")}</p>
-    <div>
-      <button type="button" onclick={() => suppressDialog?.close()}>{t("governance.relation.suppressKeep")}</button>
-      <button class="danger" type="button" onclick={suppressRelation}>{t("governance.suppressReject")}</button>
-    </div>
-  </dialog>
+  <AlertDialog.Root bind:open={suppressOpen}>
+    <AlertDialog.Content class="sm:max-w-[420px]">
+      <AlertDialog.Header>
+        <AlertDialog.Title>{t("governance.relation.suppressTitle")}</AlertDialog.Title>
+        <AlertDialog.Description>{t("governance.relation.suppressBody")}</AlertDialog.Description>
+      </AlertDialog.Header>
+      <AlertDialog.Footer>
+        <AlertDialog.Cancel variant="outline" size="sm">{t("governance.relation.suppressKeep")}</AlertDialog.Cancel>
+        <AlertDialog.Action variant="destructive" size="sm" onclick={suppressRelation}>{t("governance.suppressReject")}</AlertDialog.Action>
+      </AlertDialog.Footer>
+    </AlertDialog.Content>
+  </AlertDialog.Root>
 {/if}
 
 <style>
@@ -352,8 +378,6 @@
   header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding-bottom: 18px; }
   .eyebrow { margin: 0 0 4px; color: var(--ink-faint); font-size: 0.72rem; letter-spacing: 0.08em; }
   h2 { margin: 0; font-size: 1.3rem; font-weight: 550; }
-  .close { width: 36px; height: 36px; border: 0; border-radius: var(--radius-full); background: transparent; color: var(--ink-secondary); font-size: 1.3rem; cursor: pointer; }
-  .close:hover { background: var(--surface-soft); color: var(--ink); }
   .state { color: var(--ink-secondary); font-size: 0.86rem; line-height: 1.55; }
   .state.error { color: var(--danger-ink); }
   .direction { display: grid; gap: 5px; padding: 14px 0 20px; border-top: 1px solid var(--hairline); overflow-wrap: anywhere; }
@@ -377,28 +401,15 @@
   blockquote a { color: var(--accent); text-decoration: none; }
   .assertion { margin: 0; padding: 12px; border: 1px solid var(--hairline); border-radius: var(--radius-md); color: var(--ink-secondary); font-size: 0.86rem; }
   .primary-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 12px; }
-  button { min-height: 34px; padding: 7px 10px; border: 1px solid var(--hairline-strong); border-radius: var(--radius-md); background: transparent; color: var(--ink-secondary); font: inherit; font-size: 0.8rem; cursor: pointer; }
-  button:hover:not(:disabled) { background: var(--surface-soft); color: var(--ink); }
-  button.danger { border-color: var(--danger-line); color: var(--danger-ink); }
-  button.danger:hover { background: var(--danger-tint); }
-  button:disabled, input:disabled, select:disabled, textarea:disabled { opacity: 0.5; cursor: default; }
   details { border-top: 1px solid var(--hairline); }
   summary { padding: 12px 2px; color: var(--ink); font-size: 0.84rem; cursor: pointer; }
   form { display: grid; gap: 7px; padding: 0 2px 14px; }
   label { color: var(--ink-secondary); font-size: 0.76rem; }
-  input, select, textarea { box-sizing: border-box; width: 100%; padding: 8px 9px; border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--surface-press); color: var(--ink); font: inherit; font-size: 0.82rem; }
-  textarea { min-height: 68px; resize: vertical; }
-  input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .swap { justify-self: start; }
+  summary:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .feedback-row { position: sticky; bottom: 0; padding: 11px 0; border-top: 1px solid var(--hairline); background: var(--surface); }
   .feedback-row p { min-height: 1.3em; margin: 0 0 6px; color: var(--success); font-size: 0.78rem; line-height: 1.45; }
   .feedback-row p.error { color: var(--danger-ink); }
   .feedback-row > div { display: flex; flex-wrap: wrap; gap: 7px; }
-  .confirm-dialog { width: min(420px, calc(100vw - 32px)); padding: 20px; border: 1px solid var(--danger-line); border-radius: var(--radius-xl); background: var(--surface); color: var(--ink); box-shadow: var(--shadow-popover); }
-  .confirm-dialog::backdrop { background: light-dark(rgba(20, 21, 22, 0.28), rgba(0, 0, 0, 0.64)); }
-  .confirm-dialog h2 { font-size: 1.05rem; }
-  .confirm-dialog p { color: var(--ink-secondary); font-size: 0.84rem; line-height: 1.6; }
-  .confirm-dialog div { display: flex; justify-content: flex-end; gap: 8px; }
-  @media (pointer: coarse) { button, summary { min-height: 44px; } .close { width: 44px; } }
+  @media (pointer: coarse) { summary { min-height: 44px; } }
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; } }
 </style>

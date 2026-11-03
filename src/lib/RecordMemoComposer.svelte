@@ -3,6 +3,7 @@
   // (memo_anchor_now),不信前端走表;草稿被清空(删光或 Esc)就丢掉锚点,下一次按键重取。
   import { t } from "$lib/i18n/index.svelte";
   import { addMemo, fmtClock, memoAnchorNow, MEMO_MAX_CHARS, type Memo } from "$lib/memos";
+  import { Textarea } from "$lib/ui/components/textarea";
 
   let { noteId, onSaved }: { noteId: string; onSaved?: (m: Memo) => void } = $props();
 
@@ -83,15 +84,18 @@
     <svg class="flag" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M3.5 14V2.5M3.5 3h8l-1.8 2.8L11.5 8.5h-8" />
     </svg>
-    <textarea
-      bind:this={el}
+    <!-- 外框(.composer)负责描边与聚焦高亮,组件本身去边去底去聚焦环;高度仍由下方
+         effect 按内容自适应(field-sizing-fixed:不让组件的 field-sizing-content 抢高度)。 -->
+    <Textarea
+      bind:ref={el}
       bind:value={text}
-      rows="1"
+      rows={1}
+      class="max-h-[120px] min-h-0 flex-1 resize-none rounded-none border-0 bg-transparent p-0 text-[0.95rem] leading-normal shadow-none field-sizing-fixed focus-visible:ring-0 disabled:bg-transparent md:text-[0.95rem] dark:bg-transparent dark:disabled:bg-transparent"
       placeholder={t("memo.composer.placeholder")}
       oninput={onInput}
       onkeydown={onKeydown}
       disabled={saving}
-    ></textarea>
+    />
   </div>
   {#if anchor !== null || error || tooLong}
     <div class="meta">
@@ -132,19 +136,6 @@
     flex: none;
     margin-top: 0.25rem;
     color: var(--ink-faint);
-  }
-  textarea {
-    flex: 1;
-    resize: none;
-    border: none;
-    outline: none;
-    background: transparent;
-    color: var(--ink);
-    font: inherit;
-    font-size: 0.95rem;
-    line-height: 1.5;
-    padding: 0;
-    max-height: 120px;
   }
   .meta {
     margin-top: 0.3rem;

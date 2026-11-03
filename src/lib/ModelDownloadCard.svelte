@@ -8,6 +8,8 @@
     type ModelDownloadEvent,
   } from "$lib/models";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Progress } from "$lib/ui/components/progress";
 
   let {
     status,
@@ -106,7 +108,7 @@
             · {t("settings.models.mirrorSwitched")}
           {/if}
         </span>
-        <div class="bar"><div class="fill" style="width:{pct(prog[a.id])}%"></div></div>
+        <Progress value={pct(prog[a.id])} class="mt-1 h-1.5" />
       {/if}
     </div>
   {/each}
@@ -120,9 +122,9 @@
 
   <div class="actions">
     {#if downloading}
-      <button onclick={() => cancelModelsDownload()}>{t("ai.modelCard.pause")}</button>
+      <Button variant="outline" onclick={() => cancelModelsDownload()}>{t("ai.modelCard.pause")}</Button>
     {:else}
-      <button class="primary" onclick={start}>{error || cancelled ? t("ai.modelCard.resume") : (primaryLabel ?? t("ai.modelCard.download"))}</button>
+      <Button class="rounded-full px-4" onclick={start}>{error || cancelled ? t("ai.modelCard.resume") : (primaryLabel ?? t("ai.modelCard.download"))}</Button>
     {/if}
     {#if !compact}
       <span class="note">{t("ai.modelCard.routeNote")}</span>
@@ -155,25 +157,7 @@
   .row { margin: 0.4rem 0; }
   .label { font-size: 0.9rem; }
   .phase { color: var(--ink-secondary); font-size: 0.8rem; margin-left: 0.5em; }
-  /* 进度条：轨 hairline、填充 accent、rounded-full */
-  .bar { height: 6px; background: var(--hairline); border-radius: var(--radius-full); margin-top: 0.25rem; overflow: hidden; }
-  .fill { height: 100%; background: var(--accent); transition: width 0.3s; }
   .actions { display: flex; align-items: center; gap: 0.8rem; margin-top: 0.8rem; flex-wrap: wrap; }
-  /* button-secondary（暂停下载/继续下载默认态） */
-  button {
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    padding: 0.45em 1.1em;
-    font-size: 0.9rem;
-    font-weight: 500;
-    cursor: pointer;
-    background: transparent;
-    color: var(--ink);
-  }
-  button:hover { background: var(--surface-soft); }
-  /* button-primary：下载模型是本卡唯一主动作 */
-  button.primary { background: var(--primary); color: var(--on-primary); border-color: transparent; border-radius: var(--radius-full); font-weight: 500; }
-  button.primary:hover { background: var(--primary-pressed); }
   .note { font-size: 0.85rem; color: var(--ink-faint); }
   .error { color: var(--danger); font-size: 0.9rem; margin-top: 0.5rem; }
   .hint { color: var(--warning-ink); font-size: 0.9rem; margin-top: 0.5rem; }

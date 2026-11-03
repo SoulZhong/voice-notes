@@ -580,13 +580,14 @@ describe("backfill dialog source contract", () => {
 
   it("uses the design-system primary CTA and coarse disclosure targets", () => {
     const dialog = source("./RelationBackfillDialog.svelte");
-    expect(dialog).toMatch(/\.primary\s*\{[^}]*background:\s*var\(--primary\)/s);
-    expect(dialog).toMatch(/\.primary\s*\{[^}]*color:\s*var\(--on-primary\)/s);
-    expect(dialog).toMatch(/\.primary\s*\{[^}]*border-radius:\s*var\(--radius-full\)/s);
-    expect(dialog).toMatch(/\.primary\s*\{[^}]*box-shadow:\s*var\(--shadow-btn\)/s);
-    expect(dialog).toMatch(/\.primary:hover:not\(:disabled\)[^}]*background:\s*var\(--primary-pressed\)/s);
-    expect(dialog).toMatch(/\.primary:active:not\(:disabled\)[^}]*translateY\(0\.5px\)/s);
-    expect(dialog).not.toMatch(/\.primary\s*\{[^}]*var\(--accent\)/s);
+    // 主操作已迁到 Button 组件(UI 改版 #730):默认变体 = bg-primary/text-primary-foreground
+    // (tailwind.css 映射到 --primary/--on-primary,按下位移由组件自带),这里钉胶囊外形、按钮阴影
+    // 与 pressed 底色,且三处主操作都走同一份 primaryCta,不得回落到 accent 蓝。
+    expect(dialog).toMatch(/const primaryCta = "[^"]*rounded-full[^"]*"/);
+    expect(dialog).toMatch(/const primaryCta = "[^"]*shadow-\[var\(--shadow-btn\)\][^"]*"/);
+    expect(dialog).toMatch(/const primaryCta = "[^"]*hover:bg-\[var\(--primary-pressed\)\][^"]*"/);
+    expect(dialog.match(/<Button\s+class=\{primaryCta\}/g)?.length).toBe(3);
+    expect(dialog).not.toMatch(/const primaryCta = "[^"]*var\(--accent\)/);
     expect(dialog).not.toMatch(/font-weight:\s*(?:620|650)/);
     expect(dialog).toMatch(/@media \(pointer: coarse\)\s*\{[^}]*\.technical summary[^}]*min-height:\s*44px/s);
   });

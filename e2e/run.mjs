@@ -104,7 +104,7 @@ try {
   // 1. 冒烟:各页面在三套皮肤 × 亮暗下都能渲染,无脚本错误
   for (const family of ["classic", "paper", "nord"]) {
     for (const mode of ["light", "dark"]) {
-      const routes = family === "classic" ? ROUTES : ["/settings", `/notes/${NOTE}`, "/record"];
+      const routes = ROUTES;
       for (const r of routes) {
         await scenario(`渲染 ${r} · ${family}/${mode}`, async () => {
           const { page, errors } = await openPage(r, { family, mode });
@@ -188,6 +188,12 @@ try {
     const added = await waitFor(async () => (await calls(page, "add_memo")).find((c) => c.args.origin === "composer"));
     assert(added && added.args.atMs === 7000, `add_memo 的时间点应为锚点 7000,实际 ${added && added.args.atMs}`);
     assert(await waitFor(() => hasText(page, "现场记一句")), "新备注没出现在书签/备注栏");
+    const overlap = await page.evaluate(() => {
+      const col = document.querySelector(".memo-col")?.getBoundingClientRect();
+      const bar = document.querySelector(".topbar")?.getBoundingClientRect();
+      return col && bar ? col.top < bar.bottom - 1 : "missing";
+    });
+    assert(overlap === false, `备注栏被吸顶操作栏盖住或缺失:${overlap}`);
     await page.screenshot({ path: join(out, "flow-record-memo.png") });
     const bad = errors.filter((e) => !benign(e));
     assert(bad.length === 0, "页面错误:\n" + bad.join("\n"));

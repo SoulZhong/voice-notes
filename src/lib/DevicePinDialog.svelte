@@ -7,24 +7,17 @@
   import { onMount } from "svelte";
   import { t } from "$lib/i18n/index.svelte";
   import { deviceSubmitPin, normalizePin, onPinClosed, onPinRequest } from "$lib/device";
+  import * as AlertDialog from "$lib/ui/components/alert-dialog";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
 
-  let dialog = $state<HTMLDialogElement | null>(null);
   let input = $state<HTMLInputElement | null>(null);
   let deviceName = $state<string | null>(null);
   let pin = $state("");
   let error = $state("");
 
   const ready = $derived(pin.length === 6);
-
-  $effect(() => {
-    if (!dialog) return;
-    if (deviceName && !dialog.open) {
-      dialog.showModal();
-      queueMicrotask(() => input?.focus());
-    } else if (!deviceName && dialog.open) {
-      dialog.close();
-    }
-  });
+  const open = $derived(deviceName !== null);
 
   onMount(() => {
     const subs = [
@@ -48,75 +41,59 @@
   }
 </script>
 
-<dialog
-  bind:this={dialog}
-  class="pin-dialog"
-  aria-labelledby="device-pin-title"
-  oncancel={(e) => {
-    e.preventDefault();
-    answer(null);
-  }}
+<!-- UI 改版:AlertDialog 外壳(模态、点遮罩不关)。打开/关闭由 deviceName 派生;组件自己发起
+     的关闭只有 Esc,等同「取消」——经 bind 的 setter 落到 answer(null),与原生 oncancel 一致。
+     打开即聚焦配对码输入框;Enter 走 form submit(凑满 6 位才提交)。 -->
+<AlertDialog.Root
+  bind:open={
+    () => open,
+    (v) => {
+      if (!v && open) answer(null);
+    }
+  }
 >
-  <h2 id="device-pin-title">{t("device.pin.title")}</h2>
-  <p>{t("device.pin.body", { name: deviceName ?? "" })}</p>
-  <form
-    onsubmit={(e) => {
+  <AlertDialog.Content
+    class="gap-0 rounded-xl border border-border bg-card p-5 text-foreground shadow-(--shadow-popover) ring-0 data-[size=default]:max-w-[min(24rem,calc(100vw-2rem))] data-[size=default]:sm:max-w-[min(24rem,calc(100vw-2rem))]"
+    onOpenAutoFocus={(e) => {
       e.preventDefault();
-      if (ready) answer(pin);
+      input?.focus();
     }}
   >
-    <input
-      bind:this={input}
-      class="pin"
-      inputmode="numeric"
-      autocomplete="one-time-code"
-      maxlength="6"
-      placeholder={t("device.pin.placeholder")}
-      value={pin}
-      oninput={(e) => (pin = normalizePin((e.target as HTMLInputElement).value))}
-    />
-    {#if error}<p class="error">{error}</p>{/if}
-    <div class="actions">
-      <button type="button" onclick={() => answer(null)}>{t("device.pin.cancel")}</button>
-      <button class="primary" type="submit" disabled={!ready}>{t("device.pin.ok")}</button>
-    </div>
-  </form>
-</dialog>
+    <AlertDialog.Title class="m-0 text-[1.05rem] font-[550]">{t("device.pin.title")}</AlertDialog.Title>
+    <AlertDialog.Description class="mt-1.5 text-[0.84rem] leading-relaxed text-muted-foreground">
+      {t("device.pin.body", { name: deviceName ?? "" })}
+    </AlertDialog.Description>
+    <form
+      onsubmit={(e) => {
+        e.preventDefault();
+        if (ready) answer(pin);
+      }}
+    >
+      <Input
+        bind:ref={input}
+        class="mt-4 h-auto bg-background px-3 py-2.5 text-center text-2xl tracking-[0.4em] tabular-nums md:text-2xl dark:bg-background"
+        inputmode="numeric"
+        autocomplete="one-time-code"
+        maxlength={6}
+        placeholder={t("device.pin.placeholder")}
+        value={pin}
+        oninput={(e) => (pin = normalizePin((e.target as HTMLInputElement).value))}
+      />
+      {#if error}<p class="error">{error}</p>{/if}
+      <div class="actions">
+        <Button variant="outline" class="rounded-full px-3.5" onclick={() => answer(null)}>{t("device.pin.cancel")}</Button>
+        <Button
+          type="submit"
+          class="rounded-full px-3.5 shadow-(--shadow-btn) hover:bg-(color:--primary-pressed)"
+          disabled={!ready}>{t("device.pin.ok")}</Button
+        >
+      </div>
+    </form>
+  </AlertDialog.Content>
+</AlertDialog.Root>
 
 <style>
-  .pin-dialog {
-    width: min(24rem, calc(100vw - 2rem));
-    padding: 20px;
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-xl);
-    background: var(--surface);
-    color: var(--ink);
-    box-shadow: var(--shadow-popover);
-  }
-  .pin-dialog::backdrop { background: light-dark(rgba(20, 21, 22, 0.28), rgba(0, 0, 0, 0.64)); }
-  h2 { margin: 0; font-size: 1.05rem; font-weight: 550; }
-  p { margin: 6px 0 0; color: var(--ink-secondary); font-size: 0.84rem; line-height: 1.6; }
-  .pin {
-    display: block;
-    width: 100%;
-    margin-top: 16px;
-    padding: 10px 12px;
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-md);
-    background: var(--canvas);
-    color: var(--ink);
-    font-size: 1.5rem;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: 0.4em;
-    text-align: center;
-  }
-  .pin:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .error { color: var(--danger); }
+  .error { margin: 6px 0 0; color: var(--danger); font-size: 0.84rem; line-height: 1.6; }
   .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
-  button { padding: 7px 14px; border: 1px solid var(--hairline); border-radius: var(--radius-full); background: var(--surface); color: var(--ink); font-size: 0.86rem; cursor: pointer; }
-  button:hover { background: var(--surface-soft); }
-  button:disabled { opacity: 0.5; cursor: default; }
-  .primary { border-color: var(--primary); background: var(--primary); color: var(--on-primary); box-shadow: var(--shadow-btn); }
-  .primary:hover:not(:disabled) { background: var(--primary-pressed); }
-  @media (pointer: coarse) { button { min-height: 44px; } }
+  @media (pointer: coarse) { .actions :global(button) { min-height: 44px; } }
 </style>

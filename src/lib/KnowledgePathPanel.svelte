@@ -2,6 +2,8 @@
   import type { KnowledgePath, KnowledgePathStep } from "$lib/knowledge";
   import { relationLabel } from "$lib/knowledgeView";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Checkbox } from "$lib/ui/components/checkbox";
 
   let {
     startId,
@@ -53,14 +55,13 @@
         <span class="point-mark endpoint">{t("graph.path.endMark")}</span>
         <strong>{nameFor(endId)}</strong>
       </div>
-      <button type="button" class="clear" onclick={onClear}>{t("graph.path.clear")}</button>
+      <Button variant="ghost" size="sm" class="shrink-0 font-normal text-muted-foreground" onclick={onClear}>{t("graph.path.clear")}</Button>
     </header>
 
     <label class="weak-toggle">
-      <input
-        type="checkbox"
+      <Checkbox
         checked={includeCooccurrence}
-        onchange={(event) => onToggleCooccurrence(event.currentTarget.checked)}
+        onCheckedChange={(checked) => onToggleCooccurrence(checked)}
       />
       <span>{t("graph.path.includeCooccur")}</span>
     </label>
@@ -93,9 +94,9 @@
                 })}
               </p>
               {#if !isWeak(step)}
-                <button type="button" class="evidence" onclick={() => onOpenEvidence(step.id)}>
+                <Button variant="link" size="xs" class="mt-1 h-auto px-0 py-[3px] text-ring" onclick={() => onOpenEvidence(step.id)}>
                   {t("graph.path.viewEvidence")}
-                </button>
+                </Button>
               {/if}
             </div>
           </li>
@@ -140,18 +141,6 @@
   }
   .point-mark.endpoint { background: var(--surface-soft); color: var(--ink-secondary); }
   .path-arrow { color: var(--ink-faint); }
-  button {
-    min-height: 32px;
-    border: 0;
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--ink-secondary);
-    font: inherit;
-    font-size: 0.73rem;
-    cursor: pointer;
-  }
-  button:hover { background: var(--surface-soft); color: var(--ink); }
-  .clear { flex: none; padding: 4px 7px; }
   .weak-toggle {
     gap: 7px;
     min-height: 38px;
@@ -160,7 +149,6 @@
     color: var(--ink-secondary);
     font-size: 0.74rem;
   }
-  input { accent-color: var(--accent); }
   .state { margin: 10px 0 2px; color: var(--ink-secondary); font-size: 0.78rem; line-height: 1.55; }
   .state.error { color: var(--danger); }
   .steps { margin: 10px 0 0; padding: 0; list-style: none; }
@@ -172,10 +160,8 @@
   .direction { color: var(--ink-faint); }
   .relation-name { margin: 4px 0 0; color: var(--ink); font-size: 0.86rem; line-height: 1.45; overflow-wrap: anywhere; }
   .provenance { flex-wrap: wrap; gap: 3px; margin: 3px 0 0; color: var(--ink-faint); font-size: 0.68rem; line-height: 1.45; }
-  .evidence { margin-top: 4px; padding: 3px 0; color: var(--accent); }
-  button:focus-visible, label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
   @media (pointer: coarse) {
-    button, .weak-toggle { min-height: 44px; }
+    .weak-toggle { min-height: 44px; }
   }
   @media (max-width: 700px) {
     .path-panel { top: auto; bottom: 12px; max-height: 52%; }

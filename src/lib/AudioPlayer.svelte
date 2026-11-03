@@ -5,6 +5,9 @@
   import { formatTs, type TrackInfo } from "$lib/notes";
   import { t } from "$lib/i18n/index.svelte";
   import { playback, shouldStopOnCleanup } from "$lib/playback.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Checkbox } from "$lib/ui/components/checkbox";
+  import * as Popover from "$lib/ui/components/popover";
 
   /* 多轨播放器(原生引擎):音频在 Rust 里单条 cpal 输出流按 offset 混音——WebView
      只画 UI。此前 <audio> 方案在打包版(tauri:// 文档源)被 WKWebView 按自动播放策略
@@ -305,25 +308,10 @@
 
   // ── 音轨菜单(收纳每轨静音开关):双轨会议才有,主控制行只留一个「音轨」按钮 ──
   let menuOpen = $state(false);
-  let menuEl = $state<HTMLElement | null>(null);
   /** 任一轨被静音:按钮点亮 + 换静音图标,收起状态也能看出「动过」。 */
   const anyMuted = $derived(tracks.some((t) => muted[t.source]));
-  // 点面板外或按 Esc 关闭(仅开启时挂监听)。capture 阶段:开关按钮本身在 menuEl 内不误关。
-  $effect(() => {
-    if (!menuOpen) return;
-    const onDown = (e: PointerEvent) => {
-      if (menuEl && !menuEl.contains(e.target as Node)) menuOpen = false;
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") menuOpen = false;
-    };
-    document.addEventListener("pointerdown", onDown, true);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("pointerdown", onDown, true);
-      document.removeEventListener("keydown", onKey);
-    };
-  });
+  // 点面板外 / Esc 关闭交给 Popover(弹层 portal 到 body,原先按 menuEl.contains 判
+  // 「点外面」的手写监听在 portal 后会把面板内的点击也当成外面,故整段移除)。
   export function play() {
     ensureLoaded();
     if (!loadPromise) return;
@@ -497,7 +485,14 @@
 
 <div class="player">
   <!-- 图标遵循 DESIGN.md:16px 线性/实心 SVG(currentColor),禁用 Unicode 符号字符 -->
-  <button class="play-btn" onclick={toggle} title={playing ? t("notes.player.pause") : t("notes.player.play")}>
+  <Button
+    variant="outline"
+    size="icon"
+    class="play-btn size-[2.1rem] flex-none rounded-full text-foreground"
+    onclick={toggle}
+    title={playing ? t("notes.player.pause") : t("notes.player.play")}
+    aria-label={playing ? t("notes.player.pause") : t("notes.player.play")}
+  >
     {#if playing}
       <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
         <rect x="3" y="2.5" width="3.4" height="11" rx="1" fill="currentColor" />
@@ -508,7 +503,7 @@
         <path d="M4.5 2.8v10.4c0 .8.9 1.3 1.6.9l8-5.2c.6-.4.6-1.4 0-1.8l-8-5.2c-.7-.4-1.6.1-1.6.9z" fill="currentColor" />
       </svg>
     {/if}
-  </button>
+  </Button>
   <span class="time">{formatTs(Math.min(currentMs, totalMs))}</span>
   <!-- 波形音轨(即进度条):条高来自段落 rms,已播部分 accent;点击/拖拽定位 -->
   <div
@@ -587,12 +582,15 @@
     <!-- 音轨菜单:双轨会议才有。回放有回音(外放+蓝牙延迟致 AEC 失效,同句两轨各一份)时
          点开静掉一轨即无回音。收进菜单——主控制行保持干净,用途一句话只在点开时出现;
          有轨被静音时按钮点亮 accent、喇叭换静音图标,收起也看得出动过。 -->
-    <div class="track-menu" bind:this={menuEl}>
-      <button
-        class="track-btn"
-        class:has-touched={anyMuted}
-        onclick={() => (menuOpen = !menuOpen)}
-        aria-expanded={menuOpen}
+    <div class="track-menu">
+      <Popover.Root bind:open={menuOpen}>
+      <Popover.Trigger>
+        {#snippet child({ props })}
+      <Button
+        {...props}
+        variant="outline"
+        size="xs"
+        class={["track-btn rounded-full text-muted-foreground", anyMuted && "has-touched"]}
         title={anyMuted ? t("notes.player.tracksMutedTitle") : t("notes.player.tracksTitle")}
       >
         {#if anyMuted}
@@ -611,19 +609,21 @@
         <svg class="chev" class:open={menuOpen} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M4 6l4 4 4-4" />
         </svg>
-      </button>
-      {#if menuOpen}
-        <div class="track-pop" role="menu">
+      </Button>
+        {/snippet}
+      </Popover.Trigger>
+      <!-- 播放器贴近视口顶,故向上弹、右对齐避免溢出右缘(同原 bottom:100%/right:0)。 -->
+      <Popover.Content side="top" align="end" sideOffset={6} class="w-auto min-w-44 gap-0 p-2">
           <p class="track-pop-hint">{t("notes.player.echoHint")}</p>
           {#each tracks as track (track.source)}
             <label class="track-row">
-              <input type="checkbox" checked={!muted[track.source]} onchange={() => toggleMute(track.source)} />
+              <Checkbox checked={!muted[track.source]} onCheckedChange={() => toggleMute(track.source)} />
               <span class="track-row-name">{track.source === "mic" ? t("notes.player.mic") : t("notes.player.system")}</span>
               {#if muted[track.source]}<span class="track-row-tag">{t("notes.player.muted")}</span>{/if}
             </label>
           {/each}
-        </div>
-      {/if}
+      </Popover.Content>
+      </Popover.Root>
     </div>
   {/if}
 </div>
@@ -650,48 +650,13 @@
     /* 间距由页面的 transport 行统一控制,组件自身不带外边距 */
     margin: 0;
   }
-  /* button-secondary 形态的圆形播放键 */
-  .play-btn {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink);
-    border-radius: 50%;
-    width: 2.1rem;
-    height: 2.1rem;
-    font-size: 0.85rem;
-    cursor: pointer;
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .play-btn:hover {
-    background: var(--surface-soft);
-  }
   /* 音轨菜单:主控制行只放一个「音轨」胶囊按钮(图标+文字+chevron),静音开关收进弹出面板 */
   .track-menu {
     position: relative;
     flex: none;
   }
-  .track-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3em;
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink-secondary);
-    border-radius: var(--radius-full);
-    padding: 0.15em 0.6em;
-    font-size: 0.75rem;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .track-btn:hover {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
   /* 改过任一默认(静音/关响度):点亮 accent,收起状态也看得出动过 */
-  .track-btn.has-touched {
+  .track-menu :global(.track-btn.has-touched) {
     color: var(--accent);
     border-color: var(--accent);
   }
@@ -701,20 +666,6 @@
   }
   .chev.open {
     transform: rotate(180deg);
-  }
-  /* 弹出面板:与改说话人菜单同语言(surface-press 底、hairline 边、rounded-lg、shadow-popover)。
-     播放器贴近视口顶,故向上弹(bottom:100%),右对齐避免溢出右缘。 */
-  .track-pop {
-    position: absolute;
-    bottom: calc(100% + 6px);
-    right: 0;
-    z-index: 20;
-    min-width: 11rem;
-    background: var(--surface-press);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-    padding: 0.5rem;
   }
   .track-pop-hint {
     margin: 0 0 0.4rem;
@@ -729,10 +680,6 @@
     padding: 0.3em 0.15rem;
     font-size: 0.85rem;
     color: var(--ink);
-    cursor: pointer;
-  }
-  .track-row input {
-    accent-color: var(--accent);
     cursor: pointer;
   }
   .track-row-name {

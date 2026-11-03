@@ -17,6 +17,13 @@
     type DictationNote,
     type DictationRecord,
   } from "$lib/device";
+  import PlayIcon from "@lucide/svelte/icons/play";
+  import { Button } from "$lib/ui/components/button";
+  import { cn } from "$lib/ui/utils";
+
+  // 行内文字操作(播放/复制/删除这一句):accent 链接式小字;danger 只给删除。
+  const linkBtn = (danger = false) =>
+    cn("h-auto gap-1 px-0 py-0 text-[0.78rem] font-normal text-ring no-underline hover:underline", danger && "text-destructive");
 
   const id = $derived($page.params.id as string);
   let note = $state<DictationNote | null>(null);
@@ -117,10 +124,15 @@
         <p class="sub">{t("device.note.subtitle", { app: note.meta.app })}</p>
       </div>
       <div class="head-actions">
-        <button class="btn" disabled={!liveText} onclick={() => copy(liveText, "all")}>
+        <Button variant="outline" size="sm" disabled={!liveText} onclick={() => copy(liveText, "all")}>
           {copied === "all" ? t("device.note.copied") : t("device.note.copyAll")}
-        </button>
-        <button class="btn danger" onclick={removeNote}>{t("device.note.deleteNote")}</button>
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          class="border-(color:--danger-line) text-destructive hover:text-destructive dark:border-(color:--danger-line)"
+          onclick={removeNote}>{t("device.note.deleteNote")}</Button
+        >
       </div>
     </header>
 
@@ -134,17 +146,18 @@
             <time>{formatDate(r.at)}</time>
             {#if r.undone}<span class="tag">{t("device.note.undone")}</span>{/if}
             {#if r.audio}
-              <button class="link" onclick={() => play(r)}>
-                ▶ {t("device.note.audio", { secs: Math.max(1, Math.round(r.duration_ms / 1000)) })}
-              </button>
+              <!-- 播放符号走线性图标(DESIGN.md 第 7 条禁 Unicode 符号字符) -->
+              <Button variant="link" class={linkBtn()} onclick={() => play(r)}>
+                <PlayIcon class="size-3" aria-hidden="true" />{t("device.note.audio", { secs: Math.max(1, Math.round(r.duration_ms / 1000)) })}
+              </Button>
             {/if}
           </div>
           <p class="text">{r.text}</p>
           <div class="row-actions">
-            <button class="link" onclick={() => copy(r.text, r.rid)}>
+            <Button variant="link" class={linkBtn()} onclick={() => copy(r.text, r.rid)}>
               {copied === r.rid ? t("device.note.copied") : t("device.note.copy")}
-            </button>
-            <button class="link danger" onclick={() => removeRecord(r)}>{t("device.note.deleteRecord")}</button>
+            </Button>
+            <Button variant="link" class={linkBtn(true)} onclick={() => removeRecord(r)}>{t("device.note.deleteRecord")}</Button>
           </div>
         </li>
       {/each}
@@ -175,20 +188,5 @@
   .undone .text { text-decoration: line-through; color: var(--ink-faint); }
   .row-actions { visibility: hidden; display: flex; gap: 10px; margin-top: 0.2rem; }
   @media (hover: none) { .row-actions { visibility: visible; } }
-  .btn {
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    padding: 0.35em 0.9em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    cursor: pointer;
-    background: transparent;
-    color: var(--ink);
-  }
-  .btn:hover { background: var(--surface-soft); }
-  .btn:disabled { opacity: 0.5; cursor: default; }
-  .btn.danger { color: var(--danger); border-color: var(--danger-line); }
-  .link { background: none; border: none; padding: 0; font: inherit; font-size: 0.78rem; color: var(--accent); cursor: pointer; }
-  .link.danger { color: var(--danger); }
   .err { color: var(--danger); font-size: 0.85rem; }
 </style>

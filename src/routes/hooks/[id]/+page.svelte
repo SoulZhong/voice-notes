@@ -3,6 +3,12 @@
   import { goto } from "$app/navigation";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import { Textarea } from "$lib/ui/components/textarea";
+  import { Switch } from "$lib/ui/components/switch";
+  import * as Select from "$lib/ui/components/select";
+  import * as ToggleGroup from "$lib/ui/components/toggle-group";
   import {
     listHooks,
     saveHooks,
@@ -125,6 +131,11 @@
     !cfg || (cfg.kind === "shell" ? !cfg.command.trim() : !cfg.url.trim()),
   );
 
+  // 分段选择(钩子类型/消息样式)共用的外观:浅底槽 + 选中项浮起,与旧 .segmented 一致。
+  const segGroupClass = "ml-auto flex-wrap justify-end rounded-md bg-[var(--surface-press)] p-0.5";
+  const segItemClass =
+    "h-auto min-w-0 rounded-md px-[0.7em] py-[0.25em] text-[0.85em] font-normal text-muted-foreground hover:bg-transparent data-[state=on]:bg-background data-[state=on]:text-foreground data-[state=on]:shadow-[var(--shadow-btn)]";
+
   const webhookHelp = $derived.by(() => {
     if (!cfg) return { desc: "", hint: "", placeholder: "" };
     if (cfg.kind === "feishu") {
@@ -165,8 +176,8 @@
           <span class="row-label">{t("hooks.field.name.label")}</span>
           <span class="row-desc">{t("hooks.field.name.desc")}</span>
         </div>
-        <input
-          class="row-input"
+        <Input
+          class="ml-auto w-52"
           placeholder={t("hooks.field.name.placeholder")}
           bind:value={cfg.name}
           oninput={() => (testResult = null)}
@@ -178,11 +189,16 @@
           <span class="row-label">{t("hooks.field.event.label")}</span>
           <span class="row-desc">{t("hooks.field.event.desc")}</span>
         </div>
-        <select class="row-input" bind:value={cfg.event} onchange={() => (testResult = null)}>
-          {#each HOOK_EVENTS as e (e.value)}
-            <option value={e.value}>{e.label}</option>
-          {/each}
-        </select>
+        <Select.Root type="single" bind:value={cfg.event} onValueChange={() => (testResult = null)}>
+          <Select.Trigger class="ml-auto w-52" aria-label={t("hooks.field.event.label")}>
+            {HOOK_EVENTS.find((e) => e.value === cfg?.event)?.label ?? cfg.event}
+          </Select.Trigger>
+          <Select.Content>
+            {#each HOOK_EVENTS as e (e.value)}
+              <Select.Item value={e.value}>{e.label}</Select.Item>
+            {/each}
+          </Select.Content>
+        </Select.Root>
       </div>
 
       <div class="row">
@@ -192,30 +208,30 @@
             {cfg.kind === "shell" ? t("hooks.kind.shellDesc") : webhookHelp.desc}
           </span>
         </div>
-        <div class="segmented" role="radiogroup" aria-label={t("hooks.field.kind.label")}>
+        <ToggleGroup.Root
+          type="single"
+          spacing={1}
+          class={segGroupClass}
+          aria-label={t("hooks.field.kind.label")}
+          value={cfg.kind}
+          onValueChange={(v) => {
+            // 单选分段:再点已选项会被 bits 报成空值,视为不变(旧单选框也无法取消)
+            if (!v || v === cfg!.kind) return;
+            cfg!.kind = v as HookKind;
+            cfg!.webhook_type =
+              v === "feishu" || v === "wecom" ? v : "generic";
+            testResult = null;
+          }}
+        >
           {#each [
             ["shell", "Shell"],
             ["feishu", t("hooks.kind.feishu")],
             ["wecom", t("hooks.kind.wecom")],
             ["webhook", t("hooks.kind.generic")],
           ] as [v, label] (v)}
-            <label class="seg-item">
-              <input
-                type="radio"
-                name="kind"
-                value={v}
-                checked={cfg.kind === v}
-                onchange={() => {
-                  cfg!.kind = v as HookKind;
-                  cfg!.webhook_type =
-                    v === "feishu" || v === "wecom" ? v : "generic";
-                  testResult = null;
-                }}
-              />
-              {label}
-            </label>
+            <ToggleGroup.Item value={v} class={segItemClass}>{label}</ToggleGroup.Item>
           {/each}
-        </div>
+        </ToggleGroup.Root>
       </div>
 
       {#if cfg.kind === "shell"}
@@ -224,13 +240,13 @@
             <span class="row-label">{t("hooks.field.command.label")}</span>
             <span class="row-desc">{t("hooks.field.command.desc")}</span>
           </div>
-          <textarea
-            class="cmd"
-            rows="3"
+          <Textarea
+            class="resize-y font-mono text-[0.85em] leading-normal"
+            rows={3}
             placeholder={t("hooks.field.command.placeholder")}
             bind:value={cfg.command}
             oninput={() => (testResult = null)}
-          ></textarea>
+          />
         </div>
       {:else}
         <div class="row">
@@ -238,8 +254,8 @@
             <span class="row-label">{t("hooks.field.url.label")}</span>
             <span class="row-desc">{webhookHelp.hint}</span>
           </div>
-          <input
-            class="row-input wide"
+          <Input
+            class="ml-auto w-80 max-w-full"
             placeholder={webhookHelp.placeholder}
             bind:value={cfg.url}
             oninput={() => (testResult = null)}
@@ -253,23 +269,22 @@
                 {cfg.kind === "feishu" ? t("hooks.style.feishuDesc") : t("hooks.style.wecomDesc")}
               </span>
             </div>
-            <div class="segmented" role="radiogroup" aria-label={t("hooks.field.style.label")}>
+            <ToggleGroup.Root
+              type="single"
+              spacing={1}
+              class={segGroupClass}
+              aria-label={t("hooks.field.style.label")}
+              value={cfg.webhook_message_style}
+              onValueChange={(v) => {
+                if (!v || v === cfg!.webhook_message_style) return;
+                cfg!.webhook_message_style = v as "text" | "rich";
+                testResult = null;
+              }}
+            >
               {#each [["rich", cfg.kind === "feishu" ? t("hooks.style.rich") : "Markdown"], ["text", t("hooks.style.plain")]] as [v, label] (v)}
-                <label class="seg-item">
-                  <input
-                    type="radio"
-                    name="message-style"
-                    value={v}
-                    checked={cfg.webhook_message_style === v}
-                    onchange={() => {
-                      cfg!.webhook_message_style = v as "text" | "rich";
-                      testResult = null;
-                    }}
-                  />
-                  {label}
-                </label>
+                <ToggleGroup.Item value={v} class={segItemClass}>{label}</ToggleGroup.Item>
               {/each}
-            </div>
+            </ToggleGroup.Root>
           </div>
 
           {#if cfg.kind === "feishu"}
@@ -278,8 +293,8 @@
                 <span class="row-label">{t("hooks.field.secret.label")}</span>
                 <span class="row-desc">{t("hooks.field.secret.desc")}</span>
               </div>
-              <input
-                class="row-input wide"
+              <Input
+                class="ml-auto w-80 max-w-full"
                 type="password"
                 autocomplete="off"
                 placeholder={t("hooks.field.secret.placeholder")}
@@ -294,7 +309,7 @@
               <span class="row-label">{t("hooks.field.mentionAll.label")}</span>
               <span class="row-desc">{t("hooks.field.mentionAll.desc")}</span>
             </div>
-            <input type="checkbox" class="switch" bind:checked={cfg.webhook_mention_all} />
+            <Switch bind:checked={cfg.webhook_mention_all} />
           </label>
 
           <div class="webhook-tip">
@@ -319,11 +334,9 @@
           </span>
         </div>
         <!-- 与启用开关不同:附带与否改变测试注入的内容,旧测试结果不再作数 -->
-        <input
-          type="checkbox"
-          class="switch"
+        <Switch
           bind:checked={cfg.include_note}
-          onchange={() => (testResult = null)}
+          onCheckedChange={() => (testResult = null)}
         />
       </label>
 
@@ -332,19 +345,19 @@
           <span class="row-label">{t("hooks.field.enabled.label")}</span>
           <span class="row-desc">{t("hooks.field.enabled.desc")}</span>
         </div>
-        <input type="checkbox" class="switch" bind:checked={cfg.enabled} />
+        <Switch bind:checked={cfg.enabled} />
       </label>
     </div>
 
     <div class="actions">
-      <button class="btn-primary" onclick={save} disabled={saving || bodyMissing}>
+      <Button class="rounded-full px-4 shadow-[var(--shadow-btn)]" onclick={save} disabled={saving || bodyMissing}>
         {saving ? t("hooks.action.saving") : t("hooks.action.save")}
-      </button>
-      <button class="btn-secondary" onclick={runTest} disabled={testing || bodyMissing}>
+      </Button>
+      <Button variant="outline" onclick={runTest} disabled={testing || bodyMissing}>
         {testing ? t("hooks.action.testing") : t("hooks.action.test")}
-      </button>
+      </Button>
       {#if !isNew}
-        <button class="btn-danger" onclick={remove}>{t("hooks.action.delete")}</button>
+        <Button variant="destructive" class="ml-auto" onclick={remove}>{t("hooks.action.delete")}</Button>
       {/if}
     </div>
 
@@ -381,66 +394,6 @@
   .row-info { flex: 1; min-width: 11rem; display: flex; flex-direction: column; gap: 0.1rem; }
   .row-label { font-size: 0.92rem; color: var(--ink); }
   .row-desc { font-size: 0.8rem; color: var(--ink-secondary); line-height: 1.4; }
-  .row-input {
-    margin-left: auto;
-    box-sizing: border-box;
-    width: 13rem;
-    padding: 0.35em 0.6em;
-    border: 1px solid transparent;
-    border-radius: var(--radius-md);
-    background: var(--surface-press);
-    color: var(--ink);
-    font-size: 0.88em;
-  }
-  .row-input.wide { width: 20rem; max-width: 100%; }
-  .row-input:focus {
-    outline: none;
-    background: var(--canvas);
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-  select.row-input { cursor: pointer; }
-  .cmd {
-    box-sizing: border-box;
-    width: 100%;
-    padding: 0.5em 0.7em;
-    border: 1px solid transparent;
-    border-radius: var(--radius-md);
-    background: var(--surface-press);
-    color: var(--ink);
-    font-size: 0.85em;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    line-height: 1.5;
-    resize: vertical;
-  }
-  .cmd:focus {
-    outline: none;
-    background: var(--canvas);
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-  .segmented {
-    margin-left: auto;
-    display: flex;
-    background: var(--surface-press);
-    border-radius: var(--radius-md);
-    padding: 2px;
-  }
-  .seg-item {
-    padding: 0.25em 0.7em;
-    border-radius: var(--radius-md);
-    font-size: 0.85em;
-    color: var(--ink-secondary);
-    cursor: pointer;
-  }
-  .seg-item:hover { color: var(--ink); }
-  .seg-item:has(input:checked) {
-    background: var(--canvas);
-    color: var(--ink);
-    box-shadow: var(--shadow-btn);
-  }
-  .seg-item input { position: absolute; opacity: 0; pointer-events: none; }
-  .segmented { flex-wrap: wrap; justify-content: flex-end; }
   .webhook-tip {
     display: flex;
     align-items: center;
@@ -454,41 +407,6 @@
   }
   .webhook-tip span { color: var(--success, var(--ink)); font-weight: 600; }
   .actions { margin-top: 1rem; display: flex; gap: 0.6rem; align-items: center; }
-  .btn-primary {
-    border: none;
-    border-radius: var(--radius-full);
-    padding: 0.45em 1.1em;
-    font-size: 0.88rem;
-    font-weight: 500;
-    color: var(--on-primary);
-    background: var(--primary);
-    box-shadow: var(--shadow-btn);
-    cursor: pointer;
-  }
-  .btn-primary:hover { background: var(--primary-pressed); }
-  .btn-primary:disabled { opacity: 0.5; cursor: default; }
-  .btn-secondary {
-    background: transparent;
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-md);
-    padding: 0.4em 0.9em;
-    font-size: 0.88rem;
-    color: var(--ink);
-    cursor: pointer;
-  }
-  .btn-secondary:hover { background: var(--surface-soft); }
-  .btn-secondary:disabled { opacity: 0.5; cursor: default; }
-  .btn-danger {
-    margin-left: auto;
-    background: transparent;
-    border: 1px solid var(--danger);
-    border-radius: var(--radius-md);
-    padding: 0.4em 0.9em;
-    font-size: 0.88rem;
-    color: var(--danger);
-    cursor: pointer;
-  }
-  .btn-danger:hover { background: var(--danger-tint); }
   .test-result { font-size: 0.85rem; margin: 0.6rem 0 0; }
   .test-result.ok { color: var(--success, var(--ink-secondary)); }
   .test-result.err { color: var(--danger-ink); }

@@ -1,5 +1,8 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import * as ToggleGroup from "$lib/ui/components/toggle-group";
+  import { toggleVariants } from "$lib/ui/components/toggle";
+  import { cn } from "$lib/ui/utils";
   import { nextEnabledIndex, type SegmentedItem } from "./segmented";
 
   let {
@@ -16,8 +19,8 @@
     size?: "sm" | "md";
   } = $props();
 
-  let trackEl: HTMLDivElement | undefined = $state();
-  let btns: (HTMLButtonElement | undefined)[] = $state([]);
+  let trackEl: HTMLElement | null = $state(null);
+  let btns: (HTMLElement | null | undefined)[] = $state([]);
   // 滑块几何与过渡开关分开存,measure 只写不读它们:在 $effect 里读写同一 state
   // 会无限重跑,effect_update_depth_exceeded 冻死整页反应性(2026-08-09 实锤:
   // 首帧渲染正常,之后全应用点击无响应)。ready=false 时不播过渡:首帧直接落位。
@@ -52,6 +55,14 @@
     return () => ro.disconnect();
   });
 
+  // 选中态完全受控于 value 属性:ToggleGroup 的写入只转成 onSelect,不在组件内存一份
+  // (父组件可能拒绝/延后切换,如声纹模型要先确认)。单选组再点已选项会写入 "",忽略。
+  function pick(v: string) {
+    if (!v || v === value) return;
+    const it = items.find((x) => x.id === v);
+    if (it && !it.momentary && !it.disabled) onSelect(v);
+  }
+
   function handleKey(e: KeyboardEvent) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
     const next = nextEnabledIndex(items, activeIdx, e.key === "ArrowRight" ? 1 : -1);
@@ -60,9 +71,25 @@
     onSelect(items[next]!.id);
     btns[next]?.focus();
   }
+
+  const itemClass = $derived(
+    cn(
+      "relative z-[1] rounded-[calc(var(--radius-md)_-_2px)] font-medium tracking-[0.2px] text-muted-foreground",
+      "hover:bg-transparent hover:text-foreground data-[state=on]:bg-transparent data-[state=on]:text-foreground",
+      "disabled:pointer-events-auto disabled:cursor-default disabled:opacity-45 disabled:hover:text-muted-foreground",
+      size === "sm" ? "h-6 min-w-0 px-2 text-[0.8rem]" : "h-7 min-w-0 px-2.5 text-[0.85rem]",
+    ),
+  );
 </script>
 
-<div class="seg" class:sm={size === "sm"} role="tablist" bind:this={trackEl}>
+<ToggleGroup.Root
+  type="single"
+  bind:ref={trackEl}
+  bind:value={() => value, pick}
+  rovingFocus={false}
+  spacing={0.5}
+  class="relative flex-none rounded-md border border-border bg-muted p-0.5"
+>
   <span
     class="thumb"
     class:ready={ready}
@@ -71,34 +98,38 @@
     aria-hidden="true"
   ></span>
   {#each items as it, i (it.id)}
-    <button
-      bind:this={btns[i]}
-      type="button"
-      role={it.momentary ? undefined : "tab"}
-      aria-selected={it.momentary ? undefined : it.id === value}
-      class="seg-btn"
-      class:active={!it.momentary && it.id === value}
-      disabled={it.disabled}
-      title={it.title}
-      tabindex={it.momentary ? 0 : it.id === value ? 0 : -1}
-      onclick={() => (it.momentary ? onAction?.(it.id) : onSelect(it.id))}
-      onkeydown={handleKey}
-    >{it.label}</button>
+    {#if it.momentary}
+      <!-- 动作段:不参与单选,点了触发 onAction,滑块不落位 -->
+      <button
+        bind:this={btns[i]}
+        type="button"
+        class={cn(toggleVariants({ size: size === "sm" ? "sm" : "default" }), itemClass)}
+        disabled={it.disabled}
+        title={it.title}
+        onclick={() => onAction?.(it.id)}
+        onkeydown={handleKey}
+      >{it.label}</button>
+    {:else}
+      <ToggleGroup.Item
+        value={it.id}
+        disabled={it.disabled}
+        title={it.title}
+        size={size === "sm" ? "sm" : "default"}
+        class={itemClass}
+        onkeydown={handleKey}
+      >
+        {#snippet child({ props })}
+          <!-- 漫游 tabindex 自己管:Tab 只停在选中项,方向键切换(原 tablist 语义) -->
+          <button {...props} bind:this={btns[i]} tabindex={it.id === value ? 0 : -1}>{it.label}</button>
+        {/snippet}
+      </ToggleGroup.Item>
+    {/if}
   {/each}
-</div>
+</ToggleGroup.Root>
 
 <style>
-  /* 凹槽式 segmented(DESIGN.md 命令面板语言):surface-soft 凹槽轨道 + 发丝线边,
+  /* 凹槽式 segmented(DESIGN.md 命令面板语言):muted 凹槽轨道 + 发丝线边(ToggleGroup 根),
      选中项是抬升滑块(surface-press + hairline-strong + shadow-btn),120ms 滑动。 */
-  .seg {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    padding: 2px;
-    background: var(--surface-soft);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-md);
-  }
   .thumb {
     position: absolute;
     top: 2px;
@@ -118,37 +149,6 @@
   }
   .thumb.gone {
     opacity: 0;
-  }
-  .seg-btn {
-    position: relative;
-    border: none;
-    background: none;
-    box-shadow: none;
-    padding: 0.28em 0.7em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    line-height: 1.3;
-    letter-spacing: 0.2px;
-    color: var(--ink-secondary);
-    border-radius: calc(var(--radius-md) - 2px);
-    cursor: pointer;
-    transition: color 120ms ease;
-  }
-  .sm .seg-btn {
-    font-size: 0.8rem;
-    padding: 0.2em 0.55em;
-  }
-  .seg-btn:hover:not(:disabled),
-  .seg-btn.active {
-    color: var(--ink);
-  }
-  .seg-btn:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-  .seg-btn:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: -1px;
   }
   @media (prefers-reduced-motion: reduce) {
     .thumb.ready {

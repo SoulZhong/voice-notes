@@ -16,6 +16,8 @@
 
 ## 写法
 
+- 开关与进度条的「开/已完成」用链接蓝(`bg-ring` = `var(--accent)`),开关滑块恒白——沿用 DESIGN.md 的开关规格,已在 `switch`/`progress` 组件里改好。
+
 - 组件从 `$lib/ui/components/<name>` 导入;类名合并用 `cn` (`$lib/ui/utils`)。
 - 颜色只用语义:Tailwind 侧 `bg-background / bg-card / bg-muted / text-muted-foreground /
   border-border / bg-primary / text-destructive`;或仍用 `var(--canvas)` 等 app.css token。

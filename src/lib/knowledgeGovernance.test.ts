@@ -582,10 +582,12 @@ describe("governance UI source contract", () => {
     const backfill = source("./RelationBackfillDialog.svelte");
     expect(backfill).toContain('busy && state.phase !== "cancel-requested"');
     expectCopy(backfill, governanceZh, "governance.backfill.cancelNote", "当前模型请求结束或超时后会停止，结果不会写入。你可以关闭窗口继续使用应用。");
-    expect(backfill).toContain('<button class="secondary" type="button" onclick={closeDialog}>{t("governance.backfill.closeWindow")}</button>');
+    // 按钮已迁到 Button 组件(UI 改版 #730):意图不变——取消已受理时有一个可点的「关闭窗口」。
+    expect(backfill).toContain('<Button variant="outline" onclick={closeDialog}>{t("governance.backfill.closeWindow")}</Button>');
     expect(governanceZh["governance.backfill.closeWindow"]).toBe("关闭窗口");
     // 取消进行中不得退化成一个只能干等的禁用按钮(文案与禁用态都不该出现)。
     expect(backfill).not.toContain('<button class="secondary" type="button" disabled>');
+    expect(backfill).not.toMatch(/<Button[^>]*\bdisabled\b[^>]*>\{t\("governance\.backfill\.closeWindow"\)\}/);
     for (const v of Object.values(governanceZh)) {
       if (typeof v === "string") expect(v).not.toBe("等待取消");
     }

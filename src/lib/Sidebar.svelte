@@ -36,6 +36,11 @@
     onDictationNotesChanged,
     type DictationSummary,
   } from "$lib/device";
+  import XIcon from "@lucide/svelte/icons/x";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import * as ContextMenu from "$lib/ui/components/context-menu";
+  import { cn } from "$lib/ui/utils";
 
   let notes = $state<NoteSummary[]>([]);
   /** 听写笔记(设备听写按会话归档):与会议笔记同列,按最后一次听写的时间插入。 */
@@ -178,28 +183,25 @@
   );
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");
-  // 右键菜单(冒烟反馈:改名/删除从行内挪进 context menu,列表不再有常驻操作行)
+  // 右键菜单(冒烟反馈:改名/删除从行内挪进 context menu,列表不再有常驻操作行)。
+  // UI 改版:换成 ContextMenu 组件——整张列表共用一个触发器(不给每行各挂一个菜单实例),
+  // 右键时按事件目标的 data-note-id 认行;光标处展开与视口钳制、Esc/点别处关闭由组件承担。
   let menuForId = $state<string | null>(null);
-  let menuX = $state(0);
-  let menuY = $state(0);
-  let menuEl = $state<HTMLElement | null>(null);
-  // 视口钳制:菜单在光标处展开,靠近右/下缘时整体收回视口内(原生菜单惯例),
-  // 渲染后按实测尺寸修正一次。
-  $effect(() => {
-    if (!menuEl) return;
-    const r = menuEl.getBoundingClientRect();
-    if (r.right > window.innerWidth - 8) menuX = Math.max(8, window.innerWidth - 8 - r.width);
-    if (r.bottom > window.innerHeight - 8) menuY = Math.max(8, window.innerHeight - 8 - r.height);
-  });
+  let menuOpen = $state(false);
+  /** 菜单里点了「重命名」:等菜单收起后再进改名态——否则改名框刚拿到焦点就可能被
+      菜单的关闭/焦点归还抢走,blur 立即提交,看上去像「点了重命名没反应」。 */
+  let renameAfterClose: NoteSummary | null = null;
 
-  function openMenu(e: MouseEvent, id: string) {
-    e.preventDefault();
-    menuForId = id;
-    menuX = e.clientX;
-    menuY = e.clientY;
+  function onListContextMenu(e: MouseEvent, open: unknown) {
+    // 听写行自己处理右键(先 preventDefault,组件据此不开菜单);空白处不开菜单。
+    const row = (e.target as HTMLElement).closest<HTMLElement>("[data-note-id]");
+    if (!row) return;
+    menuForId = row.dataset.noteId ?? null;
+    (open as (e: MouseEvent) => void)(e);
   }
 
   function closeMenu() {
+    menuOpen = false;
     menuForId = null;
   }
 
@@ -419,6 +421,29 @@
 
   // 暂停是运行时标志(不落盘),active 笔记叠加 recording.paused 显示「已暂停」,
   // 与录制按钮(下方 365 行)/实时转写页头同口径。合成逻辑抽 noteBadgeKind(带单测)。
+  // ── 控件外观(UI 改版):侧栏过滤框沿用「内嵌式」——surface-press 底、无边,聚焦才浮出
+  // canvas 底 + accent 边;Notion 侧栏过滤即此形态,带边框的输入框在侧栏里比正文还抢眼。
+  const searchClass =
+    "my-3 h-8 border-transparent bg-accent dark:bg-accent focus-visible:bg-background dark:focus-visible:bg-background";
+  /** 图谱视角分段(实体/文章):选中段抬成 surface 底 + 微投影,与原分段控件同观感。 */
+  function segClass(on: boolean) {
+    return cn(
+      "h-7 flex-1 rounded-[calc(var(--radius-md)-2px)] text-[0.8em]",
+      on
+        ? "bg-card text-foreground shadow-(--shadow-btn) hover:bg-card dark:hover:bg-card"
+        : "text-muted-foreground",
+    );
+  }
+  /** 图谱 kind 过滤药丸:选中走 accent 弱底 + accent 字。 */
+  function chipClass(on: boolean) {
+    return cn(
+      "gchip h-auto gap-1 rounded-full px-2.5 py-0.5 text-[0.72em]",
+      on
+        ? "bg-(color:--accent-tint) text-ring hover:bg-(color:--accent-tint) hover:text-ring dark:hover:bg-(color:--accent-tint)"
+        : "bg-accent text-muted-foreground",
+    );
+  }
+
   const badgeLabel: Record<NoteBadgeKind, () => string> = {
     active: () => t("shell.note.stateActive"),
     paused: () => t("shell.note.statePaused"),
@@ -507,29 +532,34 @@
 
   <div id="graph-sidebar-panel" class="panel" class:drawer-open={graphDrawerOpen}>
   {#if tab === "graph"}
-    <button
-      type="button"
+    <Button
+      variant="ghost"
+      size="icon"
       class="graph-drawer-close"
       aria-label={t("shell.graph.closeSidebar")}
       onclick={() => (graphDrawerOpen = false)}
-    >×</button>
+    ><XIcon /></Button>
   {/if}
-  <button
-    class="record-btn"
-    class:recording={recording.isLive}
+  <Button
+    class={cn(
+      "h-9 w-full gap-2 rounded-full text-[0.9rem] shadow-(--shadow-btn) hover:bg-(color:--primary-pressed) disabled:opacity-60",
+      recording.isLive && "text-(color:--record)",
+    )}
     onclick={toggleRecording}
     disabled={recording.pending || recording.stopping}
     title={recording.stopping ? t("shell.record.finishingHint") : undefined}
   >
     <span class="rec-dot" class:square={recording.isLive}></span>
     {recording.stopping ? t("shell.record.start") : recording.isLive ? (recording.paused ? t("shell.record.paused") : t("shell.record.stop")) : t("shell.record.start")}
-  </button>
+  </Button>
 
   <!-- 导入已有录音:录制的次级入口,常驻在录制药丸下方。刻意带文字而非纯图标——
        同样的幽灵图标钮在重转写入口上被实测"没人找到"(见笔记页 retrans-btn 注释)。
        录制中禁用:后端同样会拒(录制与转写全局互斥),这里先一步说明原因。 -->
-  <button
-    class="import-btn"
+  <Button
+    variant="ghost"
+    size="sm"
+    class="mt-1.5 w-full rounded-full text-[0.82rem] text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-muted"
     onclick={importAudioFile}
     disabled={importing || recording.isLive || recording.pending}
     title={recording.isLive ? t("shell.import.busyRecording") : t("shell.import.hint")}
@@ -539,7 +569,7 @@
       <path d="M2.5 10.5v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2" />
     </svg>
     {importing ? t("shell.import.running") : t("shell.import.action")}
-  </button>
+  </Button>
 
   {#if tab === "hooks"}
     {#if hooksError}
@@ -548,12 +578,18 @@
     <ul class="list">
       <!-- 固定入口:新建钩子——虚线「添加」按钮,与下方钩子列表行明确区分 -->
       <li class="new-hook-row">
-        <a class="new-hook" class:current={$page.url.pathname === "/hooks/new"} href="/hooks/new">
+        <Button
+          href="/hooks/new"
+          class={cn(
+            "mt-3.5 h-9 w-full gap-2 rounded-full bg-ring text-[0.9rem] font-semibold text-(color:--on-accent) shadow-(--shadow-btn) hover:bg-(color:--accent-pressed)",
+            $page.url.pathname === "/hooks/new" && "bg-(color:--accent-pressed)",
+          )}
+        >
           <svg class="new-hook-icon" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
             <path d="M8 3.5v9M3.5 8h9" />
           </svg>
           {t("shell.hooks.new")}
-        </a>
+        </Button>
       </li>
       {#if hookList.length === 0 && !hooksError}
         <p class="empty-hint">{t("shell.hooks.emptyHint1")}<br />{t("shell.hooks.emptyHint2")}</p>
@@ -614,7 +650,7 @@
           {/if}
         </li>
         <li class="people-search-row">
-          <input class="people-search" placeholder={t("shell.people.searchPlaceholder")} bind:value={peopleQuery} />
+          <Input class="h-7 bg-card text-[0.82rem] md:text-[0.82rem]" placeholder={t("shell.people.searchPlaceholder")} bind:value={peopleQuery} />
         </li>
       {/if}
       {#if peopleUnnamed.length > 0}
@@ -635,19 +671,23 @@
     </ul>
   {:else if tab === "graph"}
     <div class="gmode" aria-label={t("shell.graph.viewAria")}>
-      <button
-        class="gmode-seg"
-        class:on={graphFilter.mode === "entity"}
+      <Button
+        variant="ghost"
+        size="sm"
+        class={segClass(graphFilter.mode === "entity")}
+        aria-pressed={graphFilter.mode === "entity"}
         onclick={() => { graphFilter.mode = "entity"; if ($page.url.search) goto("/graph"); }}
-      >{t("shell.graph.modeEntity")}</button>
-      <button
-        class="gmode-seg"
-        class:on={graphFilter.mode === "note"}
+      >{t("shell.graph.modeEntity")}</Button>
+      <Button
+        variant="ghost"
+        size="sm"
+        class={segClass(graphFilter.mode === "note")}
+        aria-pressed={graphFilter.mode === "note"}
         onclick={() => { graphFilter.mode = "note"; if ($page.url.search) goto("/graph"); }}
-      >{t("shell.graph.modeNote")}</button>
+      >{t("shell.graph.modeNote")}</Button>
     </div>
-    <input
-      class="search"
+    <Input
+      class={searchClass}
       type="search"
       name="graph-search"
       aria-label={graphFilter.mode === "note" ? t("shell.graph.searchNotes") : t("shell.graph.searchEntities")}
@@ -659,11 +699,11 @@
     {/if}
     {#if graphFilter.mode === "entity"}
       <div class="gchips">
-        <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>{t("shell.graph.kindAll")}</button>
+        <Button variant="ghost" size="xs" class={chipClass(graphFilter.kind === "all")} aria-pressed={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>{t("shell.graph.kindAll")}</Button>
         {#each graphKinds as k (k)}
-          <button class="gchip" class:on={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
+          <Button variant="ghost" size="xs" class={chipClass(graphFilter.kind === k)} aria-pressed={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
             <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
-          </button>
+          </Button>
         {/each}
       </div>
       {#if graphShown.length === 0}
@@ -701,7 +741,7 @@
       </ul>
     {/if}
   {:else}
-  <input class="search" type="search" placeholder={t("shell.notes.filterPlaceholder")} bind:value={query} />
+  <Input class={searchClass} type="search" placeholder={t("shell.notes.filterPlaceholder")} bind:value={query} />
 
   {#if error}
     <div class="banner">{error}</div>
@@ -715,7 +755,27 @@
     </p>
   {/if}
 
-  <ul class="list">
+  <ContextMenu.Root
+    bind:open={menuOpen}
+    onOpenChange={(o) => {
+      if (o) return;
+      menuForId = null;
+      const n = renameAfterClose;
+      renameAfterClose = null;
+      if (n) setTimeout(() => beginRename(n), 0);
+    }}
+  >
+  <ContextMenu.Trigger>
+    {#snippet child({ props })}
+  <!-- 触发器 props 自带 tabindex=-1,这里覆盖回 undefined(列表本身不进 Tab 序) -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <ul
+    {...props}
+    class="list"
+    tabindex={undefined}
+    onpointerdown={undefined}
+    oncontextmenu={(e) => onListContextMenu(e, props.oncontextmenu)}
+  >
     {#each rows as row (row.kind === "note" ? row.n.id : row.d.id)}
       {#if row.kind === "dictation"}
         {@const d = row.d}
@@ -747,18 +807,18 @@
       <li
         class="item"
         class:current={$page.url.pathname === `/notes/${n.id}`}
+        data-note-id={n.id}
         onclick={(e) => rowClick(e, n)}
-        oncontextmenu={(e) => openMenu(e, n.id)}
       >
         <div class="main-line">
           {#if editingId === n.id}
             <!-- svelte-ignore a11y_autofocus -->
-            <input
-              class="rename"
+            <Input
+              class="h-6 border-ring bg-background px-1.5 text-[0.92em] md:text-[0.92em]"
               autofocus
               bind:value={editingTitle}
               onkeydown={(e) => {
-                if (e.key === "Enter") commitRename();
+                if (e.key === "Enter" && !e.isComposing) commitRename();
                 if (e.key === "Escape") editingId = null;
               }}
               onblur={commitRename}
@@ -789,6 +849,27 @@
       {/if}
     {/each}
   </ul>
+    {/snippet}
+  </ContextMenu.Trigger>
+  <!-- 关闭时不把焦点还给列表:改名框此刻要拿焦点(见 renameAfterClose)。 -->
+  <ContextMenu.Content class="min-w-36" onCloseAutoFocus={(e) => e.preventDefault()}>
+    {@const menuNote = notes.find((n) => n.id === menuForId)}
+    <ContextMenu.Item
+      onSelect={() => {
+        renameAfterClose = menuNote ?? null;
+      }}>{t("shell.menu.rename")}</ContextMenu.Item
+    >
+    <ContextMenu.Item
+      variant="destructive"
+      onSelect={() => {
+        const id = menuForId!;
+        const title = menuNote?.title ?? "";
+        closeMenu();
+        confirmDelete(id, title);
+      }}>{t("shell.menu.delete")}</ContextMenu.Item
+    >
+  </ContextMenu.Content>
+  </ContextMenu.Root>
   {/if}
 
   </div>
@@ -803,35 +884,11 @@
   ></button>
 {/if}
 
-{#if menuForId}
-  {@const menuNote = notes.find((n) => n.id === menuForId)}
-  <!-- 点击任意处关闭;键盘路径由 svelte:window 的 Esc 承担,遮罩是纯指针便利层 -->
-  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-  <div class="menu-overlay" onclick={closeMenu} oncontextmenu={(e) => { e.preventDefault(); closeMenu(); }}></div>
-  <div class="ctx-menu" bind:this={menuEl} style="left: {menuX}px; top: {menuY}px">
-    <button
-      class="ctx-item"
-      onclick={() => {
-        if (menuNote) beginRename(menuNote);
-        closeMenu();
-      }}>{t("shell.menu.rename")}</button
-    >
-    <button
-      class="ctx-item danger"
-      onclick={() => {
-        const id = menuForId!;
-        const title = menuNote?.title ?? "";
-        closeMenu();
-        confirmDelete(id, title);
-      }}>{t("shell.menu.delete")}</button
-    >
-  </div>
-{/if}
-
 <svelte:window onkeydown={(e) => {
   if (e.key !== "Escape") return;
-  if (menuForId) closeMenu();
-  else if (graphDrawerOpen) graphDrawerOpen = false;
+  // 右键菜单的 Esc 由 ContextMenu 组件自己收;这里只管图谱抽屉(两者不会同时出现)。
+  if (menuOpen) return;
+  if (graphDrawerOpen) graphDrawerOpen = false;
 }} />
 
 <style>
@@ -850,7 +907,7 @@
     overflow-y: hidden;
   }
   .graph-drawer-toggle,
-  .graph-drawer-close,
+  .panel > :global(.graph-drawer-close),
   .graph-drawer-scrim { display: none; }
   .tab-rail {
     width: 34px;
@@ -880,6 +937,13 @@
     border-radius: var(--radius-md) 0 0 var(--radius-md);
     cursor: pointer;
     text-decoration: none;
+    font-family: inherit;
+    transition: background 0.12s, color 0.12s;
+  }
+  /* 焦点态与新组件同口径:accent 焦点环(内收,不被轨道裁掉)。 */
+  .vtab:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   /* 拉丁标签(AI,仅中文界面):中文竖排里拉丁缩略语用縦中横正立横排;
      英文界面不加本类,与其余页签一致旋转 */
@@ -915,26 +979,10 @@
     /* 滚动收敛到 .list:footer 沉底常驻,长列表不会把设置推出视口 */
     overflow-y: hidden;
   }
-  /* 录制按钮:主 CTA 药丸(primary 底 + on-primary 字 + radius-full,dark 下即白药丸)+ 红点。
-     大面积强调蓝在侧栏太吵,"彩色"由红点承担——红是本产品唯一常驻彩色信号,识别度反而更高。 */
-  .record-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.5em;
-    border: none;
-    border-radius: var(--radius-full);
-    padding: 0.55em 1em;
-    font-size: 0.9rem;
-    font-weight: 500;
-    cursor: pointer;
-    color: var(--on-primary);
-    background: var(--primary);
-    box-shadow: var(--shadow-btn);
-  }
-  .record-btn:hover {
-    background: var(--primary-pressed);
-  }
+  /* 录制按钮:主 CTA 药丸(Button 默认变体 = primary 底 + on-primary 字,补 radius-full 与
+     shadow-btn)+ 红点。大面积强调蓝在侧栏太吵,"彩色"由红点承担——红是本产品唯一常驻
+     彩色信号,识别度反而更高。录制中字色走 record(dark 下白药丸上 2.94:1 偏低,由红色方块
+     符号独立承担停止语义兜底;light 下 5.98:1 无虞)。导入是幽灵态次级入口,同宽对齐、不抢重心。 */
   .rec-dot {
     width: 9px;
     height: 9px;
@@ -945,41 +993,6 @@
   /* 录制中红点变方块 = 通用"停止"符号,文字不再需要 Unicode 符号凑数 */
   .rec-dot.square {
     border-radius: 2px;
-  }
-  /* 录制中红字于药丸:dark 下白药丸上 #ff6161 实测 2.94:1 偏低,由旁侧红色方块符号
-     独立承担停止语义兜底,冒烟观察;light 下黑药丸上同色 5.98:1 无虞。两主题均保留
-     record 字色。 */
-  .record-btn.recording {
-    color: var(--record);
-    font-weight: 500;
-  }
-  .record-btn:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
-  /* 导入:录制的次级入口——幽灵态(无底色、弱文字)与上方实心录制药丸分主次,
-     同宽对齐,不抢视觉重心。 */
-  .import-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.45em;
-    margin-top: 0.4em;
-    border: none;
-    background: none;
-    border-radius: var(--radius-full);
-    padding: 0.35em 1em;
-    font-size: 0.82rem;
-    color: var(--ink-secondary);
-    cursor: pointer;
-  }
-  .import-btn:hover:not(:disabled) {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .import-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
   }
   /* 人物行:小色点(与详情页头像同色源)+ 名字/最近出现;点击进主区详情(主从结构),
      hover/选中与笔记行同语义。图谱实体行(.entity)是同一形态——之前漏了这条 flex
@@ -999,25 +1012,7 @@
   /* 新建钩子:本页的主操作入口——实心 accent 按钮,与上方录制药丸拉开间距、
      并以蓝色区分红点录制;虚线/幽灵态表达太弱,看不出这是入口。 */
   .new-hook-row { list-style: none; }
-  .new-hook {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.45em;
-    margin-top: 0.9rem;
-    padding: 0.55em 1em;
-    border-radius: var(--radius-full);
-    background: var(--accent);
-    color: var(--on-accent);
-    text-decoration: none;
-    font-size: 0.9rem;
-    font-weight: 600;
-    box-shadow: var(--shadow-btn);
-    transition: background 0.12s;
-  }
   .new-hook-icon { flex: none; }
-  .new-hook:hover { background: var(--accent-pressed); }
-  .new-hook.current { background: var(--accent-pressed); }
   .empty-hint {
     color: var(--ink-faint);
     font-size: 0.82em;
@@ -1058,24 +1053,6 @@
     list-style: none;
     padding: 0 0.1rem 0.4rem;
   }
-  .people-search {
-    box-sizing: border-box;
-    width: 100%;
-    padding: 0.4em 0.6em;
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-md);
-    background: var(--surface);
-    color: var(--ink);
-    font: inherit;
-    font-size: 0.82rem;
-  }
-  .people-search::placeholder {
-    color: var(--ink-faint);
-  }
-  .people-search:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
   .people-empty {
     list-style: none;
     padding: 0.5rem 0.5rem;
@@ -1107,17 +1084,6 @@
 
   /* 过滤框:内嵌式(surface-press 底、无边)——侧栏里带边框的输入框比正文还抢眼,
      Notion 侧栏过滤即此形态;聚焦才浮出 canvas 底 + accent 环。 */
-  .search {
-    box-sizing: border-box;
-    width: 100%;
-    margin: 0.75rem 0;
-    padding: 0.4em 0.7em;
-    border-radius: var(--radius-md);
-    border: 1px solid transparent;
-    background: var(--surface-press);
-    color: var(--ink);
-    font-size: 0.9em;
-  }
   .memo-hit {
     display: block;
     font-size: 0.75rem;
@@ -1125,15 +1091,6 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-  .search::placeholder {
-    color: var(--ink-faint);
-  }
-  .search:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-    background: var(--canvas);
-    border-color: var(--accent);
   }
   .search-behavior { margin: -0.45rem 0 0.6rem; color: var(--ink-faint); font-size: 0.7rem; line-height: 1.45; }
   .gmode {
@@ -1144,42 +1101,12 @@
     border-radius: var(--radius-md);
     background: var(--surface-press);
   }
-  .gmode-seg {
-    flex: 1;
-    min-height: 30px;
-    border: 0;
-    border-radius: calc(var(--radius-md) - 2px);
-    background: transparent;
-    color: var(--ink-secondary);
-    font: inherit;
-    font-size: 0.8em;
-    font-weight: 500;
-    cursor: pointer;
-  }
-  .gmode-seg.on { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-btn); }
   /* 图谱 kind 过滤药丸(侧栏窄,紧凑换行) */
   .gchips {
     display: flex;
     flex-wrap: wrap;
     gap: 4px;
     margin-bottom: 0.5rem;
-  }
-  .gchip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 9px;
-    border-radius: 999px;
-    font-size: 0.72em;
-    font-weight: 500;
-    background: var(--surface-press);
-    color: var(--ink-secondary);
-    border: 1px solid transparent;
-    cursor: pointer;
-  }
-  .gchip.on {
-    background: var(--accent-tint);
-    color: var(--accent);
   }
   /* kind 色点(kindInk):选中态仍统一走 accent 高亮(哪个药丸被选清清楚楚),
      色点只在未选中时充当"这是什么类别"的视觉索引,不跟 accent 抢语义。 */
@@ -1229,14 +1156,6 @@
   .title:hover {
     color: var(--accent);
   }
-  .rename {
-    font-size: 0.92em;
-    padding: 0.15em 0.3em;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--accent);
-    background: var(--canvas);
-    color: var(--ink);
-  }
   .meta {
     color: var(--ink-faint);
     font-size: 0.75em;
@@ -1269,42 +1188,6 @@
   .state.dictation-tag {
     background: var(--tint-sky);
     color: var(--tint-sky-ink);
-  }
-  /* 右键菜单:popover 规范(surface-press 底 + hairline + shadow-popover);
-     暗色下 canvas 比承载面更黑,浮层若用 canvas 会成"洞",故底走 surface-press。
-     透明遮罩承接"点击别处关闭",fixed 定位跟随鼠标坐标。 */
-  .menu-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 40;
-  }
-  .ctx-menu {
-    position: fixed;
-    z-index: 41;
-    min-width: 9rem;
-    background: var(--surface-press);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-    padding: 4px;
-    display: flex;
-    flex-direction: column;
-  }
-  .ctx-item {
-    background: none;
-    border: none;
-    text-align: left;
-    color: var(--ink);
-    cursor: pointer;
-    padding: 0.4em 0.7em;
-    border-radius: var(--radius-md);
-    font-size: 0.88rem;
-  }
-  .ctx-item:hover {
-    background: var(--surface-soft);
-  }
-  .ctx-item.danger {
-    color: var(--danger);
   }
   /* 此处 banner 只用于加载失败，用 danger 色系（DESIGN.md：错误横幅换 danger） */
   .banner {
@@ -1365,21 +1248,15 @@
       writing-mode: vertical-rl;
       cursor: pointer;
     }
-    .graph-drawer-close {
+    .panel > :global(.graph-drawer-close) {
       display: grid;
       place-items: center;
       align-self: flex-end;
       width: 44px;
       min-height: 44px;
       margin: -4px -4px 2px 0;
-      padding: 0;
-      border: 0;
       border-radius: var(--radius-full);
-      background: transparent;
       color: var(--ink-secondary);
-      font: inherit;
-      font-size: 1.25rem;
-      cursor: pointer;
     }
     .graph-drawer-scrim {
       position: fixed;
@@ -1393,10 +1270,10 @@
     }
   }
   @media (pointer: coarse) {
-    .sidebar.graph-mode .panel button,
-    .sidebar.graph-mode .panel input { min-height: 44px; }
-    .sidebar.graph-mode .panel button,
-    .sidebar.graph-mode .panel .gchip { min-inline-size: 44px; }
+    .sidebar.graph-mode .panel :global(button),
+    .sidebar.graph-mode .panel :global(input) { min-height: 44px; }
+    .sidebar.graph-mode .panel :global(button),
+    .sidebar.graph-mode .panel :global(.gchip) { min-inline-size: 44px; }
   }
   @media (prefers-reduced-motion: reduce) {
     .sidebar.graph-mode .panel { transition: none; }

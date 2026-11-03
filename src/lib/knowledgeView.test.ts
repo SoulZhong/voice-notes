@@ -1030,7 +1030,8 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("semanticRequestFailed");
     expect(route).toContain("legacyFallbackGraph(");
     expect(route).toContain("visibleIds = initialIds(fallback)");
-    expect(route).toContain('{t("graph.retryRead")}</button>');
+    // 重试按钮已迁到 Button 组件(UI 改版 #730):钉的是「失败横幅里有重新读取的按钮」。
+    expect(route).toContain('{t("graph.retryRead")}</Button>');
     expect(graphZh["graph.retryRead"]).toBe("重新读取");
     expect(policy).toContain("requestFailed ||");
     expect(route).toMatch(/semanticFallback[\s\S]{0,240}!semanticRequestFailed/);
@@ -1075,10 +1076,12 @@ describe("exploratory graph UI source contract", () => {
     expect(sidebar).toMatch(/\.graph-drawer-toggle\s*\{[^}]*width:\s*44px[^}]*height:\s*44px/s);
     expect(sidebar).toContain("transform 240ms cubic-bezier(0.16, 1, 0.3, 1)");
     expect(sidebar).not.toContain("transform 180ms ease");
-    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel button[\s\S]*min-height:\s*44px/);
-    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel button[\s\S]*min-inline-size:\s*44px/);
+    // UI 改版后面板里的按钮/输入框是 Button/Input 组件,作用域样式要经 :global() 才够得着
+    // 组件根元素——断言接受 `.panel button` 与 `.panel :global(button)` 两种写法。
+    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel (?::global\()?button[\s\S]*min-height:\s*44px/);
+    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel (?::global\()?button[\s\S]*min-inline-size:\s*44px/);
     expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.gchip[\s\S]*min-inline-size:\s*44px/);
-    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel input[\s\S]*min-height:\s*44px/);
+    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel (?::global\()?input[\s\S]*min-height:\s*44px/);
     expect(finePointerStyles).not.toMatch(/\.graph-global\s*\{[^}]*min-height:\s*44px/s);
     expect(finePointerStyles).not.toMatch(/\.gchip\s*\{[^}]*min-inline-size:\s*44px/s);
   });

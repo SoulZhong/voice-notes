@@ -2,6 +2,9 @@
   import { t } from "$lib/i18n/index.svelte";
   import type { Entity } from "$lib/notes";
   import { ENTITY_KINDS, entityKind, entityKindLabel } from "$lib/entityKind";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import * as Popover from "$lib/ui/components/popover";
 
   /* 关键实体行(2026-09-17 设计:docs/superpowers/specs/2026-09-17-note-entity-list-design.md):
      说话人条下方同形态 chips。chip 本体点击 = 定位正文提及(再点跳下一处);
@@ -156,158 +159,204 @@
     <span class="ent-row-label">{t("notes.entities.rowLabel")}</span>
     {#each visible as e (e.id)}
       {@const k = kindOf(e.kind)}
-      <span class="ent-chip" style="background: {k?.tint}; color: {k?.ink}">
-        <button
+      <span class="ent-chip" class:no-edit={!editable} style="background: {k?.tint}; color: {k?.ink}">
+        <Button
+          variant="ghost"
           class="ent-name"
           title={t("notes.entities.locate", { n: counts[e.id] ?? 0 })}
           onclick={() => onLocate?.(e.id)}
         >
           <span class="ent-hash" aria-hidden="true">#</span>{e.name}{#if (counts[e.id] ?? 0) > 1}<span class="ent-n">{counts[e.id]}</span>{/if}
-        </button>
+        </Button>
         {#if editable}
-          <button
-            class="ent-edit"
-            aria-label={t("notes.entities.edit")}
-            onclick={(ev) => {
-              ev.stopPropagation();
-              editingId === e.id ? closeAll() : openEdit(e);
-            }}
-          >
-            <svg width="9" height="9" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4" /></svg>
-          </button>
-        {/if}
-        {#if editingId === e.id}
-          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-          <div class="ent-pop" onclick={(ev) => ev.stopPropagation()}>
-            <input
-              class="ent-input"
-              placeholder={t("notes.entities.renamePlaceholder")}
-              bind:value={editingName}
-              onkeydown={(ev) => {
-                if (ev.key === "Enter") commitRename(e);
-                if (ev.key === "Escape") closeAll();
-              }}
-            />
-            <div class="ent-kinds">
-              {#each KINDS as kk (kk.key)}
-                <button
-                  class="ent-kind"
-                  class:on={kindOf(e.kind)?.key === kk.key}
-                  onclick={() => onSetKind && void act(() => onSetKind(e.id, kk.key))}
-                >
-                  {entityKindLabel(kk.key)}
-                </button>
-              {/each}
-            </div>
-            {#if onSetAliases}
-              <!-- 别名:正文里这个实体的其它写法。加了立刻多认出提及,删了对应高亮
-                   一并消失——所以每条都带 ×,而不是只读展示。合并/改名塞进来的别名
-                   也在这里,用户第一次有地方看见并纠正它们。 -->
-              <div class="ent-aliases">
-                {#each e.aliases ?? [] as al (al)}
-                  <span class="ent-alias">
-                    {al}
-                    <button class="ent-alias-x" aria-label={t("notes.entities.aliasRemove", { name: al })} onclick={() => removeAlias(e, al)}>×</button>
-                  </span>
-                {/each}
-                <input
-                  class="ent-alias-input"
-                  placeholder={t("notes.entities.aliasPlaceholder")}
-                  bind:value={aliasInput}
-                  onkeydown={(ev) => {
-                    if (ev.key === "Enter") commitAlias(e);
-                    if (ev.key === "Escape") closeAll();
+          <!-- 浮层开合由 editingId 唯一决定:读 = 是否正编辑本条,写 = 开(openEdit)/关(closeAll);
+               点外/Esc 由 Popover 自己判定(内容 portal 到 body),宿主页 window onclick 的
+               closeAll 仍兜底——所以触发钮与浮层内容都要 stopPropagation,免得刚开就被它关掉。 -->
+          <Popover.Root bind:open={() => editingId === e.id, (o) => (o ? openEdit(e) : closeAll())}>
+            <Popover.Trigger>
+              {#snippet child({ props })}
+                <Button
+                  {...props}
+                  variant="ghost"
+                  class="ent-edit"
+                  aria-label={t("notes.entities.edit")}
+                  onclick={(ev: MouseEvent) => {
+                    (props.onclick as ((ev: MouseEvent) => void) | undefined)?.(ev);
+                    ev.stopPropagation();
                   }}
-                />
-              </div>
-            {/if}
-            <div class="ent-actions">
-              {#if onMerge}
-                <button class="ent-act" class:on={mergeOpen} onclick={() => { mergeOpen = !mergeOpen; mergeQuery = ""; }}>
-                  {t("notes.entities.merge")}
-                </button>
-              {/if}
-              {#if graphHref?.(e.id)}
-                <a class="ent-act" href={graphHref(e.id)}>{t("notes.entities.openGraph")}</a>
-              {/if}
-              <button class="ent-del" onclick={() => onDelete && void act(() => onDelete(e.id))}>
-                {t("notes.entities.delete")}
-              </button>
-            </div>
-            {#if mergeOpen}
-              <!-- 合并目标选择:并进谁。方向刻意是"本条并进目标"(本条消失),
-                   与浮层标题就是本条这件事一致,不做反向,免得点错把留下的那个删了。 -->
-              <div class="ent-merge">
-                <p class="ent-hint">{t("notes.entities.mergeHint", { name: e.name })}</p>
-                <input
-                  class="ent-input"
-                  placeholder={t("notes.entities.mergeSearch")}
-                  bind:value={mergeQuery}
-                  onkeydown={(ev) => { if (ev.key === "Escape") { mergeOpen = false; } }}
-                />
-                {#each mergeTargets(e) as tgt (tgt.id)}
-                  {@const tk = kindOf(tgt.kind)}
-                  <button
-                    class="ent-merge-item"
-                    onclick={() => onMerge && void act(() => onMerge(e.id, tgt.id))}
+                >
+                  <svg width="9" height="9" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4" /></svg>
+                </Button>
+              {/snippet}
+            </Popover.Trigger>
+            <Popover.Content align="start" sideOffset={6} class="ent-pop w-auto min-w-60 max-w-80 gap-0 p-2" onclick={(ev: MouseEvent) => ev.stopPropagation()}>
+              <Input
+                class="h-7 text-[0.85rem]"
+                placeholder={t("notes.entities.renamePlaceholder")}
+                bind:value={editingName}
+                onkeydown={(ev) => {
+                  if (ev.key === "Enter" && !ev.isComposing) commitRename(e);
+                  if (ev.key === "Escape") closeAll();
+                }}
+              />
+              <div class="ent-kinds">
+                {#each KINDS as kk (kk.key)}
+                  <Button
+                    variant="outline"
+                    size="xs"
+                    class={["ent-kind rounded-full", kindOf(e.kind)?.key === kk.key && "on"]}
+                    aria-pressed={kindOf(e.kind)?.key === kk.key}
+                    onclick={() => onSetKind && void act(() => onSetKind(e.id, kk.key))}
                   >
-                    <span class="ent-chip-mini" style="background: {tk?.tint}; color: {tk?.ink}"><span class="ent-hash" aria-hidden="true">#</span>{tgt.name}</span>
-                    {#if (counts[tgt.id] ?? 0) > 0}<span class="ent-n">{counts[tgt.id]}</span>{/if}
-                  </button>
-                {:else}
-                  <p class="ent-hint">{t("notes.entities.mergeNone")}</p>
+                    {entityKindLabel(kk.key)}
+                  </Button>
                 {/each}
               </div>
-            {:else}
-              <span class="ent-hint">{onSetAliases ? t("notes.entities.aliasHint") : t("notes.entities.renameHint")}</span>
-            {/if}
-            {#if busyErr}<div class="ent-err">{busyErr}</div>{/if}
-          </div>
+              {#if onSetAliases}
+                <!-- 别名:正文里这个实体的其它写法。加了立刻多认出提及,删了对应高亮
+                     一并消失——所以每条都带 ×,而不是只读展示。合并/改名塞进来的别名
+                     也在这里,用户第一次有地方看见并纠正它们。 -->
+                <div class="ent-aliases">
+                  {#each e.aliases ?? [] as al (al)}
+                    <span class="ent-alias">
+                      {al}
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        class="ent-alias-x size-4 rounded-full"
+                        aria-label={t("notes.entities.aliasRemove", { name: al })}
+                        onclick={() => removeAlias(e, al)}
+                      >
+                        <svg width="8" height="8" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+                      </Button>
+                    </span>
+                  {/each}
+                  <Input
+                    class="ent-alias-input h-6 min-w-20 flex-[1_1_6rem] rounded-full border-dashed px-2 text-xs focus-visible:border-solid"
+                    placeholder={t("notes.entities.aliasPlaceholder")}
+                    bind:value={aliasInput}
+                    onkeydown={(ev) => {
+                      if (ev.key === "Enter" && !ev.isComposing) commitAlias(e);
+                      if (ev.key === "Escape") closeAll();
+                    }}
+                  />
+                </div>
+              {/if}
+              <div class="ent-actions">
+                {#if onMerge}
+                  <Button
+                    variant="outline"
+                    size="xs"
+                    class={["ent-act rounded-full", mergeOpen && "on"]}
+                    aria-expanded={mergeOpen}
+                    onclick={() => { mergeOpen = !mergeOpen; mergeQuery = ""; }}
+                  >
+                    {t("notes.entities.merge")}
+                  </Button>
+                {/if}
+                {#if graphHref?.(e.id)}
+                  <Button variant="outline" size="xs" class="ent-act rounded-full" href={graphHref(e.id) ?? undefined}>{t("notes.entities.openGraph")}</Button>
+                {/if}
+                <!-- 「从本篇删除」六个字不得被挤断行(截图实证):Button 自带 nowrap -->
+                <Button variant="destructive" size="xs" class="ml-auto rounded-full" onclick={() => onDelete && void act(() => onDelete(e.id))}>
+                  {t("notes.entities.delete")}
+                </Button>
+              </div>
+              {#if mergeOpen}
+                <!-- 合并目标选择:并进谁。方向刻意是"本条并进目标"(本条消失),
+                     与浮层标题就是本条这件事一致,不做反向,免得点错把留下的那个删了。 -->
+                <div class="ent-merge">
+                  <p class="ent-hint">{t("notes.entities.mergeHint", { name: e.name })}</p>
+                  <Input
+                    class="h-7 text-[0.85rem]"
+                    placeholder={t("notes.entities.mergeSearch")}
+                    bind:value={mergeQuery}
+                    onkeydown={(ev) => {
+                      // 只收起合并区、不关整个浮层:拦住冒泡,免得 Popover 的 Esc 把浮层一起关了。
+                      if (ev.key === "Escape") { ev.stopPropagation(); mergeOpen = false; }
+                    }}
+                  />
+                  {#each mergeTargets(e) as tgt (tgt.id)}
+                    {@const tk = kindOf(tgt.kind)}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      class="h-auto justify-start gap-1.5 px-1 py-0.5 font-normal"
+                      onclick={() => onMerge && void act(() => onMerge(e.id, tgt.id))}
+                    >
+                      <span class="ent-chip-mini" style="background: {tk?.tint}; color: {tk?.ink}"><span class="ent-hash" aria-hidden="true">#</span>{tgt.name}</span>
+                      {#if (counts[tgt.id] ?? 0) > 0}<span class="ent-n">{counts[tgt.id]}</span>{/if}
+                    </Button>
+                  {:else}
+                    <p class="ent-hint">{t("notes.entities.mergeNone")}</p>
+                  {/each}
+                </div>
+              {:else}
+                <span class="ent-hint">{onSetAliases ? t("notes.entities.aliasHint") : t("notes.entities.renameHint")}</span>
+              {/if}
+              {#if busyErr}<div class="ent-err">{busyErr}</div>{/if}
+            </Popover.Content>
+          </Popover.Root>
         {/if}
       </span>
     {/each}
     {#if hiddenN > 0 && !showAll}
-      <button class="ent-more" onclick={() => (showAll = true)}>+{hiddenN}</button>
+      <Button variant="outline" size="xs" class="ent-more" onclick={() => (showAll = true)}>+{hiddenN}</Button>
     {:else if showAll && hiddenN > 0}
-      <button class="ent-more" onclick={() => (showAll = false)}>{t("notes.entities.collapse")}</button>
+      <Button variant="outline" size="xs" class="ent-more" onclick={() => (showAll = false)}>{t("notes.entities.collapse")}</Button>
     {/if}
     {#if editable}
-      <span class="ent-chip ent-add-wrap">
-        <button
-          class="ent-more ent-add"
-          title={t("notes.entities.addTitle")}
-          onclick={(ev) => {
-            ev.stopPropagation();
-            addOpen = !addOpen;
-            editingId = null;
-            busyErr = null;
-          }}
-        >
-          ＋ {t("notes.entities.add")}
-        </button>
-        {#if addOpen}
-          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-          <div class="ent-pop" onclick={(ev) => ev.stopPropagation()}>
-            <input
-              class="ent-input"
-              placeholder={t("notes.entities.addPlaceholder")}
-              bind:value={addInput}
-              onkeydown={(ev) => {
-                if (ev.key === "Enter") commitAdd();
-                if (ev.key === "Escape") closeAll();
+      <Popover.Root
+        bind:open={() => addOpen, (o) => {
+          addOpen = o;
+          editingId = null;
+          busyErr = null;
+        }}
+      >
+        <Popover.Trigger>
+          {#snippet child({ props })}
+            <Button
+              {...props}
+              variant="outline"
+              size="xs"
+              class="ent-more border-dashed"
+              title={t("notes.entities.addTitle")}
+              onclick={(ev: MouseEvent) => {
+                (props.onclick as ((ev: MouseEvent) => void) | undefined)?.(ev);
+                ev.stopPropagation();
               }}
-            />
-            <div class="ent-kinds">
-              {#each KINDS as kk (kk.key)}
-                <button class="ent-kind" class:on={addKind === kk.key} onclick={() => (addKind = kk.key)}>
-                  {entityKindLabel(kk.key)}
-                </button>
-              {/each}
-            </div>
-            {#if busyErr}<div class="ent-err">{busyErr}</div>{/if}
+            >
+              <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+              {t("notes.entities.add")}
+            </Button>
+          {/snippet}
+        </Popover.Trigger>
+        <Popover.Content align="start" sideOffset={6} class="ent-pop w-auto min-w-60 max-w-80 gap-0 p-2" onclick={(ev: MouseEvent) => ev.stopPropagation()}>
+          <Input
+            class="h-7 text-[0.85rem]"
+            placeholder={t("notes.entities.addPlaceholder")}
+            bind:value={addInput}
+            onkeydown={(ev) => {
+              if (ev.key === "Enter" && !ev.isComposing) commitAdd();
+              if (ev.key === "Escape") closeAll();
+            }}
+          />
+          <div class="ent-kinds">
+            {#each KINDS as kk (kk.key)}
+              <Button
+                variant="outline"
+                size="xs"
+                class={["ent-kind rounded-full", addKind === kk.key && "on"]}
+                aria-pressed={addKind === kk.key}
+                onclick={() => (addKind = kk.key)}
+              >
+                {entityKindLabel(kk.key)}
+              </Button>
+            {/each}
           </div>
-        {/if}
-      </span>
+          {#if busyErr}<div class="ent-err">{busyErr}</div>{/if}
+        </Popover.Content>
+      </Popover.Root>
     {/if}
   </div>
 {/if}
@@ -347,19 +396,20 @@
     font-weight: 600;
     margin-right: 0.05em;
   }
-  .ent-name {
-    display: inline-flex;
-    align-items: center;
+  /* chip 本体与 ⌄ 是 Button(ghost),但底色/字色跟随实体类型配色(不进组件主题):
+     去掉 ghost 的悬停底与固定高度,只保留焦点环与无障碍行为。 */
+  .ent-chip :global(.ent-name) {
+    height: auto;
     gap: 0.25em;
     border: none;
     background: none;
     color: inherit;
     padding: 0.18em 0.3em 0.18em 0.6em;
     border-radius: var(--radius-sm) 0 0 var(--radius-sm);
-    cursor: pointer;
     font-size: inherit;
+    font-weight: 400;
   }
-  .ent-chip:not(:has(.ent-edit)) .ent-name {
+  .ent-chip.no-edit :global(.ent-name) {
     padding-right: 0.7em;
     border-radius: var(--radius-full);
   }
@@ -368,60 +418,24 @@
     opacity: 0.65;
     font-variant-numeric: tabular-nums;
   }
-  .ent-edit {
+  .ent-chip :global(.ent-edit) {
+    height: auto;
     border: none;
     background: none;
     color: inherit;
     opacity: 0.55;
     padding: 0.18em 0.5em 0.18em 0.1em;
-    cursor: pointer;
     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   }
-  .ent-edit:hover {
+  .ent-chip :global(.ent-edit:hover),
+  .ent-chip :global(.ent-edit[aria-expanded="true"]) {
     opacity: 1;
   }
-  .ent-more {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink-secondary);
+  .ent-row :global(.ent-more) {
     border-radius: var(--radius-sm);
-    padding: 0.15em 0.6em;
+    color: var(--ink-secondary);
     font-size: 0.78rem;
-    cursor: pointer;
-  }
-  .ent-more:hover {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .ent-add-wrap {
-    background: transparent;
-  }
-  /* 浮层:与说话人/音轨菜单同语言 */
-  .ent-pop {
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 0;
-    z-index: 25;
-    min-width: 15rem;
-    background: var(--surface-press);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-    padding: 0.5rem;
-    color: var(--ink);
-  }
-  .ent-input {
-    width: 100%;
-    box-sizing: border-box;
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink);
-    border-radius: var(--radius-md);
-    padding: 0.35em 0.55em;
-    font-size: 0.85rem;
-  }
-  .ent-input:focus {
-    outline: 2px solid var(--accent);
+    font-weight: 400;
   }
   .ent-kinds {
     display: flex;
@@ -429,16 +443,11 @@
     margin-top: 0.45rem;
     flex-wrap: wrap;
   }
-  .ent-kind {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
+  .ent-kinds :global(.ent-kind) {
     color: var(--ink-secondary);
-    border-radius: var(--radius-full);
-    padding: 0.12em 0.6em;
-    font-size: 0.75rem;
-    cursor: pointer;
+    font-weight: 400;
   }
-  .ent-kind.on {
+  .ent-kinds :global(.ent-kind.on) {
     color: var(--accent);
     border-color: var(--accent);
     background: var(--accent-tint);
@@ -452,24 +461,12 @@
     gap: 0.4rem;
     margin-top: 0.5rem;
   }
-  /* 中性动作药丸(合并 / 打开图谱):与危险色的删除拉开,同尺寸同形状。 */
-  .ent-act {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
+  .ent-actions :global(.ent-act) {
     color: var(--ink-secondary);
-    border-radius: var(--radius-full);
-    padding: 0.12em 0.6em;
-    font-size: 0.75rem;
-    line-height: 1.5;
-    white-space: nowrap;
+    font-weight: 400;
     text-decoration: none;
-    cursor: pointer;
   }
-  .ent-act:hover {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .ent-act.on {
+  .ent-actions :global(.ent-act.on) {
     border-color: var(--accent);
     color: var(--accent);
   }
@@ -492,32 +489,11 @@
     font-size: 0.75rem;
     white-space: nowrap;
   }
-  .ent-alias-x {
-    border: none;
-    background: transparent;
+  .ent-alias :global(.ent-alias-x) {
     color: var(--ink-faint);
-    font-size: 0.95em;
-    line-height: 1;
-    padding: 0 0.25em;
-    cursor: pointer;
   }
-  .ent-alias-x:hover {
+  .ent-alias :global(.ent-alias-x:hover) {
     color: var(--danger);
-  }
-  .ent-alias-input {
-    flex: 1 1 6rem;
-    min-width: 5rem;
-    border: 1px dashed var(--hairline-strong);
-    background: transparent;
-    color: var(--ink);
-    border-radius: var(--radius-full);
-    padding: 0.1em 0.55em;
-    font-size: 0.75rem;
-  }
-  .ent-alias-input:focus {
-    outline: none;
-    border-style: solid;
-    border-color: var(--accent);
   }
   /* 合并目标选择区 */
   .ent-merge {
@@ -526,46 +502,15 @@
     flex-direction: column;
     gap: 0.3rem;
   }
-  .ent-merge-item {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    border: none;
-    background: transparent;
-    border-radius: var(--radius-sm);
-    padding: 0.2em 0.3em;
-    cursor: pointer;
-    text-align: left;
-  }
-  .ent-merge-item:hover {
-    background: var(--surface-soft);
-  }
   .ent-chip-mini {
     border-radius: var(--radius-sm);
     padding: 0.1em 0.55em;
     font-size: 0.78rem;
     white-space: nowrap;
   }
-  .ent-del {
-    border: 1px solid var(--danger-line);
-    background: transparent;
-    color: var(--danger);
-    border-radius: var(--radius-full);
-    padding: 0.12em 0.6em;
-    font-size: 0.75rem;
-    line-height: 1.5;
-    /* 「从本篇删除」六个字不得被挤断行(截图实证) */
-    white-space: nowrap;
-    margin-left: auto;
-    cursor: pointer;
-  }
-  .ent-del:hover {
-    background: var(--danger-tint);
-    color: var(--danger-ink);
-  }
   .ent-hint {
     display: block;
-    margin-top: 0.4rem;
+    margin: 0.4rem 0 0;
     color: var(--ink-faint);
     font-size: 0.72rem;
     line-height: 1.5;

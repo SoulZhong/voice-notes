@@ -22,6 +22,10 @@
     type SplitSuggestOut,
   } from "$lib/multiSpeaker";
   import { createAudition, type PlayerLike } from "$lib/tidyAudio";
+  import { Button } from "$lib/ui/components/button";
+  import { Checkbox } from "$lib/ui/components/checkbox";
+  import * as Dialog from "$lib/ui/components/dialog";
+  import * as Select from "$lib/ui/components/select";
 
   let {
     noteId,
@@ -268,14 +272,28 @@
   $effect(() => () => audition.stop());
 
   const sampleName = (path: string) => path.split("/").pop() ?? path;
+
+  // 下拉选项文案(与原 <option> 完全同文案、同取值;抽出来是因为选择器触发器要显示当前项)。
+  function groupName(key: string): string {
+    return key === "u" ? t("speakers.split.undetermined") : t("speakers.split.groupN", { n: key.slice(1) });
+  }
+  const destOptions = $derived([
+    { value: "keep:", label: t("speakers.split.destKeep") },
+    { value: "new_speaker:", label: t("speakers.split.destNew") },
+    ...Object.entries(speakers).map(([sid, m]) => ({ value: `existing_speaker:${sid}`, label: t("speakers.split.destExisting", { name: m.name || sid }) })),
+    ...people.map((pp) => ({ value: `person:${pp.id}`, label: t("speakers.split.destPerson", { name: pp.name || pp.id }) })),
+  ]);
 </script>
 
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="overlay" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-  <div class="panel">
+<!-- 由宿主条件挂载:挂上即打开;点遮罩 / Esc / 「取消」都走 onClose(与原先点遮罩关闭同义)。 -->
+<Dialog.Root open={true} onOpenChange={(o) => { if (!o) onClose(); }}>
+  <Dialog.Content
+    showCloseButton={false}
+    class="panel block max-h-[84vh] w-[min(560px,92vw)] max-w-none overflow-y-auto px-[18px] py-4 sm:max-w-none"
+  >
     <div class="head">
-      <span class="title">{t("speakers.multi.title")}</span>
-      <button class="link" onclick={onClose}>{t("speakers.cancel")}</button>
+      <Dialog.Title class="title text-sm">{t("speakers.multi.title")}</Dialog.Title>
+      <Button variant="link" size="xs" class="h-auto px-0 text-foreground" onclick={onClose}>{t("speakers.cancel")}</Button>
     </div>
     {#if error}<div class="banner">{error}</div>{/if}
 
@@ -283,14 +301,14 @@
       <p class="note">{t("speakers.multi.mapNotice")}</p>
       {#each candidateSpeakers as sid (sid)}
         <label class="row-check">
-          <input type="checkbox" bind:checked={checked[sid]} />
+          <Checkbox bind:checked={checked[sid]} />
           {speakerLabel(sid, "mic", speakers)}
         </label>
       {/each}
       <div class="actions">
-        <button class="primary" disabled={busy || candidateSpeakers.every((s) => !checked[s])} onclick={doMark}>
+        <Button disabled={busy || candidateSpeakers.every((s) => !checked[s])} onclick={doMark}>
           {t("speakers.chipMarkMulti")}
-        </button>
+        </Button>
       </div>
     {:else if step === "samples"}
       <div class="banner ok">{t("speakers.multi.marked")}</div>
@@ -305,16 +323,16 @@
               <div class="note strong">{t("speakers.multi.samplesHeader")}</div>
               {#each p.samples as sp (sp.path)}
                 <div class="sample-row">
-                  <button class="link" onclick={() => audition.toggle(sp.path, sp.audition_path)}>
+                  <Button variant="link" size="xs" class="h-auto px-0 text-foreground" onclick={() => audition.toggle(sp.path, sp.audition_path)}>
                     {playingKey === sp.path ? t("speakers.stop") : t("speakers.playSample")}
-                  </button>
+                  </Button>
                   <span class="mono">{sampleName(sp.path)}</span>
                   {#if sp.from_marked_cluster}
                     <span class="tag auto">{t("speakers.multi.fromThisNote")}</span>
                   {:else}
                     <span class="tag">{t("speakers.multi.unknownOrigin")}</span>
                     <label class="row-check inline">
-                      <input type="checkbox" bind:checked={extraDelete[sp.path]} />
+                      <Checkbox bind:checked={extraDelete[sp.path]} />
                       {t("speakers.delete")}
                     </label>
                   {/if}
@@ -324,30 +342,30 @@
           </section>
         {/each}
         <label class="row-check">
-          <input type="checkbox" bind:checked={confirmSeen} />
+          <Checkbox bind:checked={confirmSeen} />
           {t("speakers.multi.confirmSeen")}
         </label>
         <div class="actions">
-          <button class="primary" disabled={busy || !confirmSeen} onclick={doSamples}>
+          <Button disabled={busy || !confirmSeen} onclick={doSamples}>
             {t("speakers.multi.deleteChecked")}
-          </button>
+          </Button>
         </div>
       {/if}
     {:else if step === "residual"}
       <div class="p-title">{t("speakers.multi.residualTitle")}</div>
       <label class="row-check">
-        <input type="checkbox" bind:checked={thenSplit} />
+        <Checkbox bind:checked={thenSplit} />
         {t("speakers.split.enter")}
       </label>
       <div class="choice">
-        <button class="option" disabled={busy} onclick={() => doResidual("accept")}>
+        <Button variant="outline" class="option" disabled={busy} onclick={() => doResidual("accept")}>
           <span class="opt-name">{t("speakers.multi.residualAccept")}</span>
           <span class="opt-desc">{t("speakers.multi.residualAcceptDesc")}</span>
-        </button>
-        <button class="option danger" disabled={busy} onclick={() => doResidual("baseline")}>
+        </Button>
+        <Button variant="outline" class="option danger" disabled={busy} onclick={() => doResidual("baseline")}>
           <span class="opt-name">{t("speakers.multi.residualBaseline")}</span>
           <span class="opt-desc">{t("speakers.multi.residualBaselineDesc")}</span>
-        </button>
+        </Button>
       </div>
     {:else if step === "split"}
       <div class="p-title">{t("speakers.split.title")}</div>
@@ -369,14 +387,14 @@
                 </td>
                 <td>
                   {#if onAuditionSeg}
-                    <button class="link" onclick={() => onAuditionSeg(q)}>{t("speakers.playSample")}</button>
+                    <Button variant="link" size="xs" class="h-auto px-0 text-foreground" onclick={() => onAuditionSeg(q)}>{t("speakers.playSample")}</Button>
                   {/if}
                 </td>
                 <td>
-                  <select
+                  <Select.Root
+                    type="single"
                     value={segGroup[q]}
-                    onchange={(e) => {
-                      const v = e.currentTarget.value;
+                    onValueChange={(v) => {
                       if (v === "__new") {
                         // 补组:分配一个新的组键并给它一个去向条目(默认新说话人)。
                         let n = 0;
@@ -389,13 +407,14 @@
                       }
                     }}
                   >
-                    {#each groupKeys as key (key)}
-                      <option value={key}>
-                        {key === "u" ? t("speakers.split.undetermined") : t("speakers.split.groupN", { n: key.slice(1) })}
-                      </option>
-                    {/each}
-                    <option value="__new">{t("speakers.split.destNew")}</option>
-                  </select>
+                    <Select.Trigger size="sm" class="max-w-[220px] text-xs">{groupName(segGroup[q])}</Select.Trigger>
+                    <Select.Content>
+                      {#each groupKeys as key (key)}
+                        <Select.Item value={key}>{groupName(key)}</Select.Item>
+                      {/each}
+                      <Select.Item value="__new">{t("speakers.split.destNew")}</Select.Item>
+                    </Select.Content>
+                  </Select.Root>
                 </td>
               </tr>
             {/each}
@@ -412,58 +431,57 @@
               <span class="tag">{t("speakers.split.suggestedTag", { name: sug[1] || sug[0], sim: sug[2].toFixed(2) })}</span>
             {/if}
             {#if dests[key]}
-              <select
-                value={`${dests[key].kind}:${dests[key].id ?? ""}`}
-                onchange={(e) => {
-                  const [kind, id] = e.currentTarget.value.split(":");
+              {@const destValue = `${dests[key].kind}:${dests[key].id ?? ""}`}
+              <Select.Root
+                type="single"
+                value={destValue}
+                onValueChange={(v) => {
+                  const [kind, id] = v.split(":");
                   dests[key] = { kind: kind as Dest["kind"], id: id || null };
                 }}
               >
-                <option value="keep:">{t("speakers.split.destKeep")}</option>
-                <option value="new_speaker:">{t("speakers.split.destNew")}</option>
-                {#each Object.entries(speakers) as [sid, m] (sid)}
-                  <option value={`existing_speaker:${sid}`}>{t("speakers.split.destExisting", { name: m.name || sid })}</option>
-                {/each}
-                {#each people as pp (pp.id)}
-                  <option value={`person:${pp.id}`}>{t("speakers.split.destPerson", { name: pp.name || pp.id })}</option>
-                {/each}
-              </select>
+                <Select.Trigger size="sm" class="max-w-[220px] text-xs">{destOptions.find((o) => o.value === destValue)?.label ?? destValue}</Select.Trigger>
+                <Select.Content>
+                  {#each destOptions as o (o.value)}
+                    <Select.Item value={o.value}>{o.label}</Select.Item>
+                  {/each}
+                </Select.Content>
+              </Select.Root>
             {/if}
           </div>
         {/each}
         <div class="actions">
-          <button class="link" disabled={busy} onclick={doCancelSplit}>{t("speakers.split.cancel")}</button>
-          <button class="primary" disabled={busy} onclick={() => doCommitSplit(false)}>{t("speakers.split.commit")}</button>
+          <Button variant="ghost" disabled={busy} onclick={doCancelSplit}>{t("speakers.split.cancel")}</Button>
+          <Button disabled={busy} onclick={() => doCommitSplit(false)}>{t("speakers.split.commit")}</Button>
         </div>
       {/if}
     {:else if step === "cancelling"}
       <div class="note">{t("speakers.split.cancel")}</div>
       <div class="actions">
-        <button class="primary" disabled={busy} onclick={doCancelSplit}>{t("speakers.split.cancel")}</button>
+        <Button disabled={busy} onclick={doCancelSplit}>{t("speakers.split.cancel")}</Button>
       </div>
     {:else if step === "finishing"}
       <div class="actions">
-        <button
-          class="primary"
+        <Button
           disabled={busy}
           onclick={() => doResidual((op?.residual_choice as "accept" | "baseline") ?? "accept")}
         >
           {t("speakers.ok")}
-        </button>
+        </Button>
       </div>
     {:else if step === "split_resume"}
       <div class="note">{t("speakers.multi.resume")}</div>
       <div class="actions">
-        <button class="primary" disabled={busy} onclick={() => doCommitSplit(true)}>{t("speakers.split.continueCommit")}</button>
+        <Button disabled={busy} onclick={() => doCommitSplit(true)}>{t("speakers.split.continueCommit")}</Button>
       </div>
     {:else}
       <div class="banner ok">
         {enrollNotes ? t("speakers.split.enrollNotes", { notes: enrollNotes }) : t("speakers.multi.doneToast")}
       </div>
-      <div class="actions"><button class="primary" onclick={onClose}>{t("speakers.ok")}</button></div>
+      <div class="actions"><Button onclick={onClose}>{t("speakers.ok")}</Button></div>
     {/if}
-  </div>
-</div>
+  </Dialog.Content>
+</Dialog.Root>
 
 <style>
   .seg-table {
@@ -480,7 +498,7 @@
   }
   .seg-table td {
     padding: 3px 4px;
-    border-top: 1px solid rgba(128, 128, 128, 0.18);
+    border-top: 1px solid var(--hairline);
   }
   .seg-text .dur {
     opacity: 0.6;
@@ -497,53 +515,24 @@
   .g-name {
     font-weight: 600;
   }
-  select {
-    background: inherit;
-    color: inherit;
-    border: 1px solid rgba(128, 128, 128, 0.45);
-    border-radius: 6px;
-    padding: 2px 6px;
-    font-size: 12px;
-    max-width: 220px;
-  }
-
-  .overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.45);
-    z-index: 60;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .panel {
-    background: var(--bg, #1b1b1f);
-    color: var(--fg, #eee);
-    border: 1px solid rgba(128, 128, 128, 0.35);
-    border-radius: 12px;
-    padding: 16px 18px;
-    width: min(560px, 92vw);
-    max-height: 84vh;
-    overflow-y: auto;
-  }
   .head {
     display: flex;
     justify-content: space-between;
     align-items: center;
     margin-bottom: 8px;
   }
-  .title {
+  .head :global(.title) {
     font-weight: 600;
   }
   .banner {
-    border: 1px solid rgba(220, 120, 120, 0.5);
-    border-radius: 8px;
+    border: 1px solid var(--danger-line);
+    border-radius: var(--radius-md);
     padding: 6px 10px;
     margin: 6px 0;
     font-size: 13px;
   }
   .banner.ok {
-    border-color: rgba(120, 200, 140, 0.5);
+    border-color: var(--success);
   }
   .note {
     font-size: 12.5px;
@@ -552,7 +541,7 @@
   }
   .note.warn {
     opacity: 1;
-    color: #e8c46a;
+    color: var(--warning-ink);
   }
   .note.strong {
     opacity: 1;
@@ -560,7 +549,7 @@
     margin-top: 8px;
   }
   .person {
-    border-top: 1px solid rgba(128, 128, 128, 0.25);
+    border-top: 1px solid var(--hairline);
     padding: 8px 0;
     margin-top: 8px;
   }
@@ -581,13 +570,13 @@
   }
   .tag {
     font-size: 11px;
-    border: 1px solid rgba(128, 128, 128, 0.5);
-    border-radius: 6px;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-sm);
     padding: 0 6px;
     opacity: 0.85;
   }
   .tag.auto {
-    border-color: rgba(120, 200, 140, 0.6);
+    border-color: var(--success);
   }
   .row-check {
     display: flex;
@@ -604,26 +593,7 @@
     margin-top: 12px;
     display: flex;
     justify-content: flex-end;
-  }
-  .primary {
-    padding: 6px 14px;
-    border-radius: 8px;
-    border: 1px solid rgba(128, 128, 128, 0.5);
-    background: rgba(120, 160, 255, 0.18);
-    cursor: pointer;
-  }
-  .primary:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .link {
-    background: none;
-    border: none;
-    color: inherit;
-    text-decoration: underline;
-    cursor: pointer;
-    font-size: 12.5px;
-    padding: 0;
+    gap: 8px;
   }
   .choice {
     display: flex;
@@ -631,17 +601,16 @@
     gap: 10px;
     margin-top: 8px;
   }
-  .option {
-    text-align: left;
-    border: 1px solid rgba(128, 128, 128, 0.45);
-    border-radius: 10px;
+  .choice :global(.option) {
+    display: block;
+    height: auto;
     padding: 10px 12px;
-    background: none;
-    color: inherit;
-    cursor: pointer;
+    text-align: left;
+    white-space: normal;
+    border-radius: var(--radius-lg);
   }
-  .option.danger {
-    border-color: rgba(220, 120, 120, 0.55);
+  .choice :global(.option.danger) {
+    border-color: var(--danger-line);
   }
   .opt-name {
     display: block;

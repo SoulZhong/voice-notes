@@ -9,6 +9,9 @@
     task10GovernanceApi,
   } from "./knowledgeGovernance";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import { Checkbox } from "$lib/ui/components/checkbox";
 
   let {
     entity,
@@ -133,7 +136,11 @@
         <p class="eyebrow">{t("governance.split.eyebrow")}</p>
         <h2 id="split-title">{t("governance.split.title", { name: entity.name })}</h2>
       </div>
-      <button class="icon-button" type="button" aria-label={t("governance.split.closeAria")} onclick={dismiss}>×</button>
+      <Button variant="ghost" size="icon" class="rounded-full text-muted-foreground" aria-label={t("governance.split.closeAria")} onclick={dismiss}>
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 4l8 8M12 4l-8 8" />
+        </svg>
+      </Button>
     </header>
 
     <p id="split-description" class="description">
@@ -143,15 +150,15 @@
     <div class="identity-fields">
       <label>
         <span>{t("governance.split.name")}</span>
-        <input bind:value={name} disabled={working || splitOperationId !== null} aria-describedby="split-feedback" />
+        <Input bind:value={name} disabled={working || splitOperationId !== null} aria-describedby="split-feedback" />
       </label>
       <label>
         <span>{t("governance.split.kind")}</span>
-        <input bind:value={kind} disabled={working || splitOperationId !== null} aria-describedby="split-feedback" />
+        <Input bind:value={kind} disabled={working || splitOperationId !== null} aria-describedby="split-feedback" />
       </label>
       <label class="wide-field">
         <span>{t("governance.split.aliases")}</span>
-        <input bind:value={aliases} disabled={working || splitOperationId !== null} aria-describedby="split-feedback" />
+        <Input bind:value={aliases} disabled={working || splitOperationId !== null} aria-describedby="split-feedback" />
       </label>
     </div>
 
@@ -167,11 +174,10 @@
           <div class="note-heading">
             <a href={'/notes/' + encodeURIComponent(group.noteId)}>{t("governance.noteFallback", { id: group.noteId })}</a>
             <label class="select-note">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={allSelected}
                 disabled={working || splitOperationId !== null}
-                onchange={(event) => toggleNote(group.items, event.currentTarget.checked)}
+                onCheckedChange={(checked) => toggleNote(group.items, checked)}
               />
               {t("governance.split.selectNote")}
             </label>
@@ -180,11 +186,11 @@
             {#each group.items as mention (mention.id)}
               <li>
                 <label class="mention-choice">
-                  <input
-                    type="checkbox"
+                  <Checkbox
+                    class="mt-1"
                     checked={selectedIds.has(mention.id)}
                     disabled={working || splitOperationId !== null}
-                    onchange={(event) => toggleMention(mention.id, event.currentTarget.checked)}
+                    onCheckedChange={(checked) => toggleMention(mention.id, checked)}
                   />
                   <span>
                     <q>{mention.quote}</q>
@@ -206,16 +212,14 @@
     </p>
 
     <footer>
-      <button class="secondary" type="button" onclick={dismiss}>{t("governance.split.keep")}</button>
+      <Button variant="outline" onclick={dismiss}>{t("governance.split.keep")}</Button>
       {#if splitOperationId && !undone}
-        <button class="secondary" type="button" disabled={working} onclick={undoSplit}>{t("governance.split.undo")}</button>
+        <Button variant="outline" disabled={working} onclick={undoSplit}>{t("governance.split.undo")}</Button>
       {:else if !splitOperationId}
-        <button
-          class="primary"
-          type="button"
+        <Button
           disabled={working || !canSubmitSplit(preview) || !name.trim()}
           onclick={commitSplit}
-        >{t("governance.split.commit")}</button>
+        >{t("governance.split.commit")}</Button>
       {/if}
     </footer>
   </div>
@@ -239,13 +243,10 @@
   h2 { margin: 0; font-size: 1.25rem; font-weight: 550; }
   h3 { margin: 0; font-size: 0.9rem; font-weight: 550; }
   .description { margin: 12px 0 20px; color: var(--ink-secondary); font-size: 0.9rem; line-height: 1.6; }
-  .icon-button { width: 36px; height: 36px; border: 0; border-radius: var(--radius-full); background: transparent; color: var(--ink-secondary); font-size: 1.3rem; cursor: pointer; }
-  .icon-button:hover { background: var(--surface-soft); color: var(--ink); }
   .identity-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding-bottom: 20px; border-bottom: 1px solid var(--hairline); }
   .wide-field { grid-column: 1 / -1; }
   label > span:first-child, .identity-fields label { display: grid; gap: 6px; color: var(--ink-secondary); font-size: 0.8rem; }
-  input:not([type="checkbox"]) { box-sizing: border-box; width: 100%; padding: 9px 10px; border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--surface-press); color: var(--ink); font: inherit; }
-  input:not([type="checkbox"]):focus-visible, button:focus-visible, a:focus-visible, input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .selection-heading { align-items: baseline; margin: 20px 0 8px; }
   .selection-heading p { margin: 0; color: var(--ink-faint); font-size: 0.78rem; font-variant-numeric: tabular-nums; }
   .evidence-list { min-height: 160px; overflow-y: auto; border-top: 1px solid var(--hairline); }
@@ -255,21 +256,14 @@
   ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; }
   .mention-choice { display: grid; grid-template-columns: 24px 1fr; gap: 8px; padding: 8px 4px; cursor: pointer; }
   .mention-choice:hover { background: var(--surface-soft); }
-  .mention-choice input { margin-top: 3px; }
   q { display: block; color: var(--ink); font-size: 0.9rem; line-height: 1.65; overflow-wrap: anywhere; }
   small { display: block; margin-top: 4px; color: var(--ink-faint); font-size: 0.72rem; }
   .empty { color: var(--ink-secondary); font-size: 0.88rem; }
   .feedback { min-height: 1.4em; margin: 12px 0 0; color: var(--success); font-size: 0.8rem; }
   .feedback.error { color: var(--danger-ink); }
   footer { justify-content: flex-end; margin-top: 8px; padding-top: 12px; border-top: 1px solid var(--hairline); }
-  footer button { min-height: 36px; padding: 7px 14px; border-radius: var(--radius-md); font: inherit; font-size: 0.84rem; cursor: pointer; }
-  .secondary { border: 1px solid var(--hairline-strong); background: transparent; color: var(--ink-secondary); }
-  .secondary:hover { background: var(--surface-soft); color: var(--ink); }
-  .primary { border: 0; background: var(--primary); color: var(--on-primary); font-weight: 550; }
-  button:disabled, input:disabled { opacity: 0.5; cursor: default; }
   @media (pointer: coarse) {
-    button, .select-note, .mention-choice { min-height: 44px; }
-    .icon-button { width: 44px; }
+    .select-note, .mention-choice { min-height: 44px; }
   }
   @media (max-width: 560px) {
     .dialog-frame { padding: 18px; }

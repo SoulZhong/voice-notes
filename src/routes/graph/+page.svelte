@@ -49,6 +49,8 @@
   import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
   import GraphEdgeInspector from "$lib/GraphEdgeInspector.svelte";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import * as DropdownMenu from "$lib/ui/components/dropdown-menu";
 
   const emptySemantic = (): SemanticGraphData => ({
     nodes: [],
@@ -647,7 +649,7 @@
       <div class="placeholder">
         <p class="ph-title">{t("graph.notePh.errorTitle")}</p>
         <p class="ph-desc">{t("graph.notePh.errorDesc")}</p>
-        <button class="empty-cta" onclick={() => noteGraphState.load()}>{t("graph.notePh.reload")}</button>
+        <Button variant="outline" onclick={() => noteGraphState.load()}>{t("graph.notePh.reload")}</Button>
       </div>
     {:else}
       <div class="placeholder"><p class="ph-title">{t("graph.notePh.emptyTitle")}</p><p class="ph-desc">{t("graph.notePh.emptyDesc")}</p></div>
@@ -678,21 +680,21 @@
             <div class="map-message degraded" role="status">
               <span>{semanticStatusMessage}</span>
               {#if semanticRequestFailed}
-                <button type="button" onclick={() => loadSemantic(effectiveGraphFilter)}>{t("graph.retryRead")}</button>
+                <Button variant="secondary" size="sm" class="shrink-0" onclick={() => loadSemantic(effectiveGraphFilter)}>{t("graph.retryRead")}</Button>
               {/if}
-              <button type="button" onclick={() => (backfillOpen = true)}>{t("graph.backfill.analyze")}</button>
+              <Button variant="secondary" size="sm" class="shrink-0" onclick={() => (backfillOpen = true)}>{t("graph.backfill.analyze")}</Button>
             </div>
           {/if}
           {#if !debugFixtureRequested && semanticFallback}
             <div class="map-message fallback">
               <span>{t("graph.fallback.notice")}</span>
-              <button type="button" onclick={() => (backfillOpen = true)}>{t("graph.backfill.analyze")}</button>
+              <Button variant="secondary" size="sm" class="shrink-0" onclick={() => (backfillOpen = true)}>{t("graph.backfill.analyze")}</Button>
             </div>
           {/if}
           {#if !debugFixtureRequested && filteredSemanticEmpty}
             <div class="map-message" role="status">
               <span>{t("graph.filteredEmpty.notice")}</span>
-              <button type="button" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>{t("graph.filteredEmpty.reset")}</button>
+              <Button variant="secondary" size="sm" class="shrink-0" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>{t("graph.filteredEmpty.reset")}</Button>
             </div>
           {/if}
 
@@ -700,7 +702,7 @@
             <div class="placeholder">
               <p class="ph-title">{t("graph.emptyPh.title")}</p>
               <p class="ph-desc">{t("graph.emptyPh.desc")}</p>
-              <button class="empty-cta" onclick={() => goto("/ai")}>{t("graph.emptyPh.goAi")}</button>
+              <Button variant="outline" onclick={() => goto("/ai")}>{t("graph.emptyPh.goAi")}</Button>
             </div>
           {:else if renderedNodes.length >= 2 && renderedEdges.length > 0}
             <ForceGraph
@@ -720,7 +722,7 @@
             <div class="placeholder">
               <p class="ph-title">{t("graph.noMatchPh.title")}</p>
               <p class="ph-desc">{t("graph.noMatchPh.desc")}</p>
-              <button class="empty-cta" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>{t("graph.noMatchPh.showAll")}</button>
+              <Button variant="outline" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>{t("graph.noMatchPh.showAll")}</Button>
             </div>
           {:else}
             <div class="placeholder">
@@ -763,7 +765,7 @@
               simple={true}
             />
           {:else if !debugFixtureRequested && selected}
-            <button class="inspector-close" type="button" aria-label={t("graph.closeEntityAria")} onclick={closeEntity}>×</button>
+            <Button variant="ghost" size="icon" class="sticky top-0 z-[1] float-right rounded-full bg-card text-lg text-muted-foreground" aria-label={t("graph.closeEntityAria")} onclick={closeEntity}>×</Button>
             {#if detailLoading && !detail}
               <p class="inspector-state" aria-live="polite">{t("graph.detail.loading")}</p>
             {:else if detail}
@@ -777,7 +779,7 @@
             {:else}
               <div class="inspector-state" aria-live="polite">
                 <p>{detailError || t("graph.detail.unavailable")}</p>
-                <button type="button" onclick={() => selected && loadDetail(selected)}>{t("graph.detail.retry")}</button>
+                <Button variant="outline" onclick={() => selected && loadDetail(selected)}>{t("graph.detail.retry")}</Button>
               </div>
             {/if}
           {/if}
@@ -796,13 +798,26 @@
 {/if}
 
 {#if ctxMenu}
-  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-  <div class="menu-overlay" onclick={closeCtxMenu} oncontextmenu={(event) => { event.preventDefault(); closeCtxMenu(); }}></div>
-  <div class="ctx-menu" style:left={`${ctxMenu.x}px`} style:top={`${ctxMenu.y}px`} role="menu" aria-label={t("graph.ctx.aria", { name: ctxMenu.name })}>
-    <p>{ctxMenu.name}</p>
-    <button class="ctx-item" role="menuitem" onclick={openContextDetail}>{t("graph.ctx.viewDetail")}</button>
-    <button class="ctx-item" role="menuitem" onclick={openContextGovernance}>{t("graph.ctx.manage")}</button>
-  </div>
+  <!-- 右键菜单:锚在鼠标位置的零尺寸触发点上;Esc 仍由本页 handleEscape 统一处理(只关菜单,
+       不连带关详情),所以内容层关掉 bits 自带的 Esc 行为。点外面/右键外面 → onOpenChange 关。 -->
+  <DropdownMenu.Root open={true} onOpenChange={(open) => { if (!open) closeCtxMenu(); }}>
+    <DropdownMenu.Trigger>
+      {#snippet child({ props })}
+        <span {...props} class="ctx-anchor" style:left={`${ctxMenu?.x ?? 0}px`} style:top={`${ctxMenu?.y ?? 0}px`}></span>
+      {/snippet}
+    </DropdownMenu.Trigger>
+    <DropdownMenu.Content
+      align="start"
+      sideOffset={0}
+      class="min-w-[180px]"
+      escapeKeydownBehavior="ignore"
+      aria-label={t("graph.ctx.aria", { name: ctxMenu.name })}
+    >
+      <DropdownMenu.Label class="text-xs font-normal text-muted-foreground">{ctxMenu.name}</DropdownMenu.Label>
+      <DropdownMenu.Item onSelect={openContextDetail}>{t("graph.ctx.viewDetail")}</DropdownMenu.Item>
+      <DropdownMenu.Item onSelect={openContextGovernance}>{t("graph.ctx.manage")}</DropdownMenu.Item>
+    </DropdownMenu.Content>
+  </DropdownMenu.Root>
 {/if}
 
 <style>
@@ -811,32 +826,7 @@
   .entity-stage { display: flex; background: var(--canvas); }
   .map-column { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; }
   .canvas-shell { flex: 1 1 auto; position: relative; min-width: 0; min-height: 0; }
-  .menu-overlay { position: fixed; inset: 0; z-index: 48; }
-  .ctx-menu {
-    position: fixed;
-    z-index: 49;
-    display: grid;
-    min-width: 180px;
-    padding: 6px;
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-lg);
-    background: var(--surface-press);
-    box-shadow: var(--shadow-popover);
-  }
-  .ctx-menu p { margin: 3px 8px 7px; color: var(--ink-faint); font-size: 0.7rem; }
-  .ctx-item {
-    min-height: 36px;
-    padding: 7px 9px;
-    border: 0;
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--ink);
-    font: inherit;
-    font-size: 0.82rem;
-    text-align: left;
-    cursor: pointer;
-  }
-  .ctx-item:hover { background: var(--surface-soft); }
+  .ctx-anchor { position: fixed; width: 0; height: 0; pointer-events: none; }
   .map-message {
     position: absolute;
     z-index: 9;
@@ -856,17 +846,6 @@
     line-height: 1.45;
   }
   .map-message.degraded + .map-message { top: 52px; }
-  .map-message button {
-    flex: none;
-    min-height: 32px;
-    padding: 4px 8px;
-    border: 0;
-    border-radius: var(--radius-md);
-    background: var(--accent-tint);
-    color: var(--accent);
-    font: inherit;
-    cursor: pointer;
-  }
   .edge-inspector {
     flex: 0 0 clamp(340px, 34%, 440px);
     box-sizing: border-box;
@@ -876,40 +855,10 @@
     border-left: 1px solid var(--hairline);
     background: var(--surface);
   }
-  .inspector-close {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    float: right;
-    width: 36px;
-    height: 36px;
-    padding: 0;
-    border: 0;
-    border-radius: var(--radius-full);
-    background: var(--surface);
-    color: var(--ink-secondary);
-    font: inherit;
-    font-size: 1.3rem;
-    cursor: pointer;
-  }
-  .inspector-close:hover { background: var(--surface-soft); color: var(--ink); }
   .inspector-state { margin: 56px 0 0; color: var(--ink-secondary); font-size: 0.86rem; line-height: 1.6; }
-  .inspector-state button, .empty-cta {
-    min-height: 36px;
-    padding: 7px 13px;
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--ink-secondary);
-    font: inherit;
-    font-size: 0.82rem;
-    cursor: pointer;
-  }
-  .inspector-state button:hover, .empty-cta:hover { background: var(--surface-soft); color: var(--ink); }
   .placeholder { max-width: 440px; margin: 18vh auto 0; padding: 0 20px; text-align: center; }
   .ph-title { margin: 0 0 8px; color: var(--ink); font-size: 1.05rem; font-weight: 500; }
   .ph-desc { margin: 0 0 18px; color: var(--ink-secondary); font-size: 0.82rem; line-height: 1.65; }
-  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   @media (max-width: 880px) {
     .edge-inspector {
       position: fixed;
@@ -921,10 +870,6 @@
       border-left: 1px solid var(--hairline-strong);
       border-radius: 0;
     }
-  }
-  @media (pointer: coarse) {
-    button { min-height: 44px; }
-    .inspector-close { width: 44px; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
