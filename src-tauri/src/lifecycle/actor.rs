@@ -464,6 +464,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
             // P3 首批消费者:托盘图标由迁移驱动(取代 lib.rs 里 tray::set_recording
             // 的散点直调)。启动前注册完再进循环,符合 HookBus「注册序执行」契约。
             bus.register(Box::new(super::consumers::TrayHook));
+            bus.register(Box::new(super::consumers::MemoShortcutHook));
             // Aing 集各条目「最后一次有进度」的时刻(相对 actor 启动的毫秒)。
             // 用于滞留自愈,见 REFINE_STALE_MS。单线程持有,无锁。
             let boot = std::time::Instant::now();

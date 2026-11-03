@@ -337,11 +337,12 @@ fn run_retitle(args: &[String]) -> Result<i32, String> {
     for n in &candidates {
         let paragraphs = note_paragraphs_for_title(&roots, &n.id);
         let ctx = crate::ailog::Ctx { data_root: roots.data_root.clone(), note_id: n.id.clone() };
+        let memos = crate::store::memos::load_memos(&roots.data_root.join("notes").join(&n.id)).memos;
         let title = match &provider {
             TitleProvider::Agent(kind, bin, model) => {
-                crate::refine::agent::gen_title(*kind, bin, model, &paragraphs, Some(&ctx))
+                crate::refine::agent::gen_title_with_memos(*kind, bin, model, &paragraphs, &memos, Some(&ctx))
             }
-            TitleProvider::Http(cfg) => crate::refine::llm::gen_title(cfg, &paragraphs, Some(&ctx)),
+            TitleProvider::Http(cfg) => crate::refine::llm::gen_title_with_memos(cfg, &paragraphs, &memos, Some(&ctx)),
         };
         match title.and_then(|t| store.rename(&n.id, &t).map(|()| t)) {
             Ok(t) => {

@@ -42,6 +42,8 @@ mod identify_actions;
 mod hooks_external;
 mod device; // 设备听写(AI Passport),见 docs/adr/0001
 mod recording_ctl; // 程序化录制控制(MCP 控制面与设备共用)
+mod memo; // 会议备注命令壳(存储在 store::memos)
+mod memo_panel; // 备注浮窗(⌥⌘M / 托盘)
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1097,17 +1099,21 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     refine_beat_touch(&note_id, beat_gen, "title", "running"); // 心跳表打点,同 identify
                     // 标题跟随 Aing 执行体:Agent 模式一发一收(无 MCP、无工具),
                     // HTTP 模式走原 chat completions。两边同一长度守卫、同样失败即放弃。
+                    let title_memos = notes_dir(&app)
+                        .map(|d| store::memos::load_memos(&d.join(&note_id)).memos)
+                        .unwrap_or_default();
                     let title = match refine_exec.as_ref().unwrap() {
                         settings::ResolvedExecutor::Agent { kind, bin, model } => {
                             refine::agent::AgentKind::from_key(kind)
                                 .and_then(|k| refine::agent::resolve_bin(k, bin).map(|b| (k, b)))
                                 .ok_or_else(|| anyhow::anyhow!("Agent CLI 不可用"))
                                 .and_then(|(kind, bin)| {
-                                    refine::agent::gen_title(
+                                    refine::agent::gen_title_with_memos(
                                         kind,
                                         &bin,
                                         model,
                                         &doc.paragraphs,
+                                        &title_memos,
                                         log_ctx.as_ref(),
                                     )
                                 })
@@ -1118,7 +1124,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                 model: model.clone(),
                                 api_key: api_key.clone(),
                             };
-                            refine::llm::gen_title(&cfg, &doc.paragraphs, log_ctx.as_ref())
+                            refine::llm::gen_title_with_memos(&cfg, &doc.paragraphs, &title_memos, log_ctx.as_ref())
                         }
                     };
                     match title {
@@ -2413,6 +2419,15 @@ fn spawn_session(
         // 续录时间轴偏移：New 路径恒 0；Resume 路径 = 续录前最大 end_ms。
         // on_final 落盘/emit 前 start_ms/end_ms 均 + base_ms（partial 无时间戳，不受影响）。
         let base_ms = writer.base_ms();
+        // 会议备注:上一场最后一句之后的静音被切掉了(音频轨截到 base_ms),落在那之后的
+        // 备注不钳就会指进第二场开头的内容里。唯一一处「系统改备注」:只改时间、只此一次。
+        if let NoteTarget::Resume(_) = &target {
+            match store::memos::clamp_after(&note_dir, base_ms) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("续录:{n} 条备注钳回上一场末尾 {base_ms}ms"),
+                Err(e) => eprintln!("续录钳位备注失败(不影响录制): {e}"),
+            }
+        }
         let registry_snap = writer.registry_snapshot();
         // 标记本笔记的 mic 轨道已启用软件 AEC（离线清洗只认这类场次）。
         if soft_aec_on {
@@ -3463,10 +3478,14 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
                     store::VoiceprintStore::new(data_root(&app).map_err(anyhow::Error::msg)?).load();
                 speaker_prompt_labels(&note.speakers, &vp_now)
             };
-            let (outcome, _ents) = refine::llm::polish(
+            let retry_memos = notes_dir(&app)
+                .map(|d| store::memos::load_memos(&d.join(&note_id)).memos)
+                .unwrap_or_default();
+            let (outcome, _ents) = refine::llm::polish_with_memos(
                 &cfg,
                 &mut subset,
                 &prompt_labels,
+                &retry_memos,
                 log_ctx.as_ref(),
                 // 取舍(设计明说):补跑块以空术语表起步;实体/关系不补。
                 &|done, total, avg_ms| {
@@ -9379,6 +9398,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            memo::note_memos,
+            memo::memo_anchor_now,
+            memo::add_memo,
+            memo::edit_memo,
+            memo::delete_memo,
+            memo::search_memos,
+            memo_panel::memo_panel_state,
+            memo_panel::memo_panel_hide,
             device::device_status,
             device::device_scan,
             device::device_connect,

@@ -159,6 +159,9 @@
   let identifyAuto = $state(false);
   /** 系统区:全局快捷键开关 / 菜单栏常驻 / 开机自启(自启为系统真值,非 settings)。 */
   let shortcutEnabled = $state(false);
+  /** 会议备注快捷键(只在录音中生效)。 */
+  let memoShortcutEnabled = $state(true);
+  let capturingMemoShortcut = $state(false);
   let trayEnabled = $state(false);
   let telemetryEnabled = $state(true);
   /** 保存中禁用开关:快速连点会让先到的请求把后到的意图覆盖掉。 */
@@ -350,6 +353,7 @@
     refineOn = s.refine_enabled;
     identifyAuto = s.identify_auto_apply;
     shortcutEnabled = s.shortcut_enabled;
+    memoShortcutEnabled = s.memo_shortcut_enabled;
     trayEnabled = s.tray_enabled;
     telemetryEnabled = s.telemetry_enabled;
     asrMode = s.asr_mode === "cloud" || s.asr_mode === "local_cloud" ? s.asr_mode : "local";
@@ -621,6 +625,42 @@
       settings = await getSettings().catch(() => settings);
       if (settings) syncLocalFromSettings(settings);
     }
+  }
+
+  // —— 会议备注快捷键:存 settings 后 applyShortcut(后端按「是否录音中」重对备注键)。
+  // 与录制键相同的组合直接拒绝——两个键同一组合时插件只会触发一个动作。
+  async function saveMemoShortcut(patch: { enabled?: boolean; acc?: string }) {
+    error = "";
+    try {
+      const fresh = await getSettings();
+      if (patch.acc !== undefined) {
+        if (patch.acc === fresh.shortcut) {
+          error = t("memo.settings.sameAsRecord");
+          return;
+        }
+        fresh.memo_shortcut = patch.acc;
+      }
+      if (patch.enabled !== undefined) fresh.memo_shortcut_enabled = patch.enabled;
+      await setSettings(fresh);
+      settings = fresh;
+      await applyShortcut();
+    } catch (e) {
+      error = t("settings.shortcut.saveFailed", { e });
+      settings = await getSettings().catch(() => settings);
+      if (settings) syncLocalFromSettings(settings);
+    }
+  }
+  async function onMemoShortcutKeydown(e: KeyboardEvent) {
+    e.preventDefault();
+    const input = e.currentTarget as HTMLInputElement;
+    if (e.key === "Escape") {
+      input.blur();
+      return;
+    }
+    const acc = acceleratorFromEvent(e);
+    if (acc === null) return;
+    await saveMemoShortcut({ acc });
+    input.blur();
   }
 
   // —— 开机自启:直连插件真值,onMount 读、toggle 写 ——
@@ -929,6 +969,31 @@
           bind:checked={shortcutEnabled}
           disabled={!settings}
           onchange={toggleShortcutEnabled}
+        />
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("memo.settings.label")}</span>
+          <span class="row-desc">{t("memo.settings.desc")}</span>
+        </div>
+        {#if memoShortcutEnabled}
+          <input
+            class="shortcut-input"
+            readonly
+            value={capturingMemoShortcut ? "" : displayShortcut(settings?.memo_shortcut ?? "")}
+            placeholder={t("settings.shortcut.placeholder")}
+            onfocus={() => (capturingMemoShortcut = true)}
+            onblur={() => (capturingMemoShortcut = false)}
+            onkeydown={onMemoShortcutKeydown}
+          />
+        {/if}
+        <input
+          type="checkbox"
+          class="ctl switch"
+          aria-label={t("memo.settings.label")}
+          bind:checked={memoShortcutEnabled}
+          disabled={!settings}
+          onchange={() => void saveMemoShortcut({ enabled: memoShortcutEnabled })}
         />
       </div>
       <label class="row">

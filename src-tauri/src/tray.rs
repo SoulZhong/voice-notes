@@ -114,6 +114,8 @@ fn menu_items(recording: bool, session: Option<bool>, playback_active: bool) -> 
                 crate::tr!("暂停录制", "Pause recording")
             },
         ));
+        // 加备注:按下即钉住当前录音时间并弹浮窗(与 ⌥⌘M 同一入口 memo::mark_now)。
+        items.push(("add_memo", crate::tr!("加备注…", "Add memo…")));
     }
     if playback_active {
         items.push(("stop_playback", crate::tr!("停止播放", "Stop playback")));
@@ -168,6 +170,7 @@ fn on_menu_event(app: &AppHandle, id: &str) {
         // 停播放不碰窗口:用户从托盘停,本意就是不想让窗口跳出来。前端(哪怕窗口是隐藏的,
         // webview 仍在跑)收 player_stopped 后自行清会话/复位播放器。
         "stop_playback" => crate::player::stop_from_tray(app),
+        "add_memo" => crate::memo::mark_now(app, "tray"),
         // 暂停/恢复:走与命令壳同一条 actor 信箱,不在菜单回调里直接改状态。
         // 丢阻塞线程池执行(同 toggle_recording 的理由):菜单回调跑在事件循环线程,
         // command() 会等 actor 回复,actor 正忙于停录收尾时同步等待会冻住整个 UI。
@@ -457,7 +460,7 @@ mod tests {
         // 录制与播放互不排斥:边录边听旧笔记时两项都在。
         assert_eq!(
             ids(true, true),
-            ["toggle", "pause_toggle", "stop_playback", "show", "quit"]
+            ["toggle", "pause_toggle", "add_memo", "stop_playback", "show", "quit"]
         );
     }
 
@@ -468,11 +471,11 @@ mod tests {
             menu_items(rec, Some(paused), false).into_iter().map(|(id, _)| id).collect::<Vec<_>>()
         };
         assert_eq!(ids_of(false, false), ["toggle", "show", "quit"]);
-        assert_eq!(ids_of(true, false), ["toggle", "pause_toggle", "show", "quit"]);
-        assert_eq!(ids_of(true, true), ["toggle", "pause_toggle", "show", "quit"]);
+        assert_eq!(ids_of(true, false), ["toggle", "pause_toggle", "add_memo", "show", "quit"]);
+        assert_eq!(ids_of(true, true), ["toggle", "pause_toggle", "add_memo", "show", "quit"]);
         // 空闲态即便 paused 位为真(不该发生)也不出这一项
         assert_eq!(ids_of(false, true), ["toggle", "show", "quit"]);
-        // 开录途中:running 已置真但会话还没入槽 → 不出暂停项(点了只会报"没有正在进行的录制")
+        // 开录途中:running 已置真但会话还没入槽 → 不出暂停项,也不出加备注(点了只会报"没有正在进行的录制")
         let no_session = menu_items(true, None, false).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
         assert_eq!(no_session, ["toggle", "show", "quit"]);
     }

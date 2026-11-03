@@ -31,7 +31,8 @@ pub const REFINE_SYSTEM: &str = r#"你是会议逐字稿精修助手。对输入
 此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名。**不要输出关系(relations)**:关系由独立的整篇抽取阶段负责,在这里产出只会白占输出长度并把 JSON 顶到 token 上限。
 每段前的 speaker= 标注是该段说话人(人名或簇号),仅供理解上下文:用于人名/称呼错字判断与实体归一(如称呼「小王」后由 speaker=王某 的段应答,可确认「王」字写法)。禁止据此改写句式、把代词替换成人名、或把 speaker 标注/说话人名写进 texts;texts 只输出修订后的正文。
 输出 JSON:{"glossary":{"错误写法":"统一写法"},"texts":["段落1修订文","段落2修订文"],"entities":[{"name":"规范名","kind":"person|org|project|term|decision|task|place|date","aliases":["别名"]}]}。
-texts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项;只收实体类的错写→正写,一条就是一个词,不要把多个词连成一条。entities 没有可给空数组,aliases 可省略。"#;
+texts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项;只收实体类的错写→正写,一条就是一个词,不要把多个词连成一条。entities 没有可给空数组,aliases 可省略。
+输入里若有「用户备注」一节(每行 t=时间 备注:内容),那是用户在会上亲手记的只读提示:用来判断错字、统一人名与术语写法、理解主题;不得把备注内容复制或改写进 texts,备注与正文冲突时以正文为准。"#;
 
 /// 只补关系(正文与实体已定稿)。用于精修已完成、仅图谱需要重建的回填路径。
 pub const RELATION_ONLY_SYSTEM: &str = r#"你是会议语义关系抽取器。正文和实体已经定稿，禁止改写、补写或删除任何段落与实体。只根据给定 paragraphs 和 entities 抽取有逐字证据的 relations。subject/object 必须使用 entities 中的规范 name 或 alias；predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at 或 custom，custom 必须带非空 label；confidence 必须在 0 到 1；valid_from/valid_to 为 null 或带时区 RFC3339，且 from 严格早于 to。evidence.paragraph_index 是全文绝对下标；start/end 是 Unicode scalar 半开区间；quote 必须逐字符等于该区间。只输出 JSON 对象 {"relations":[...]}；没有可靠关系时输出 {"relations":[]}。"#;
@@ -52,6 +53,32 @@ pub const LLM_PROBE_USER: &str = r#"回复 OK"#;
 /// - `numbered`:本块段落,逐行由 [`refine_paragraph_line`] 排版。
 pub fn refine_user(glossary: &serde_json::Value, numbered: &str) -> String {
     format!("术语表(沿用并可扩充):{glossary}\n段落:\n{numbered}")
+}
+
+/// 带会议备注的精修 user 消息。`memos` 为空时与 [`refine_user`] **逐字节一致**(没有
+/// 备注的笔记行为不变);非空时备注一节放在术语表与段落之间,**不进编号段落**——
+/// 否则 texts 条数校验会把备注当段落数。行由 [`memo_hint_line`] 排版。
+pub fn refine_user_with_memos(glossary: &serde_json::Value, numbered: &str, memos: &str) -> String {
+    if memos.is_empty() {
+        return refine_user(glossary, numbered);
+    }
+    format!("术语表(沿用并可扩充):{glossary}\n用户备注(只读提示,不是正文):\n{memos}段落:\n{numbered}")
+}
+
+/// 一条备注进提示词的行格式。文字是用户可编辑字符串:换行会拆行、冒号会截断
+/// 「备注:内容」格式,统一替换为空格(同 `speaker_label` 的做法,保行格式不是安全边界)。
+pub fn memo_hint_line(at_ms: u64, text: &str) -> String {
+    let cleaned = text.replace(['\n', '\r', ':', ':'], " ");
+    format!("t={} 备注:{}\n", crate::store::memos::fmt_clock(at_ms), cleaned.trim())
+}
+
+/// 起标题的输入:备注(覆盖全场,补「只看开头 1500 字」的位)放在正文**之前**。
+/// `memos` 为空时原样返回正文(没有备注的笔记行为不变)。
+pub fn title_input(memos: &str, body: &str) -> String {
+    if memos.is_empty() {
+        return body.to_string();
+    }
+    format!("用户备注:\n{memos}正文:\n{body}")
 }
 
 /// 精修输入里的一行段落。**`speaker` 是说话人姓名进入模型的唯一通道**:
@@ -102,7 +129,7 @@ pub fn agent_refine(note_id: &str) -> String {
     format!(
         r#"你是会议逐字稿精修与语义图谱助手。任务:完成 voice-notes 笔记 {note_id} 的文本与图谱 Aing。
 步骤:
-1. 调用 MCP 工具 get_note,参数 {{"note_id":"{note_id}","format":"segments"}},取返回的 paragraphs 数组(段落下标从 0 计;若返回 refined=false 说明还没有精修稿,直接结束并说明)。每个段落带 speaker/name 字段(该段说话人的簇号与人名);精修正文时利用它做人名/称呼错字判断与称呼一致性(如称呼「小王」后由王某的段应答,可确认「王」字写法)。禁止修改说话人归属,禁止据此改写句式或把代词替换成人名,禁止把说话人名当前缀写进正文。
+1. 调用 MCP 工具 get_note,参数 {{"note_id":"{note_id}","format":"segments"}},取返回的 paragraphs 数组(段落下标从 0 计;若返回 refined=false 说明还没有精修稿,直接结束并说明)。每个段落带 speaker/name 字段(该段说话人的簇号与人名);精修正文时利用它做人名/称呼错字判断与称呼一致性(如称呼「小王」后由王某的段应答,可确认「王」字写法)。禁止修改说话人归属,禁止据此改写句式或把代词替换成人名,禁止把说话人名当前缀写进正文。返回里的 memos 数组(at_ms 毫秒 + text)是用户在会上亲手记的只读提示:可用来判断错字、统一人名与术语写法;不得把备注内容写进任何段落,与正文冲突时以正文为准。
 2. 逐段检查,只做四类修订,除此之外禁止任何改动(不改句式和语义,不合并/拆分段落):
 a) 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文;b) 实体归一:同一人名/产品名/术语全文统一为最常见写法;c) 删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留「吧」「啊」等语气词;d) 英文与中文之间加空格,产品名保持原大小写。
 3. 调用 MCP 工具 apply_refined_texts 一次性写回,参数 {{"note_id":"{note_id}","updates":[{{"index":段落下标,"text":"该段修订后的完整文本"}},...],"model":"你的模型名"}};只提交有改动的段落;若全文确无需要修订,updates 传空数组 []。
@@ -162,6 +189,34 @@ mod tests {
             refine_user(&glossary, "paragraph_index=0 speaker=R2: 正文\n"),
             "术语表(沿用并可扩充):{\"肯计\":\"肯定\"}\n段落:\nparagraph_index=0 speaker=R2: 正文\n"
         );
+    }
+
+    #[test]
+    fn memo_block_is_absent_without_memos_and_cleaned_with_them() {
+        let g = serde_json::json!({});
+        let n = "paragraph_index=0 speaker=R2: 正文\n";
+        assert_eq!(refine_user_with_memos(&g, n, ""), refine_user(&g, n));
+        let line = memo_hint_line(754_000, "定了:下周二\n上线");
+        assert_eq!(line, "t=12:34 备注:定了 下周二 上线\n");
+        let u = refine_user_with_memos(&g, n, &line);
+        assert!(u.find("用户备注").unwrap() < u.find("段落:").unwrap(), "{u}");
+        assert!(u.ends_with(n), "编号段落仍在末尾,不混入备注: {u}");
+        assert_eq!(title_input("", "正文"), "正文");
+        assert!(title_input(&line, "正文").starts_with("用户备注:"));
+    }
+
+    /// 护栏:精修/拟题代码只读备注,不得调用任何备注写函数(备注永远属于用户)。
+    #[test]
+    fn refine_never_writes_memos() {
+        let sources = [
+            include_str!("mod.rs"), include_str!("llm.rs"), include_str!("agent.rs"),
+            include_str!("identify.rs"), include_str!("relations.rs"), include_str!("backfill.rs"),
+        ];
+        for src in sources {
+            for f in ["memos::add_memo", "memos::edit_memo", "memos::delete_memo", "memos::clamp_after"] {
+                assert!(!src.contains(f), "refine/ 下出现了备注写函数 {f}");
+            }
+        }
     }
 
     /// 护栏:提示词不得在消费方文件里重新内联。

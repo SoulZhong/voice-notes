@@ -32,6 +32,11 @@
 
   let { children } = $props();
 
+  // 备注浮窗(/memo-panel)是另一个 webview 窗口:只要主题与语言,**不跑**主窗口的任何
+  // 启动副作用(录制监听会在停录时 goto 笔记页、播放态上报会把主窗口的播放态冲掉、
+  // 升级检查/欢迎页/侧栏都不属于浮窗)。按窗口加载时的路径判定,浮窗不会在内部导航。
+  const bare = typeof window !== "undefined" && window.location.pathname.startsWith("/memo-panel");
+
   // 迷你播放浮层的显示判定复用同一个纯函数(与 MiniPlayer.svelte 内部判定同源),
   // 避免这里再造一份、和浮层实际是否渲染不同步——那样安全区可能在浮层没显示时白留一块空白,
   // 或者浮层显示了但没留出安全区。
@@ -45,7 +50,9 @@
   // 派在 layout 而非浮层组件:浮层在自己笔记页上不渲染,挂在它身上会漏掉那一整段。
   const playbackActive = $derived(playback.session !== null);
   $effect(() => {
-    void invoke("set_playback_active", { active: playbackActive }).catch(() => {});
+    const active = playbackActive;
+    if (bare) return;
+    void invoke("set_playback_active", { active }).catch(() => {});
   });
 
   // 升级提示放全局布局:app 启动落地页可能是笔记详情/录制/空态任一(见根路由重定向),
@@ -132,6 +139,15 @@
   });
 
   onMount(() => {
+    if (bare) {
+      getSettings()
+        .then((s) => {
+          applyTheme(s.theme);
+          i18n.setChoice(s.ui_lang);
+        })
+        .catch(() => {});
+      return;
+    }
     // 分析初始化放最前:页面浏览与异常捕获越早装上覆盖面越大。
     // 内部做了 try/catch,失败不影响后续任何初始化。
     void initAnalytics();
@@ -166,6 +182,9 @@
   });
 </script>
 
+{#if bare}
+  {@render children()}
+{:else}
 <div class="shell">
   <Sidebar />
   <!-- 开录前风险确认:两个开录入口共用,挂一处。 -->
@@ -215,6 +234,7 @@
 {/if}
 <ContextGuide />
 <MiniPlayer />
+{/if}
 
 <style>
   :global(body) {

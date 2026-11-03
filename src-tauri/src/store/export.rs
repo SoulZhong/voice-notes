@@ -1,3 +1,5 @@
+use super::edits::CutRange;
+use super::memos::Memo;
 use super::{Note, NoteStore, RefinedDoc, SegmentRecord, SpeakerMeta};
 use std::collections::BTreeMap;
 
@@ -33,6 +35,12 @@ impl NoteStore {
         // (段里还有没被删的话音,文字不切半句——与圈选范围同一条整段纪律)。
         let cuts = super::edits::load_edits(&self.note_dir(id)?).cuts;
         let fully_cut = |s: u64, e: u64| cuts.iter().any(|c| s >= c.start_ms && e <= c.end_ms);
+        // 备注按时间点插入;圈选范围只带范围内的(点判定 start ≤ t < end)。落在删减
+        // 时段里的照样导出并标注(与界面一致)——备注永远属于用户,删减不动它。
+        let mut memos = super::memos::load_memos(&self.note_dir(id)?).memos;
+        if let Some((s, e)) = range {
+            memos.retain(|m| s <= m.at_ms && m.at_ms < e);
+        }
         let content = match refined {
             Some(doc) => {
                 let title = self.load(id)?.meta.title;
@@ -45,7 +53,7 @@ impl NoteStore {
                     clipped.paragraphs.retain(|p| !has_span(p) || (p.end_ms > s && p.start_ms < e));
                 }
                 clipped.paragraphs.retain(|p| !has_span(p) || !fully_cut(p.start_ms, p.end_ms));
-                render_refined(&title, &clipped, format == "md")
+                render_refined_with_memos(&title, &clipped, format == "md", &memos, &cuts)
             }
             None => {
                 let mut note = self.load(id)?;
@@ -53,7 +61,7 @@ impl NoteStore {
                     note.segments.retain(|sg| sg.end_ms > s && sg.start_ms < e);
                 }
                 note.segments.retain(|sg| !fully_cut(sg.start_ms, sg.end_ms));
-                render_note(&note, format)?
+                render_note_with_memos(&note, format, &memos, &cuts)?
             }
         };
         let tmp = dest.with_file_name(format!(
@@ -186,15 +194,85 @@ impl NoteStore {
     pub fn render_loaded(&self, note: &Note, format: &str) -> anyhow::Result<String> {
         render_note(note, format)
     }
+
+    /// 同 [`render_loaded`],备注按时间插入(MCP get_note markdown/text 用,与 GUI 导出同口径)。
+    pub fn render_loaded_with_memos(&self, note: &Note, format: &str, memos: &[Memo], cuts: &[CutRange]) -> anyhow::Result<String> {
+        render_note_with_memos(note, format, memos, cuts)
+    }
 }
 
 /// 渲染逻辑本体,供 `render`(先 load 再渲染)与 `render_loaded`(已有 Note,直接渲染)共用。
 pub(crate) fn render_note(note: &Note, format: &str) -> anyhow::Result<String> {
+    render_note_with_memos(note, format, &[], &[])
+}
+
+/// 带备注的原始稿渲染:备注按 `at_ms` 归并插入(见 [`MemoCursor`])。
+pub(crate) fn render_note_with_memos(
+    note: &Note,
+    format: &str,
+    memos: &[Memo],
+    cuts: &[CutRange],
+) -> anyhow::Result<String> {
     Ok(match format {
-        "md" => render_markdown(note),
-        "txt" => render_text(note),
+        "md" => render_markdown(note, memos, cuts),
+        "txt" => render_text(note, memos, cuts),
         _ => anyhow::bail!("未知导出格式: {format}"),
     })
+}
+
+/// 备注的归并游标:渲染每个有时间跨度的块之前,先吐出所有 `at_ms < 块.start_ms` 的备注——
+/// 即备注落在「最后一个 `start_ms <= at_ms` 的块」之后,与笔记页书签同一条规则。
+/// 循环结束后 [`MemoCursor::rest`] 吐出比所有块都晚的。
+struct MemoCursor<'a> {
+    memos: &'a [Memo],
+    i: usize,
+    cuts: &'a [CutRange],
+    md: bool,
+}
+
+impl<'a> MemoCursor<'a> {
+    fn new(memos: &'a [Memo], cuts: &'a [CutRange], md: bool) -> Self {
+        Self { memos, i: 0, cuts, md }
+    }
+
+    fn before(&mut self, start_ms: u64, out: &mut String) {
+        while let Some(m) = self.memos.get(self.i).filter(|m| m.at_ms < start_ms) {
+            out.push_str(&render_memo(m, self.cuts, self.md));
+            self.i += 1;
+        }
+    }
+
+    fn rest(&mut self, out: &mut String) {
+        for m in &self.memos[self.i..] {
+            out.push_str(&render_memo(m, self.cuts, self.md));
+        }
+        self.i = self.memos.len();
+    }
+}
+
+/// 一条备注的导出形态。Markdown 用引用块(多行每行都带 `> `),纯文本用方括号前缀。
+fn render_memo(m: &Memo, cuts: &[CutRange], md: bool) -> String {
+    let cut_tag = if super::memos::in_cut(m.at_ms, cuts) { "(该时段已删减)" } else { "" };
+    let text = m.text.trim_end();
+    if md {
+        let head = if text.is_empty() {
+            format!("> 🔖 **时间标记 {}**{cut_tag}", super::memos::fmt_clock(m.at_ms))
+        } else {
+            let mut lines = text.lines();
+            let first = lines.next().unwrap_or("");
+            let mut h = format!("> 📝 **备注 {}** {first}", super::memos::fmt_clock(m.at_ms));
+            for l in lines {
+                h.push_str(&format!("\n> {l}"));
+            }
+            h.push_str(cut_tag);
+            h
+        };
+        format!("{head}\n\n")
+    } else if text.is_empty() {
+        format!("[时间标记 {}]{cut_tag}\n", format_ts(m.at_ms))
+    } else {
+        format!("[备注 {}] {}{cut_tag}\n", format_ts(m.at_ms), text.replace('\n', "\n    "))
+    }
 }
 
 /// 把成品轨轨内若干保留区间(毫秒,有序不重叠)拼接写到 tmp。WAV 直接按字节拼
@@ -289,6 +367,13 @@ fn splice_wav(src: &std::path::Path, dest: &std::path::Path, keeps_ms: &[(u64, u
 /// GUI 导出与 MCP get_note 共用本函数,防两处漂移)。
 /// 段落标签兜底与前端 speakerLabel 同序:名字 > 关联人物全局编号 > R 簇号。
 pub fn render_refined(title: &str, doc: &RefinedDoc, md: bool) -> String {
+    render_refined_with_memos(title, doc, md, &[], &[])
+}
+
+/// 带备注的修订稿渲染(备注插在段落之间,规则同 [`MemoCursor`])。无时间跨度的自由块
+/// (用户手写段,start==end==0)不推进游标。
+pub fn render_refined_with_memos(title: &str, doc: &RefinedDoc, md: bool, memos: &[Memo], cuts: &[CutRange]) -> String {
+    let mut cursor = MemoCursor::new(memos, cuts, md);
     let mut out = String::new();
     if md {
         out.push_str(&format!("# {title}\n\n"));
@@ -334,6 +419,9 @@ pub fn render_refined(title: &str, doc: &RefinedDoc, md: bool) -> String {
         out.push('\n');
     }
     for p in &doc.paragraphs {
+        if p.end_ms > p.start_ms {
+            cursor.before(p.start_ms, &mut out);
+        }
         // 用户在笔记页插入的自由 markdown 块(空 speaker、无关联人物):只出正文。
         let speakerless =
             p.speaker.is_empty() && p.name.as_deref().unwrap_or("").is_empty() && p.person_id.is_none();
@@ -367,6 +455,7 @@ pub fn render_refined(title: &str, doc: &RefinedDoc, md: bool) -> String {
             out.push_str(&format!("{label} [{ts}]\n{}\n\n", p.text));
         }
     }
+    cursor.rest(&mut out);
     out
 }
 
@@ -423,13 +512,15 @@ fn header_line(note: &Note) -> Option<String> {
     }
 }
 
-pub(super) fn render_markdown(note: &Note) -> String {
+pub(super) fn render_markdown(note: &Note, memos: &[Memo], cuts: &[CutRange]) -> String {
+    let mut cursor = MemoCursor::new(memos, cuts, true);
     let mut out = format!("# {}\n\n", note.meta.title);
     if let Some(h) = header_line(note) {
         out.push_str(&h);
         out.push_str("\n\n");
     }
     for seg in &note.segments {
+        cursor.before(seg.start_ms, &mut out);
         out.push_str(&format!(
             "**[{}] {}** {}\n\n",
             label(seg, &note.speakers),
@@ -437,16 +528,19 @@ pub(super) fn render_markdown(note: &Note) -> String {
             seg.text
         ));
     }
+    cursor.rest(&mut out);
     out
 }
 
-pub(super) fn render_text(note: &Note) -> String {
+pub(super) fn render_text(note: &Note, memos: &[Memo], cuts: &[CutRange]) -> String {
+    let mut cursor = MemoCursor::new(memos, cuts, false);
     let mut out = format!("{}\n\n", note.meta.title);
     if let Some(h) = header_line(note) {
         out.push_str(&h);
         out.push_str("\n\n");
     }
     for seg in &note.segments {
+        cursor.before(seg.start_ms, &mut out);
         out.push_str(&format!(
             "[{}] {} {}\n",
             label(seg, &note.speakers),
@@ -454,6 +548,7 @@ pub(super) fn render_text(note: &Note) -> String {
             seg.text
         ));
     }
+    cursor.rest(&mut out);
     out
 }
 
@@ -463,6 +558,68 @@ mod tests {
     use crate::store::writer::NoteWriter;
     use crate::store::NoteStore;
     use serde_json;
+
+    fn memo(at_ms: u64, text: &str) -> Memo {
+        Memo { id: format!("m{at_ms}"), at_ms, text: text.into(), origin: "note".into(), created_at: String::new(), updated_at: String::new() }
+    }
+
+    fn memo_note() -> Note {
+        let seg = |seq: u64, s: u64, text: &str| crate::store::SegmentRecord {
+            seq, source: "mic".into(), text: text.into(), start_ms: s, end_ms: s + 1000,
+            speaker: None, rms: None, multi: None,
+        };
+        Note {
+            meta: crate::store::NoteMeta {
+                schema_version: 1, id: "x".into(), title: "t".into(), started_at: String::new(),
+                ended_at: None, state: "complete".into(), calendar: None, calendar_cleared: false,
+                attendees: vec![], attendees_removed: vec![], asr_engine: None, imported_from: None,
+            },
+            segments: vec![seg(0, 0, "一"), seg(1, 10_000, "二")],
+            suppressed_segments: vec![],
+            skipped_lines: 0,
+            speakers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn memos_interleave_after_last_segment_that_started_before() {
+        let note = memo_note();
+        let memos = [memo(5_000, "定了\n周一封版"), memo(10_000, ""), memo(99_000, "尾")];
+        let cuts = [CutRange { start_ms: 9_000, end_ms: 11_000 }];
+        let md = render_markdown(&note, &memos, &cuts);
+        let i1 = md.find("] 00:00:00** 一").unwrap();
+        let im = md.find("> 📝 **备注 00:05** 定了\n> 周一封版").expect(&md);
+        let i2 = md.find("] 00:00:10** 二").unwrap();
+        let it = md.find("> 🔖 **时间标记 00:10**(该时段已删减)").expect(&md);
+        let ie = md.find("备注 01:39** 尾").unwrap();
+        // 与段同一时刻的备注排在该段之后(落在「最后一个 start<=at 的段」之后)
+        assert!(i1 < im && im < i2 && i2 < it && it < ie, "{md}");
+        let txt = render_text(&note, &memos, &cuts);
+        assert!(txt.contains("[备注 00:00:05] 定了\n    周一封版"), "{txt}");
+        assert!(txt.contains("[时间标记 00:00:10](该时段已删减)"), "{txt}");
+        // 无备注时与旧输出逐字节一致
+        assert_eq!(render_markdown(&note, &[], &[]), render_note(&note, "md").unwrap());
+    }
+
+    #[test]
+    fn refined_memos_skip_freeform_blocks_for_placement() {
+        let doc: RefinedDoc = serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "generated_at": "2026-07-30T00:00:00Z",
+            "stages": { "filter": "done", "recluster": "done", "llm": "done" },
+            "discarded_seqs": [],
+            "paragraphs": [
+                { "speaker": "S1", "name": "张三", "start_ms": 0, "end_ms": 4000, "text": "甲", "source_seqs": [0] },
+                { "speaker": "", "start_ms": 0, "end_ms": 0, "text": "## 手写", "source_seqs": [] },
+                { "speaker": "S1", "name": "张三", "start_ms": 8000, "end_ms": 9000, "text": "乙", "source_seqs": [1] }
+            ]
+        }))
+        .unwrap();
+        let md = render_refined_with_memos("标题", &doc, true, &[memo(6_000, "中间")], &[]);
+        let (a, m, b) = (md.find("甲").unwrap(), md.find("备注 00:06** 中间").unwrap(), md.find("乙").unwrap());
+        assert!(a < m && m < b, "{md}");
+        assert_eq!(render_refined("标题", &doc, true), render_refined_with_memos("标题", &doc, true, &[], &[]));
+    }
 
     #[test]
     fn format_ts_is_hhmmss() {
@@ -860,7 +1017,7 @@ mod tests {
             skipped_lines: 0,
             speakers,
         };
-        let md = render_markdown(&note);
+        let md = render_markdown(&note, &[], &[]);
         assert!(md.contains("**[张三] 00:00:00** hi"), "{md}");
         assert!(
             md.contains("**[说话人 2] 00:00:01** yo"),
@@ -893,7 +1050,7 @@ mod tests {
             skipped_lines: 0,
             speakers: Default::default(),
         };
-        let md_normal = render_markdown(&note_normal);
+        let md_normal = render_markdown(&note_normal, &[], &[]);
         assert!(
             md_normal.contains("2026-07-03 15:04 – 16:12(1 小时 8 分)"),
             "normal case should contain time range with half-width brackets: {md_normal}"
@@ -918,7 +1075,7 @@ mod tests {
             skipped_lines: 0,
             speakers: Default::default(),
         };
-        let md_interrupted = render_markdown(&note_interrupted);
+        let md_interrupted = render_markdown(&note_interrupted, &[], &[]);
         assert!(
             md_interrupted.contains("2026-07-03 15:04 – 中断"),
             "interrupted case should contain 中断: {md_interrupted}"
@@ -943,7 +1100,7 @@ mod tests {
             skipped_lines: 0,
             speakers: Default::default(),
         };
-        let md_corrupt = render_markdown(&note_corrupt);
+        let md_corrupt = render_markdown(&note_corrupt, &[], &[]);
         assert!(
             !md_corrupt.contains(" – "),
             "corrupt case should not contain ` – ` (header_line skipped): {md_corrupt}"

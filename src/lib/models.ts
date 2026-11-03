@@ -73,6 +73,9 @@ export type Settings = {
   shortcut_enabled: boolean;
   // 全局快捷键组合(tauri accelerator 格式,如 "Alt+CmdOrCtrl+R")
   shortcut: string;
+  // 会议备注快捷键:只在录音中注册(默认开,"Alt+CmdOrCtrl+M")
+  memo_shortcut_enabled: boolean;
+  memo_shortcut: string;
   // 系统托盘图标开关
   tray_enabled: boolean;
   telemetry_enabled: boolean;

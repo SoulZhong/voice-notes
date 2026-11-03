@@ -1073,6 +1073,14 @@ fn duration_from_meta(meta: &NoteMeta) -> Option<u64> {
     Some((end - start).num_seconds().max(0) as u64)
 }
 
+/// 笔记时间轴的终点(毫秒):最后一段 `end_ms` 与 meta 墙钟时长取大。
+/// 备注「会后时间点不得超过笔记时长」的上限用它——段尾之后可能还有一截无人说话的录音。
+pub(crate) fn timeline_end_ms(dir: &Path) -> u64 {
+    let seg = max_end_ms(&dir.join("segments.jsonl")).unwrap_or(0);
+    let wall = read_meta(dir).as_ref().and_then(duration_from_meta).map(|s| s * 1000).unwrap_or(0);
+    seg.max(wall)
+}
+
 /// 按 segments.jsonl 签名缓存的时长扫描(见 MAX_END_CACHE)。签名 stat 先于内容读,
 /// 与 load 缓存同哲学:并发写至多让条目落后而永不命中,绝不还陈旧值。
 fn max_end_ms(jsonl: &Path) -> Option<u64> {

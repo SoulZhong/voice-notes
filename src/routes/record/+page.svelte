@@ -41,6 +41,18 @@
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
   import { matchesSpeakerFilter, nearestIndexByMs, searchHits } from "$lib/liveView";
+  import RecordMemoComposer from "$lib/RecordMemoComposer.svelte";
+  import RecordMemoBookmark from "$lib/RecordMemoBookmark.svelte";
+  import RecordMemoColumn from "$lib/RecordMemoColumn.svelte";
+  import {
+    addMemo,
+    anchorIndex,
+    loadMemoColumnPref,
+    memoColumnOpen,
+    saveMemoColumnPref,
+    type Memo,
+  } from "$lib/memos";
+  import { displayShortcut } from "$lib/shortcut";
 
   let models = $state<ModelsStatus | null>(null);
 
@@ -633,6 +645,79 @@
       .getElementById(`seg-${visible[idx].seq}`)
       ?.scrollIntoView({ block: "center", behavior: "smooth" });
   }
+
+  // ── 会议备注:书签按时间归并进原文流,右侧备注栏,底部输入框 ─────────────────
+  /** 每条定稿行之后要插的备注(按 anchorIndex:落在最后一个 start_ms <= at 的行之后);
+      键 -1 = 排在所有行之前。 */
+  const memosAfter = $derived.by(() => {
+    const starts = recording.finals.map((l) => l.start_ms);
+    const m = new Map<number, Memo[]>();
+    for (const memo of recording.memos) {
+      const i = anchorIndex(starts, memo.at_ms);
+      const list = m.get(i);
+      if (list) list.push(memo);
+      else m.set(i, [memo]);
+    }
+    return m;
+  });
+  const memoHitIds = $derived.by(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return new Set<string>();
+    return new Set(recording.memos.filter((m) => m.text.toLowerCase().includes(q)).map((m) => m.id));
+  });
+  const memoShortcutLabel = $derived(displayShortcut(recording.memoShortcut?.shortcut || "Alt+CmdOrCtrl+M"));
+
+  /** 刚保存/被点中的备注闪一下(只是视觉确认)。 */
+  let flashMemoId = $state<string | null>(null);
+  let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  function flashMemo(id: string) {
+    flashMemoId = id;
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => (flashMemoId = null), 2000);
+  }
+
+  function pickMemo(m: Memo) {
+    // 与时间轴点击同类:只暂停跟随,恢复靠「回到最新」。
+    follow = false;
+    document.getElementById(`memo-${m.id}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+    flashMemo(m.id);
+  }
+
+  /** 删除后的撤销入口(带原 id 与 created_at 重新加回)。 */
+  let undoMemo = $state<Memo | null>(null);
+  let undoTimer: ReturnType<typeof setTimeout> | undefined;
+  let memoError = $state("");
+  function onMemoDeleted(m: Memo) {
+    undoMemo = m;
+    clearTimeout(undoTimer);
+    undoTimer = setTimeout(() => (undoMemo = null), 6000);
+  }
+  async function undoDelete() {
+    const m = undoMemo;
+    if (!m) return;
+    undoMemo = null;
+    try {
+      await addMemo(recording.noteId, m.at_ms, m.text, "composer", { id: m.id, created_at: m.created_at });
+    } catch (e) {
+      memoError = t("memo.failed", { e: String(e) });
+    }
+  }
+
+  // 备注栏展开/收起:按**容器**宽度默认(左侧栏开合会改主区宽度),用户手动选过就记住。
+  let liveBodyEl = $state<HTMLElement | null>(null);
+  let liveBodyWidth = $state(1000);
+  let memoColPref = $state<boolean | null>(loadMemoColumnPref("record"));
+  const memoColOpen = $derived(memoColumnOpen(liveBodyWidth, memoColPref));
+  $effect(() => {
+    if (!liveBodyEl) return;
+    const ro = new ResizeObserver(([entry]) => (liveBodyWidth = entry.contentRect.width));
+    ro.observe(liveBodyEl);
+    return () => ro.disconnect();
+  });
+  function toggleMemoCol() {
+    memoColPref = !memoColOpen;
+    saveMemoColumnPref("record", memoColPref);
+  }
 </script>
 
 <!-- 录制 transport 的三枚图标。DESIGN.md 第 7 条允许"16px 线性 SVG(stroke currentColor)":
@@ -1016,8 +1101,24 @@
       </div>
     {/if}
 
+    {#if recording.isLive && recording.memoShortcut && !recording.memoShortcut.ok}
+      <div class="banner">
+        {t("memo.shortcutBusy", { key: displayShortcut(recording.memoShortcut.shortcut), reason: recording.memoShortcut.reason })}
+      </div>
+    {/if}
+    {#if memoError}
+      <div class="banner banner-danger">
+        {memoError}
+        <button class="link" onclick={() => (memoError = "")}>{t("record.edit.dismiss")}</button>
+      </div>
+    {/if}
+
+    <div class="live-body" class:with-memos={recording.isLive || recording.memos.length > 0} class:memo-col-closed={!memoColOpen} bind:this={liveBodyEl}>
     <div class="transcript-wrap">
       <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
+      {#each memosAfter.get(-1) ?? [] as m (m.id)}
+        <RecordMemoBookmark memo={m} noteId={recording.noteId} flash={flashMemoId === m.id} hit={memoHitIds.has(m.id)} onDeleted={onMemoDeleted} onError={(e) => (memoError = e)} />
+      {/each}
       {#each recording.finals as line, i (line.seq)}
         <p
           id="seg-{line.seq}"
@@ -1089,6 +1190,9 @@
             {/if}
           {/if}
         </p>
+        {#each memosAfter.get(i) ?? [] as m (m.id)}
+          <RecordMemoBookmark memo={m} noteId={recording.noteId} flash={flashMemoId === m.id} hit={memoHitIds.has(m.id)} onDeleted={onMemoDeleted} onError={(e) => (memoError = e)} />
+        {/each}
       {/each}
       {#if recording.partialMic}
         <p class="partial" class:current={recording.isLive}><span class="badge mic">{t("record.badge.me")}</span>{recording.partialMic}</p>
@@ -1107,16 +1211,43 @@
         {#each ticksView as topPct, i (i)}
           <span class="tick" style="top: {topPct}%"></span>
         {/each}
+        <!-- 备注刻度:与段落同一条时间轴口径(0..elapsedMs) -->
+        {#each recording.memos as m (m.id)}
+          {#if m.at_ms <= recording.elapsedMs}
+            <span class="tick memo-tick" style="top: {(m.at_ms / recording.elapsedMs) * 100}%"></span>
+          {/if}
+        {/each}
       </div>
     {/if}
     </div>
+    {#if recording.isLive || recording.memos.length > 0}
+      <RecordMemoColumn
+        memos={recording.memos}
+        open={memoColOpen}
+        shortcutLabel={memoShortcutLabel}
+        onToggle={toggleMemoCol}
+        onPick={pickMemo}
+      />
+    {/if}
+    </div>
 
-    <!-- 跟随被用户上滑打断时的返回入口：sticky 钉在滚动视口底部，恢复跟随即消失 -->
-    <div class="jump-anchor" aria-hidden={follow || !recording.isLive}>
+    {#if undoMemo}
+      <div class="memo-undo">
+        {t("memo.deleted")}
+        <button class="link" onclick={() => void undoDelete()}>{t("memo.undo")}</button>
+      </div>
+    {/if}
+
+    <!-- 跟随被用户上滑打断时的返回入口：sticky 钉在滚动视口底部，恢复跟随即消失。
+         录制中底部有备注输入框,药丸抬到它上方(.above-composer)。 -->
+    <div class="jump-anchor" class:above-composer={recording.isLive} aria-hidden={follow || !recording.isLive}>
       {#if !follow && recording.isLive}
         <button class="jump" onclick={jumpToLatest}>{t("record.jumpLatest")}</button>
       {/if}
     </div>
+    {#if recording.isLive && recording.noteId}
+      <RecordMemoComposer noteId={recording.noteId} onSaved={(m) => flashMemo(m.id)} />
+    {/if}
   {/if}
 </div>
 
@@ -1804,6 +1935,43 @@
      不占版面高度、不遮转写。flex-end 让按钮底边贴锚点线向上生长——不能用
      translateY(-100%)：零高容器的默认 stretch 会把按钮使用高度压成 0，
      百分比位移随之失效，药丸会沉到视口底边被裁半截。 */
+  /* 原文 + 右侧备注栏两栏;栏收起时只留一个窄把手。 */
+  .live-body.with-memos {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 260px;
+    gap: 0.9rem;
+    align-items: start;
+  }
+  .live-body.with-memos.memo-col-closed {
+    grid-template-columns: minmax(0, 1fr) 2.2rem;
+  }
+  .timeline .memo-tick {
+    background: var(--accent);
+    height: 3px;
+  }
+  .memo-undo {
+    position: sticky;
+    bottom: 5.5rem;
+    z-index: 6;
+    width: fit-content;
+    margin: 0 auto;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-full);
+    box-shadow: var(--shadow-popover);
+    padding: 0.3rem 0.9rem;
+    font-size: 0.85rem;
+  }
+  .memo-undo .link {
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: inherit;
+  }
+  .jump-anchor.above-composer {
+    bottom: 5rem;
+  }
   .jump-anchor {
     position: sticky;
     bottom: 1rem;

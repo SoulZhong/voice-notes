@@ -202,6 +202,10 @@ pub struct Settings {
     pub shortcut_enabled: bool,
     /// 全局快捷键组合,消费任务:快捷键。
     pub shortcut: String,
+    /// 会议备注快捷键开关:只在录音中注册(停录即释放给其它应用),默认开。
+    pub memo_shortcut_enabled: bool,
+    /// 会议备注快捷键组合:按下即钉住当前录音时间并弹出浮窗。
+    pub memo_shortcut: String,
     /// 系统托盘图标开关,消费任务:托盘;默认开启。
     pub tray_enabled: bool,
     /// 匿名使用统计与错误上报开关;默认开启。关掉之后两端都不再发出任何事件——
@@ -331,6 +335,10 @@ struct SettingsRepr {
     shortcut_enabled: bool,
     #[serde(default = "default_shortcut")]
     shortcut: String,
+    #[serde(default = "default_true")]
+    memo_shortcut_enabled: bool,
+    #[serde(default = "default_memo_shortcut")]
+    memo_shortcut: String,
     #[serde(default = "default_true")]
     tray_enabled: bool,
     #[serde(default = "default_true")]
@@ -463,6 +471,8 @@ impl From<SettingsRepr> for Settings {
             scene_auto_fold: r.scene_auto_fold,
             shortcut_enabled: r.shortcut_enabled,
             shortcut: r.shortcut,
+            memo_shortcut_enabled: r.memo_shortcut_enabled,
+            memo_shortcut: r.memo_shortcut,
             tray_enabled: r.tray_enabled,
             telemetry_enabled: r.telemetry_enabled,
             refine_enabled: r.refine_enabled,
@@ -575,6 +585,10 @@ fn default_shortcut() -> String {
     "Alt+CmdOrCtrl+R".into()
 }
 
+pub(crate) fn default_memo_shortcut() -> String {
+    "Alt+CmdOrCtrl+M".into()
+}
+
 fn default_refine_provider() -> String {
     "openai".into()
 }
@@ -624,6 +638,8 @@ impl Default for Settings {
             scene_auto_fold: true,
             shortcut_enabled: false,
             shortcut: default_shortcut(),
+            memo_shortcut_enabled: true,
+            memo_shortcut: default_memo_shortcut(),
             tray_enabled: true,
             telemetry_enabled: true,
             refine_enabled: false,

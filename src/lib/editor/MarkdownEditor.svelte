@@ -51,6 +51,9 @@
     refinedParagraphSchema,
   } from "./refinedSchema";
   import { makeSegmentView, segmentLockPlugin, transcriptSegmentSchema } from "./segmentSchema";
+  import { memoBookmarkPlugin, type MemoAction, type MemoCut, type MemoDecoInput, type MemoDraft } from "./memoDecorations";
+  import { renderMemoWidget } from "./memoWidget";
+  import type { Memo } from "../memos";
   import { keymap } from "@milkdown/kit/prose/keymap";
 
   let {
@@ -63,6 +66,10 @@
     onPlayFrom,
     onDeleteClick,
     speakerBadge,
+    memos = [],
+    memoCuts = [],
+    memoDraft = null,
+    onMemoAction,
   }: {
     mode: "refined" | "segments";
     editable?: boolean;
@@ -77,6 +84,14 @@
     // 页面浮层的按钮发起(见 +page.svelte 的 entityPop)。
     onDeleteClick?: (seq: number, rect: DOMRect) => void;
     speakerBadge: (attrs: BadgeAttrs) => { label: string; bg: string; ink: string };
+    /** 会议备注书签(装饰渲染,不进文档——见 memoDecorations.ts)。数据归页面:
+        这里只渲染,改/删/调时间/草稿保存都经 onMemoAction 交回宿主。 */
+    memos?: readonly Memo[];
+    /** 删减区间:落在其中的书签带「该时段已删减」。 */
+    memoCuts?: readonly MemoCut[];
+    /** 未保存的草稿书签(null = 无)。 */
+    memoDraft?: MemoDraft | null;
+    onMemoAction?: (a: MemoAction) => Promise<unknown> | void;
   } = $props();
 
   // 精修稿保存生命周期契约(宿主/Task 7 必须遵守):onSaveRefined(payload) 发出
@@ -113,6 +128,11 @@
    * 会当成误用而告警(state_referenced_locally),故用与 prop 相同的默认值起手。
    */
   let editableNow = true;
+  /** 书签输入的非响应式镜像(同 editableNow 的道理:装饰插件与 widget 回调由 PM 在
+      Svelte effect 之外调用,不得读 prop)。由下方 memos 同步 effect 维护,
+      version 每变一次装饰重算一次。 */
+  let memoInput: MemoDecoInput = { version: 0, memos: [], cuts: [], draft: null };
+  let memoActionNow: ((a: MemoAction) => Promise<unknown> | void) | undefined = undefined;
   // 精修稿保存状态:载入 doc + 各 origIndex 的序列化基线 + 上次已保存载荷指纹
   let loadedDoc: RefinedDoc | null = null;
   let baseline = new Map<number, string>();
@@ -705,6 +725,14 @@
       }),
   );
 
+  // 书签装饰:两种模式共用。只提供 decorations prop,不碰事务(骨架锁/保存载荷不受影响)。
+  const memoPlugin = proseFactory(() =>
+    memoBookmarkPlugin(
+      () => memoInput,
+      (item) => renderMemoWidget(item, { onAction: (a) => memoActionNow?.(a) }),
+    ),
+  );
+
   // segments 模式键位:Enter=提交当前段并失焦(不分段;分段事务本就被
   // segmentLockPlugin 拒绝)。Escape=失焦 + 派发 segescape(还原靠页面 refresh
   // 重建 → setSegments,与 setRefined 冲突重载同一模式)。
@@ -735,6 +763,13 @@
   onMount(async () => {
     // 首帧对齐:PM 回调只读镜像,建编辑器前必须让它等于宿主此刻传进来的值。
     editableNow = editable;
+    memoInput = {
+      version: memoInput.version + 1,
+      memos: $state.snapshot(memos) as Memo[],
+      cuts: $state.snapshot(memoCuts) as MemoCut[],
+      draft: $state.snapshot(memoDraft) as MemoDraft | null,
+    };
+    memoActionNow = onMemoAction;
     let builder = Editor.make()
       .config((ctx) => {
         ctx.set(rootCtx, rootEl);
@@ -742,7 +777,8 @@
       })
       .use(commonmark)
       .use(history)
-      .use(uiPlugins);
+      .use(uiPlugins)
+      .use(memoPlugin);
     // mode 是初始化时固定的,同一实例不会切 mode——两条路径(refined/segments)
     // 互斥,构造出的 builder 只挂其中一组 schema/plugin。
     builder =
@@ -792,6 +828,23 @@
       view.dispatch(view.state.tr);
     }
   });
+
+  // 书签数据变化 → 刷新镜像并让 PM 重读 decorations。**只用 setProps,绝不 dispatch**:
+  // 一个事务都不发,原始稿的骨架锁与修订稿的保存载荷自然碰不到书签。
+  // 编辑器重建({#key canEdit})与 setRefined/setSegments 全量重载不需要这里补挂:
+  // 前者在 onMount 建编辑器前同步镜像,后者换文档时 decorations 按新 doc 现算。
+  $effect(() => {
+    // snapshot:镜像里放纯数据,不放 $state 代理(PM 回调在 effect 之外读它);
+    // 顺带深度追踪,备注任一字段变化都会走到这里。
+    const next = {
+      memos: $state.snapshot(memos) as Memo[],
+      cuts: $state.snapshot(memoCuts) as MemoCut[],
+      draft: $state.snapshot(memoDraft) as MemoDraft | null,
+    };
+    memoActionNow = onMemoAction;
+    memoInput = { version: memoInput.version + 1, ...next };
+    if (ctxRef) ctxRef.get(editorViewCtx).setProps({});
+  });
 </script>
 
 <div class="md-editor" bind:this={rootEl} data-mode={mode}></div>
@@ -809,5 +862,172 @@
   }
   .md-editor :global(.md-para .para-text) {
     display: inline;
+  }
+
+  /* ── 会议备注书签(装饰 widget,见 memoDecorations.ts):占一整行、全文展示、把正文往下推。
+     配色借提示横幅的 warning 三件套(柔黄底 + line 边 + ink 字),与正文/说话人色系区分。 ── */
+  .md-editor :global(.memo-bm) {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.45rem;
+    margin: 4px 0 8px;
+    padding: 0.3rem 0.6rem;
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    border-radius: var(--radius-lg);
+    font-size: 0.9rem;
+    line-height: 1.55;
+    color: var(--ink);
+    white-space: pre-wrap;
+    user-select: text;
+    cursor: default;
+    transition: box-shadow 120ms ease;
+  }
+  .md-editor :global(.memo-bm.flash) {
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  .md-editor :global(.memo-bm-flag) {
+    flex: none;
+    display: inline-flex;
+    margin-top: 0.15rem;
+    color: var(--warning-ink);
+  }
+  .md-editor :global(.memo-bm-time) {
+    flex: none;
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 500;
+    line-height: 1.9;
+    font-variant-numeric: tabular-nums;
+    color: var(--warning-ink);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .md-editor :global(button.memo-bm-time:hover) {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .md-editor :global(.memo-bm-time.static) {
+    cursor: default;
+  }
+  .md-editor :global(.memo-bm-main) {
+    flex: 1;
+    min-width: 0;
+  }
+  .md-editor :global(.memo-bm-text.marker) {
+    color: var(--ink-secondary);
+  }
+  .md-editor :global(.memo-bm-cut) {
+    display: inline-block;
+    margin-left: 0.5em;
+    padding: 0 0.45em;
+    font-size: 0.72rem;
+    line-height: 1.6;
+    color: var(--ink-secondary);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-full);
+    white-space: nowrap;
+    vertical-align: 1px;
+  }
+  /* 悬停显影(DESIGN 原则 6):播放/改/删平时隐身 */
+  .md-editor :global(.memo-bm-actions) {
+    flex: none;
+    display: inline-flex;
+    gap: 0.6rem;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .md-editor :global(.memo-bm:hover .memo-bm-actions),
+  .md-editor :global(.memo-bm:focus-within .memo-bm-actions) {
+    opacity: 1;
+  }
+  .md-editor :global(.memo-bm-act) {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    font-size: 0.8rem;
+    line-height: 1.9;
+    color: var(--accent);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .md-editor :global(.memo-bm-act:hover) {
+    text-decoration: underline;
+    background: none;
+  }
+  .md-editor :global(.memo-bm-act.strong) {
+    font-weight: 500;
+  }
+  .md-editor :global(.memo-bm-act:disabled) {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .md-editor :global(.memo-bm-edit) {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .md-editor :global(.memo-bm-editrow) {
+    display: inline-flex;
+    gap: 0.8rem;
+  }
+  .md-editor :global(.memo-bm-input),
+  .md-editor :global(.memo-bm-clock) {
+    box-sizing: border-box;
+    width: 100%;
+    resize: none;
+    overflow: hidden;
+    font: inherit;
+    font-size: 0.9rem;
+    line-height: 1.55;
+    color: var(--ink);
+    background: var(--surface-press);
+    border: none;
+    border-radius: var(--radius-md);
+    padding: 0.2rem 0.5rem;
+    outline: none;
+  }
+  .md-editor :global(.memo-bm-input:focus),
+  .md-editor :global(.memo-bm-clock:focus) {
+    background: var(--canvas);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  /* 调时间浮层:menu/popover 语言,贴时间按钮下方 */
+  .md-editor :global(.memo-bm-adjust) {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 1.6rem;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    padding: 0.5rem 0.6rem;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    white-space: nowrap;
+  }
+  .md-editor :global(.memo-bm-adjrow) {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .md-editor :global(.memo-bm-clock) {
+    width: 5.5rem;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    background: var(--canvas);
+  }
+  .md-editor :global(.memo-bm-err) {
+    font-size: 0.75rem;
+    color: var(--danger);
   }
 </style>
