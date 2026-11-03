@@ -28,7 +28,7 @@ pub struct AgentDef {
     pub fmt: Fmt,
 }
 
-/// 内置支持的八家(已拍板:第二梯队不内置,靠设置页手动配置卡片)。
+/// 内置支持的九家(已拍板:第二梯队不内置,靠设置页手动配置卡片)。
 /// dotdir 系(.claude/.cursor/...)在 Windows 也直接落在 %USERPROFILE% 下,两平台同形;
 /// 唯 Claude Desktop 按系统惯例放平台数据目录,需要 Windows 变体。
 pub const AGENTS: &[AgentDef] = &[
@@ -40,6 +40,10 @@ pub const AGENTS: &[AgentDef] = &[
     AgentDef { key: "workbuddy", name: "WorkBuddy", detect_rel: ".workbuddy", config_rel: ".workbuddy/mcp.json", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Json(&["mcpServers"]) },
     AgentDef { key: "openclaw", name: "OpenClaw", detect_rel: ".openclaw", config_rel: ".openclaw/openclaw.json", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Json(&["mcp", "servers"]) },
     AgentDef { key: "hermes", name: "Hermes Agent", detect_rel: ".hermes", config_rel: ".hermes/config.yaml", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Yaml },
+    // Pi(pi.dev):`pi mcp` 读 ~/.pi/agent/mcp.json。Windows 上 pi 用 Node 的 os.homedir()
+    // 拼 .pi/agent,即 %USERPROFILE%\.pi\agent,与 dotdir 系同形,无需 win 变体。
+    // 用户设了 PI_CODING_AGENT_DIR 时 pi 改读该目录,这里不跟(GUI 进程拿不到 shell 环境变量)。
+    AgentDef { key: "pi", name: "Pi", detect_rel: ".pi/agent", config_rel: ".pi/agent/mcp.json", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Json(&["mcpServers"]) },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -790,5 +794,55 @@ mod tests {
         std::fs::write(&cfg, commented).unwrap();
         assert!(reg.register("openclaw").is_err(), "带注释的 JSON5 应拒写");
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), commented, "拒写后原文不变");
+    }
+
+    /// Pi 的 ~/.pi/agent/mcp.json:别家条目(含 url/headers/exposure/description 等
+    /// pi 专有字段)原样保留;卸载只删自己;Windows 同样落在 home(%USERPROFILE%)下。
+    #[test]
+    fn pi_registers_preserving_other_servers_and_their_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let dir = home.join(".pi/agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("mcp.json");
+        let other = serde_json::json!({
+            "url": "https://example.com/mcp",
+            "headers": { "Authorization": "Bearer ${TOKEN}" },
+            "exposure": "direct",
+            "description": "别人的服务",
+        });
+        std::fs::write(
+            &cfg,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": { "axiomos": other },
+                "autoEnableCodemode": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let r = reg(&home);
+        let st = r.status().into_iter().find(|s| s.key == "pi").unwrap();
+        assert!(st.installed && !st.registered, "{st:?}");
+
+        r.register("pi").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["axiomos"], other, "别家条目与其字段原样保留");
+        assert_eq!(v["autoEnableCodemode"], false, "无关顶层键保留");
+        assert_eq!(v["mcpServers"]["voice-notes"]["args"], serde_json::json!(["mcp", "serve"]));
+        let st = r.status().into_iter().find(|s| s.key == "pi").unwrap();
+        assert!(st.registered && !st.stale, "{st:?}");
+
+        r.unregister("pi").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v["mcpServers"].get("voice-notes").is_none());
+        assert_eq!(v["mcpServers"]["axiomos"], other, "卸载不碰别家");
+
+        // Windows:pi 用 os.homedir()(= %USERPROFILE%),不在 %APPDATA%。
+        let win = Registry::with_os(home.clone(), PathBuf::from("C:\\vn\\voice-notes.exe"), true)
+            .roaming(home.join("roaming-elsewhere"));
+        win.register("pi").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["voice-notes"]["command"], "C:\\vn\\voice-notes.exe");
+        assert!(!home.join("roaming-elsewhere").exists());
     }
 }

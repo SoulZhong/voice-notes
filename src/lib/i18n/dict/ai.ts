@@ -20,7 +20,7 @@ export const zh = {
   "ai.quickstart.step1.desc": "用在线接口，或复用本机已登录的 Agent；录制结束后自动修订转写。",
   "ai.quickstart.step1.action": "去配置 ↓",
   "ai.quickstart.step2.title": "把笔记接入常用助手",
-  "ai.quickstart.step2.desc": "为 Claude、Cursor、Codex 或 Gemini 注册 MCP；其他工具可使用通用配置。",
+  "ai.quickstart.step2.desc": "为 Claude、Cursor、Codex、Gemini 或 Pi 注册 MCP；其他工具可使用通用配置。",
   "ai.quickstart.step2.viewConnected": "查看已接入工具 ↓",
   "ai.quickstart.step2.choose": "选择接入工具 ↓",
   "ai.quickstart.step3.title": "在助手里直接提问",
@@ -41,7 +41,7 @@ export const zh = {
   "ai.guide.step2.eyebrow": "2 / 3 · 接入现有工具",
   "ai.guide.step2.title": "在这里把笔记交给常用助手",
   "ai.guide.step2.body":
-    "点击“注册”会把 voice-notes 作为 MCP 服务写入对应助手。注册后，回到 Claude、Cursor、Codex 或 Gemini 就能检索会议笔记。",
+    "点击“注册”会把 voice-notes 作为 MCP 服务写入对应助手。注册后，回到 Claude、Cursor、Codex、Gemini 或 Pi 就能检索会议笔记。",
   "ai.guide.step3.eyebrow": "3 / 3 · 理解权限边界",
   "ai.guide.step3.title": "确认 Agent 实际能调用什么",
   "ai.guide.step3.body": "这里列出的是真实工具清单。读取默认可用；开始或停止录制仍需你在上方显式开启控制权限。",
@@ -84,6 +84,7 @@ export const zh = {
   "ai.aing.agentModelHint.codex": "如 gpt-5-codex",
   "ai.aing.agentModelHint.gemini": "如 gemini-2.5-flash",
   "ai.aing.agentModelHint.cursor": "如 sonnet-4.5",
+  "ai.aing.agentModelHint.pi": "如 openai-codex/gpt-6.1-terra(provider/id,pi --list-models 可查)",
 
   // —— /ai「AI 助手接入」区(MCP) ——
   "ai.mcp.sectionTitle": "AI 助手接入",
@@ -204,7 +205,7 @@ export const en = {
   "ai.quickstart.step1.action": "Set it up ↓",
   "ai.quickstart.step2.title": "Connect notes to your assistants",
   "ai.quickstart.step2.desc":
-    "Register MCP for Claude, Cursor, Codex, or Gemini; other tools can use the generic config.",
+    "Register MCP for Claude, Cursor, Codex, Gemini, or Pi; other tools can use the generic config.",
   "ai.quickstart.step2.viewConnected": "View connected tools ↓",
   "ai.quickstart.step2.choose": "Choose tools to connect ↓",
   "ai.quickstart.step3.title": "Ask right in your assistant",
@@ -225,7 +226,7 @@ export const en = {
   "ai.guide.step2.eyebrow": "2 / 3 · Connect existing tools",
   "ai.guide.step2.title": "Hand notes to the assistants you use",
   "ai.guide.step2.body":
-    "Clicking “Register” writes voice-notes into that assistant's config as an MCP server. Once registered, Claude, Cursor, Codex, or Gemini can search your meeting notes.",
+    "Clicking “Register” writes voice-notes into that assistant's config as an MCP server. Once registered, Claude, Cursor, Codex, Gemini, or Pi can search your meeting notes.",
   "ai.guide.step3.eyebrow": "3 / 3 · Understand permission boundaries",
   "ai.guide.step3.title": "See what agents can actually call",
   "ai.guide.step3.body":
@@ -270,6 +271,7 @@ export const en = {
   "ai.aing.agentModelHint.codex": "e.g. gpt-5-codex",
   "ai.aing.agentModelHint.gemini": "e.g. gemini-2.5-flash",
   "ai.aing.agentModelHint.cursor": "e.g. sonnet-4.5",
+  "ai.aing.agentModelHint.pi": "e.g. openai-codex/gpt-6.1-terra (provider/id; see pi --list-models)",
 
   "ai.mcp.sectionTitle": "AI Assistant Access",
   "ai.mcp.statusLabel": "Status",

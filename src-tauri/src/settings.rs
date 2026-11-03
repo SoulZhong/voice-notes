@@ -217,7 +217,7 @@ pub struct Settings {
     /// 资源层:在线模型档案(2026-08-11 执行体分层设计)。可被多个 AI 功能引用,
     /// 配置一次处处可用;api_key 明文存本机(单机应用,设置页已注明)。
     pub llm_profiles: Vec<LlmProfile>,
-    /// 资源层:本机 Agent 档案。kind 即身份(claude|codex|gemini|cursor),
+    /// 资源层:本机 Agent 档案。kind 即身份(claude|codex|gemini|cursor|pi),
     /// 至多一条/种;探测状态是运行时信息,不落盘。
     pub agent_profiles: Vec<AgentProfile>,
     /// 功能层:AI 整理(含标题生成)的执行体引用。
