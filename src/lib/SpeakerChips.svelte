@@ -44,7 +44,7 @@
     noteId: string;
     editable: boolean;
     /** 各说话人的段数(可选)。传入则按段数降序排,并折叠只出现 1 段的碎片说话人;
-        不传(如录制页实时条)保持原 id 序、不折叠。 */
+        不传则保持原 id 序、不折叠。录制页实时条传已上屏段数(与笔记页同口径)。 */
     counts?: Record<string, number>;
     onRenamed?: () => void;
     /** 改名落点(可选)。缺省走笔记内 renameSpeaker;修订稿视图传 renameRefinedSpeaker

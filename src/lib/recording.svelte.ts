@@ -238,6 +238,11 @@ export const recording = {
         const { loser, winner } = e.merged;
         finals = finals.map((l) => (l.speaker === loser ? { ...l, speaker: winner } : l));
       }
+      // 录制中删除说话人:后端已把名下段落改回未标注,已上屏历史段同步清掉归属。
+      if (e.cleared) {
+        const gone = e.cleared;
+        finals = finals.map((l) => (l.speaker === gone ? { ...l, speaker: null } : l));
+      }
       speakers = Object.fromEntries(
         e.speakers.map((s) => [s.id, { name: s.name, sources: s.sources, person_id: s.person_id }]),
       );

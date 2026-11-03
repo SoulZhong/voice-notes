@@ -35,6 +35,8 @@ export type SpeakerEntry = {
 export type SpeakersEvent = {
   speakers: SpeakerEntry[];
   merged: { loser: string; winner: string } | null;
+  /** 本次事件伴随的录制中删除:该说话人名下已上屏段改为未标注(后端无删除时不带此字段)。 */
+  cleared?: string | null;
 };
 export type RefineEvent = {
   note_id: string;

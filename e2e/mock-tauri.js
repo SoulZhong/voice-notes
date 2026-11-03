@@ -73,6 +73,16 @@
     models_status: () => ({ recording_ready: true, diarization_ready: true, artifacts: [], root: "/models" }),
     apple_asr_status: () => "Ready",
     list_people: () => [],
+    // 说话人条编辑(录制中走 writer 路径;后端随后推全量 speakers 事件,删除时带 cleared)
+    assign_note_speaker_person: () => null,
+    clear_note_speaker_person: () => null,
+    person_add_email: () => null,
+    delete_note_speaker: (a) => {
+      delete note.speakers[a.speakerId];
+      const speakers = Object.entries(note.speakers).map(([id, m]) => ({ id, name: m.name, sources: m.sources, person_id: m.person_id ?? null }));
+      setTimeout(() => window.__e2e.emit("speakers", { speakers, merged: null, cleared: a.speakerId }), 0);
+      return null;
+    },
     list_speakers: () => [],
     tidy_inbox: () => [],
     pending_review: () => [],
