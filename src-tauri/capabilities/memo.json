@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "memo-panel",
+  "description": "备注浮窗:只需要事件监听与应用自有命令(add/edit_memo、memo_panel_*)",
+  "windows": [
+    "memo"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}

@@ -42,6 +42,8 @@ mod identify_actions;
 mod hooks_external;
 mod device; // 设备听写(AI Passport),见 docs/adr/0001
 mod recording_ctl; // 程序化录制控制(MCP 控制面与设备共用)
+mod memo; // 会议备注命令壳(存储在 store::memos)
+mod memo_panel; // 备注浮窗(⌥⌘M / 托盘)
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2413,6 +2415,15 @@ fn spawn_session(
         // 续录时间轴偏移：New 路径恒 0；Resume 路径 = 续录前最大 end_ms。
         // on_final 落盘/emit 前 start_ms/end_ms 均 + base_ms（partial 无时间戳，不受影响）。
         let base_ms = writer.base_ms();
+        // 会议备注:上一场最后一句之后的静音被切掉了(音频轨截到 base_ms),落在那之后的
+        // 备注不钳就会指进第二场开头的内容里。唯一一处「系统改备注」:只改时间、只此一次。
+        if let NoteTarget::Resume(_) = &target {
+            match store::memos::clamp_after(&note_dir, base_ms) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("续录:{n} 条备注钳回上一场末尾 {base_ms}ms"),
+                Err(e) => eprintln!("续录钳位备注失败(不影响录制): {e}"),
+            }
+        }
         let registry_snap = writer.registry_snapshot();
         // 标记本笔记的 mic 轨道已启用软件 AEC（离线清洗只认这类场次）。
         if soft_aec_on {
@@ -9379,6 +9390,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            memo::note_memos,
+            memo::memo_anchor_now,
+            memo::add_memo,
+            memo::edit_memo,
+            memo::delete_memo,
+            memo_panel::memo_panel_state,
+            memo_panel::memo_panel_hide,
             device::device_status,
             device::device_scan,
             device::device_connect,

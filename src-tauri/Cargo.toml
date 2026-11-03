@@ -106,7 +106,7 @@ webrtc-audio-processing = { version = "2.1.0", features = ["bundled"] }
 
 # Windows 仅原子替换短小 current pointer；immutable SQLite version 文件从不被替换。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "8", features = ["macos_13_0"] }
@@ -117,6 +117,8 @@ coreaudio-rs = { version = "0.12", default-features = false, features = ["audio_
 objc2 = "0.6"
 objc2-foundation = "0.3"
 block2 = "0.6"
+# 备注浮窗:记下/还回前台应用(NSWorkspace.frontmostApplication)。版本与 tauri 传递依赖对齐。
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSWorkspace", "NSRunningApplication"] }
 objc2-event-kit = { version = "0.3", features = [
     "EKEventStore",
     "EKEvent",

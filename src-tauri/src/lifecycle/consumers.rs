@@ -47,6 +47,26 @@ impl LifecycleHook for TrayHook {
     }
 }
 
+/// 会议备注快捷键:进入 Recording 注册、回到 Idle 注销(与托盘同一套迁移判定 `tray_flag`)。
+/// 注册/注销一律投递到主线程后立即返回——插件 register 在 macOS 上派主线程同步等结果,
+/// 在 actor 线程上同步调会与「主线程正同步等 actor」成环(tray.rs 记过同一类死锁)。
+pub struct MemoShortcutHook;
+
+impl LifecycleHook for MemoShortcutHook {
+    fn name(&self) -> &'static str {
+        "memo_shortcut"
+    }
+
+    fn on_transition(&self, ctx: &TransitionCtx) {
+        let Some(recording) = tray_flag(ctx.from, ctx.to) else { return };
+        let Some(app) = ctx.app else { return };
+        let app2 = app.clone();
+        if let Err(e) = app.run_on_main_thread(move || crate::shortcuts::sync_memo_key(&app2, recording)) {
+            eprintln!("备注快捷键派发失败(不影响录制): {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
