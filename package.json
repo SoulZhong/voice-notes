@@ -12,7 +12,8 @@
     "check:macos-entitlements": "python3 scripts/check_macos_entitlements.py",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
-    "dev:app": "tauri dev --config src-tauri/tauri.dev.conf.json"
+    "dev:app": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "e2e": "node e2e/run.mjs"
   },
   "license": "AGPL-3.0-only",
   "dependencies": {
@@ -38,6 +39,7 @@
     "@types/d3-force": "^3.0.10",
     "bits-ui": "^2.20.4",
     "clsx": "^2.1.1",
+    "puppeteer-core": "^23.11.1",
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",
     "tailwind-merge": "^3.7.0",
