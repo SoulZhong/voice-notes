@@ -16,12 +16,14 @@
    utilities 之后,组件 reset 反过来盖掉 border/bg 等工具类(实测边框与开关全没了)。 */
 @layer theme, base, components, utilities;
 @import "tailwindcss/theme.css" layer(theme);
-/* 只扫新组件与预览台:默认会扫全部源码,旧页面里恰好与工具类同名的类名(hidden/border/
-   sticky/transition…)会被生成全局工具类、悄悄改掉旧页面。迁移一个页面就在下面补一条 @source。 */
+/* 扫描范围:整个 src(页面逐步迁移到组件,不必每迁一页补一条 @source)。但旧页面里有些
+   自定义类名恰好与 Tailwind 工具类同名,全量扫描会为它们生成全局工具类、悄悄改掉旧页面
+   (最危险的是 .container:Tailwind 会给它设 width/max-width,旧页面根容器全叫这个名)。
+   2026-11-04 实测冲突集 = container/hidden/inline/ring,在这里排除;新代码别用这四个裸类名
+   (改用 w-full、sr-only、inline-block、ring-1 等)。判据见 tailwindGuard.test.ts。 */
 @import "tailwindcss/utilities.css" layer(utilities) source(none);
-@source "./";
-@source "../../routes/ui-gallery";
-@source "../ThemeFamilyPicker.svelte";
+@source "../../";
+@source not inline("{container,hidden,inline,ring}");
 /* 弹层进出场动画(animate-in/fade-in-0/zoom-in-95…),shadcn 模板依赖它;纯 CSS 无运行时。 */
 @import "tw-animate-css";
 
