@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 // 护栏(UI 改版 #730):Tailwind 接入的三条纪律,改掉任何一条都会悄悄改坏旧页面或组件。
-import css from "./tailwind.css?raw";
+// CSS 的 ?raw 导入在 vitest 里被 CSS 管线吃掉、拿到空串,所以直接读文件
+// (本仓没装 @types/node,照 systemIcons.test.ts 的写法取内置 fs)。
+type Fs = { readFileSync(path: string, encoding: "utf8"): string };
+type Runtime = typeof globalThis & { process: { cwd(): string; getBuiltinModule(name: "fs"): Fs } };
+const runtime = globalThis as Runtime;
+const css = runtime.process.getBuiltinModule("fs").readFileSync(`${runtime.process.cwd()}/src/lib/ui/tailwind.css`, "utf8");
 
 describe("Tailwind 接入纪律", () => {
   it("不引 Preflight(全局 reset 会改旧页面与 ProseMirror 正文)", () => {
