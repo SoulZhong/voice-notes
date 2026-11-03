@@ -9403,6 +9403,7 @@ pub fn run() {
             memo::add_memo,
             memo::edit_memo,
             memo::delete_memo,
+            memo::search_memos,
             memo_panel::memo_panel_state,
             memo_panel::memo_panel_hide,
             device::device_status,

@@ -17,6 +17,7 @@ import {
 } from "./events";
 import { getNote, resumeRecording } from "./notes";
 import { hasSeq } from "./liveView";
+import { noteMemos, onMemosChanged, onMemoShortcutStatus, type Memo, type MemoShortcutStatus } from "./memos";
 
 /** start_ms:回声撤回按 (source, start_ms, text) 精确定位行,展示层不消费。
  * seq:磁盘段 seq,录制中段编辑的寻址锚点。 */
@@ -49,6 +50,10 @@ let elapsedBaseMs = $state(0);
 let tickAnchor = $state<number | null>(null);
 let nowTick = $state(Date.now());
 let levels = $state({ mic: 0, system: 0 });
+/** 当前录制笔记的会议备注(升序)。以后端 memos_changed 整表为准。 */
+let memos = $state<Memo[]>([]);
+/** 备注快捷键注册结果(录音开始时后端回报;null = 还没回报)。 */
+let memoShortcut = $state<MemoShortcutStatus | null>(null);
 
 let initialized = false;
 /** 续录一次性标志：置位期间 "recording" 事件不清 finals/speakers（已由 resume() 灌注历史）。 */
@@ -77,6 +82,8 @@ export const recording = {
   get stopping() { return status === "stopping"; },
   get isLive() { return status === "recording" || status === "paused"; },
   get levels() { return levels; },
+  get memos() { return memos; },
+  get memoShortcut() { return memoShortcut; },
   /** 活跃录制毫秒：后端快照 + 本地走表（暂停/停止时不走）。 */
   get elapsedMs() { return elapsedBaseMs + (tickAnchor !== null ? nowTick - tickAnchor : 0); },
 
@@ -163,8 +170,11 @@ export const recording = {
           partialSystem = "";
           storageDegraded = false;
           speakers = {};
+          memos = [];
           statusVersion++;
         }
+        // 续录:后端在建会话时钳过备注时间(超出上一场末尾的拉回末尾),以盘上为准重读一次。
+        void loadMemos(e.note_id);
       } else if (e.state === "paused") {
         status = "paused";
         paused = true;
@@ -196,6 +206,7 @@ export const recording = {
         partialMic = "";
         partialSystem = "";
         storageDegraded = false;
+        memoShortcut = null;
         statusVersion++;
         // 停止入库可能新建/更新人物与样本:人物简表与整理收件箱都要重算。
         peopleVersion++;
@@ -205,6 +216,12 @@ export const recording = {
       } else {
         status = e.state;
       }
+    });
+    onMemosChanged((e) => {
+      if (e.note_id === noteId) memos = e.memos;
+    });
+    onMemoShortcutStatus((e) => {
+      memoShortcut = e;
     });
     onLevel((e) => {
       levels = { ...levels, [e.source]: e.rms };
@@ -294,6 +311,7 @@ export const recording = {
       finals = note.segments.map((s) => ({ seq: s.seq, source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
       speakers = { ...note.speakers };
       noteId = noteId_;
+      memos = await noteMemos(noteId_).catch(() => []);
       resuming = true;
       // 开录即停回放:续录是四条开录路径之一(另三条见 start()/onStatus 汇合点注释),
       // 同样会把正在播放的旧笔记 system 轨录进新会议——污染内容,必须同样前置停止。
@@ -308,6 +326,7 @@ export const recording = {
         resuming = false;
         finals = []; // 回滚预灌注
         speakers = {};
+        memos = [];
         noteId = ""; // 回滚预灌注（下方"已在录制"对账分支会用真实 noteId 覆盖）
         // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
         if (String(err).includes("已在录制")) { // i18n-exempt: 与后端错误原文判等,翻译会破坏竞态对账
@@ -374,7 +393,19 @@ async function hydrateFromDisk(id: string) {
     const note = await getNote(id);
     finals = note.segments.map((s) => ({ seq: s.seq, source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
     speakers = { ...note.speakers };
+    await loadMemos(id);
   } catch {
     // 水合失败仅影响历史段回显，不阻塞录制状态重建。
+  }
+}
+
+/** 以盘上为准重读本笔记备注;笔记已换(竞态)则丢弃。 */
+async function loadMemos(id: string) {
+  if (!id) return;
+  try {
+    const list = await noteMemos(id);
+    if (id === noteId) memos = list;
+  } catch {
+    // 读不到备注不影响录制。
   }
 }

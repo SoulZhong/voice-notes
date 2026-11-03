@@ -15,11 +15,12 @@ import * as speakers from "./dict/speakers";
 import * as ai from "./dict/ai";
 import * as hooks from "./dict/hooks";
 import * as device from "./dict/device";
+import * as memo from "./dict/memo";
 
 export type Locale = "zh" | "en";
 
 // 分片清单。测试哨兵(i18n.test.ts)依赖此导出检查分片间无重键。
-export const shards = { common, shell, settings, notes, record, graph, governance, speakers, ai, hooks, device } as const;
+export const shards = { common, shell, settings, notes, record, graph, governance, speakers, ai, hooks, device, memo } as const;
 
 const zhAll: Dict = Object.assign({}, ...Object.values(shards).map((s) => s.zh));
 const enAll: Dict = Object.assign({}, ...Object.values(shards).map((s) => s.en));

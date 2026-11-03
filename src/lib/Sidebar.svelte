@@ -21,6 +21,7 @@
   } from "$lib/notes";
   import { listPeople, type PersonSummary } from "$lib/people";
   import { filterPeople, sortPeopleAlpha, sortPeopleBySamples } from "$lib/personPick";
+  import { fmtClock, searchMemos, type MemoHit } from "$lib/memos";
   import { tidy } from "$lib/tidy.svelte";
   import { buildTidyQueue, splitArchive } from "$lib/tidyQueue";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
@@ -208,8 +209,38 @@
     goto(n.state === "active" ? "/record" : `/notes/${n.id}`);
   }
 
+  // 笔记搜索也搜会议备注(「我记得写过一句『封版』,是哪场会?」正是备注最常见的找法)。
+  // 备注不在笔记列表里,另走一个只读 memos.json 的命令;输入停 250ms 再查,过期结果丢弃。
+  let memoHits = $state<MemoHit[]>([]);
+  let memoSeq = 0;
+  $effect(() => {
+    const q = query.trim();
+    const seq = ++memoSeq;
+    if (!q) {
+      memoHits = [];
+      return;
+    }
+    const timer = setTimeout(() => {
+      searchMemos(q)
+        .then((hits) => {
+          if (seq === memoSeq) memoHits = hits;
+        })
+        .catch(() => {});
+    }, 250);
+    return () => clearTimeout(timer);
+  });
+  /** 每篇笔记的第一条命中备注(行下方露一句,说明为什么这篇被搜出来)。 */
+  const memoHitByNote = $derived.by(() => {
+    const m = new Map<string, MemoHit>();
+    for (const h of memoHits) if (!m.has(h.note_id)) m.set(h.note_id, h);
+    return m;
+  });
   const filtered = $derived(
-    query.trim() ? notes.filter((n) => n.title.toLowerCase().includes(query.trim().toLowerCase())) : notes,
+    query.trim()
+      ? notes.filter(
+          (n) => n.title.toLowerCase().includes(query.trim().toLowerCase()) || memoHitByNote.has(n.id),
+        )
+      : notes,
   );
   // 听写笔记按标签与句子文字过滤(笔记搜索搜得到听写内容)。
   const filteredDictations = $derived(
@@ -749,6 +780,10 @@
             </a>
           {/if}
           <span class="meta">{formatDate(n.started_at)} · {formatDuration(n.duration_secs)}</span>
+          {#if memoHitByNote.get(n.id)}
+            {@const h = memoHitByNote.get(n.id)!}
+            <span class="memo-hit">{t("memo.search.label")} {fmtClock(h.at_ms)} · {h.text}</span>
+          {/if}
         </div>
       </li>
       {/if}
@@ -1082,6 +1117,14 @@
     background: var(--surface-press);
     color: var(--ink);
     font-size: 0.9em;
+  }
+  .memo-hit {
+    display: block;
+    font-size: 0.75rem;
+    color: var(--ink-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .search::placeholder {
     color: var(--ink-faint);

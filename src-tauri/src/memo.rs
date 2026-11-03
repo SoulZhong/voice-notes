@@ -139,3 +139,64 @@ pub fn mark_now(app: &AppHandle, origin: &'static str) {
         }
     });
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoHit {
+    pub note_id: String,
+    pub memo_id: String,
+    pub at_ms: u64,
+    pub text: String,
+}
+
+/// 侧栏搜索用:扫全部笔记的备注,文字含 `query`(大小写不敏感)的条目。只读 memos.json,
+/// 不 load 整篇笔记;个人量级(百场 × 几十条)一次扫毫秒级,不建索引。
+#[tauri::command]
+pub async fn search_memos(app: AppHandle, query: String) -> Result<Vec<MemoHit>, String> {
+    crate::off_main(move || {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root = crate::notes_dir(&app).map_err(|e| e.to_string())?;
+        Ok(search_dir(&root, &needle, 200))
+    })
+    .await
+}
+
+fn search_dir(root: &std::path::Path, needle: &str, cap: usize) -> Vec<MemoHit> {
+    let mut hits = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root) else { return hits };
+    for e in rd.flatten() {
+        if !e.path().join(memos::MEMOS_FILE).is_file() {
+            continue;
+        }
+        let note_id = e.file_name().to_string_lossy().into_owned();
+        for m in memos::load_memos(&e.path()).memos {
+            if m.text.to_lowercase().contains(needle) {
+                hits.push(MemoHit { note_id: note_id.clone(), memo_id: m.id, at_ms: m.at_ms, text: m.text });
+                if hits.len() >= cap {
+                    return hits;
+                }
+            }
+        }
+    }
+    hits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_dir_finds_memos_case_insensitively() {
+        let d = tempfile::tempdir().unwrap();
+        for id in ["a", "b"] {
+            std::fs::create_dir(d.path().join(id)).unwrap();
+        }
+        memos::add_memo(&d.path().join("a"), 1_000, "Ship 封版", "note", None).unwrap();
+        memos::add_memo(&d.path().join("b"), 2_000, "别的", "note", None).unwrap();
+        let hits = search_dir(d.path(), "ship", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].note_id.as_str(), hits[0].at_ms), ("a", 1_000));
+    }
+}
