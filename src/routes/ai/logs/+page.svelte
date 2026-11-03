@@ -4,6 +4,9 @@
   import { onMount } from "svelte";
   import { aiLogsQuery, aiLogsExport, aiLogsOpenDir, AI_LOG_KIND_LABELS, type AiLogEntry } from "$lib/ailog";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Badge } from "$lib/ui/components/badge";
+  import * as ToggleGroup from "$lib/ui/components/toggle-group";
 
   const PAGE_SIZE = 50;
   // label 存 i18n 键,渲染处 t() 取值。
@@ -11,6 +14,9 @@
     { key: "", label: "ai.logs.kind.all" },
     ...Object.entries(AI_LOG_KIND_LABELS).map(([key, label]) => ({ key, label })),
   ];
+
+  // ToggleGroup 单选把空串当「未选中」,「全部」(kind = "")在控件层用哨兵值代表。
+  const ALL_KIND = "__all__";
 
   let entries = $state<AiLogEntry[]>([]);
   let total = $state(0);
@@ -79,8 +85,8 @@
   <header class="topbar">
     <h1>{t("ai.logs.sectionTitle")}</h1>
     <div class="topbar-actions">
-      <button class="btn-secondary" onclick={openDir}>{t("ai.logs.openDir")}</button>
-      <button class="btn-secondary" disabled={busy || total === 0} onclick={doExport}>{t("ai.logs.export")}</button>
+      <Button variant="outline" size="sm" onclick={openDir}>{t("ai.logs.openDir")}</Button>
+      <Button variant="outline" size="sm" disabled={busy || total === 0} onclick={doExport}>{t("ai.logs.export")}</Button>
     </div>
   </header>
 
@@ -89,14 +95,28 @@
   {/if}
 
   <div class="toolbar">
-    <div class="seg">
+    <ToggleGroup.Root
+      type="single"
+      spacing={1}
+      class="flex-none rounded-md bg-[var(--surface-press)] p-0.5"
+      bind:value={
+        // 函数绑定:再点已选项时 bits 会写入空串,setter 拒收、getter 仍给原值,控件不会变成「无选中」
+        // (单向 value + onValueChange 拦不住:bits 先改内部值再回调,Codex P2)。
+        () => kind || ALL_KIND,
+        (v) => {
+          if (!v) return;
+          const next = v === ALL_KIND ? "" : v;
+          if (next !== kind) setKind(next);
+        }
+      }
+    >
       {#each KIND_TABS as tab (tab.key)}
-        <label class="seg-item">
-          <input type="radio" name="log-kind" value={tab.key} checked={kind === tab.key} onchange={() => setKind(tab.key)} />
-          {t(tab.label)}
-        </label>
+        <ToggleGroup.Item
+          value={tab.key || ALL_KIND}
+          class="h-auto min-w-0 rounded-md px-[0.7em] py-[0.26em] text-[0.85rem] text-muted-foreground hover:bg-transparent data-[state=on]:bg-background data-[state=on]:text-foreground data-[state=on]:shadow-[var(--shadow-btn)]"
+        >{t(tab.label)}</ToggleGroup.Item>
       {/each}
-    </div>
+    </ToggleGroup.Root>
     <span class="toolbar-hint">
       {#if notice}{notice}{:else}{t("ai.logs.count", { total, loaded: entries.length })}{/if}
     </span>
@@ -111,8 +131,8 @@
           <div class="row-info">
             <span class="row-label-line">
               <span class="row-label">{AI_LOG_KIND_LABELS[e.kind] ? t(AI_LOG_KIND_LABELS[e.kind]) : e.kind}</span>
-              {#if e.status !== "ok"}<span class="pill warn">{t("ai.logs.failed")}</span>{/if}
-              {#if e.truncated}<span class="pill">{t("ai.logs.truncated")}</span>{/if}
+              {#if e.status !== "ok"}<Badge variant="outline" class="rounded-sm border-[var(--warning-line)] bg-[var(--warning-tint)] text-[var(--warning-ink)]">{t("ai.logs.failed")}</Badge>{/if}
+              {#if e.truncated}<Badge variant="outline" class="rounded-sm bg-muted text-muted-foreground">{t("ai.logs.truncated")}</Badge>{/if}
             </span>
             <span class="row-desc">
               {fmtTs(e.ts)} · {e.provider}{e.model ? ` · ${e.model}` : ""} · {e.duration_ms}ms{e.note_id
@@ -120,9 +140,9 @@
                 : ""}{#if e.status !== "ok" && e.error}<span class="desc-warn"> · {e.error.slice(0, 80)}</span>{/if}
             </span>
           </div>
-          <button class="link" onclick={() => (expandedId = expandedId === e.id ? null : e.id)}>
+          <Button variant="link" size="sm" class="h-auto shrink-0 px-0 text-ring" onclick={() => (expandedId = expandedId === e.id ? null : e.id)}>
             {expandedId === e.id ? t("ai.action.collapse") : t("ai.logs.detail")}
-          </button>
+          </Button>
         </div>
         {#if expandedId === e.id}
           <pre class="snippet log-detail">{JSON.stringify(e, null, 2)}</pre>
@@ -131,9 +151,9 @@
     {/if}
     {#if entries.length < total}
       <div class="row load-more">
-        <button class="btn-secondary" disabled={busy} onclick={() => load(false)}>
+        <Button variant="outline" size="sm" disabled={busy} onclick={() => load(false)}>
           {t("ai.logs.loadMore", { n: total - entries.length })}
-        </button>
+        </Button>
       </div>
     {/if}
   </div>
@@ -178,32 +198,7 @@
     overflow-wrap: anywhere;
   }
 
-  /* 以下控件形态与 /ai 页同一语言(seg/rows/pill/snippet) */
-  .seg {
-    display: flex;
-    gap: 2px;
-    flex: none;
-    background: var(--surface-press);
-    border-radius: var(--radius-md);
-    padding: 2px;
-  }
-  .seg-item {
-    position: relative;
-    padding: 0.26em 0.7em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    color: var(--ink-secondary);
-    border-radius: calc(var(--radius-md) - 2px);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .seg-item:hover { color: var(--ink); }
-  .seg-item:has(input:checked) {
-    background: var(--canvas);
-    color: var(--ink);
-    box-shadow: var(--shadow-btn);
-  }
-  .seg-item input { position: absolute; opacity: 0; pointer-events: none; }
+  /* 以下形态与 /ai 页同一语言(rows/snippet);分段、徽标、按钮已换组件 */
 
   .rows {
     background: var(--surface);
@@ -225,33 +220,7 @@
   .row-desc { font-size: 0.8rem; color: var(--ink-secondary); line-height: 1.4; overflow-wrap: anywhere; }
   .desc-warn { color: var(--warning-ink); }
 
-  .pill {
-    flex: none;
-    font-size: 0.78rem;
-    font-weight: 500;
-    border-radius: var(--radius-sm);
-    padding: 0.1em 0.5em;
-    background: var(--surface-soft);
-    color: var(--ink-secondary);
-    border: 1px solid var(--hairline);
-    white-space: nowrap;
-  }
-  .pill.warn {
-    background: var(--warning-tint);
-    border-color: var(--warning-line);
-    color: var(--warning-ink);
-  }
 
-  .link {
-    flex: none;
-    border: none;
-    background: none;
-    color: var(--accent);
-    font-size: 0.85rem;
-    cursor: pointer;
-    padding: 0;
-  }
-  .link:hover { text-decoration: underline; }
 
   .snippet {
     margin: 0 1rem 0.6rem;
@@ -277,17 +246,4 @@
   }
   .load-more { justify-content: center; }
 
-  .btn-secondary {
-    flex: none;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    padding: 0.35em 0.9em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    cursor: pointer;
-    background: transparent;
-    color: var(--ink);
-  }
-  .btn-secondary:hover { background: var(--surface-soft); }
-  .btn-secondary:disabled { opacity: 0.5; cursor: default; background: transparent; }
 </style>

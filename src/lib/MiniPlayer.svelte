@@ -4,6 +4,8 @@
   import { page } from "$app/stores";
   import { playback, shouldShowMiniPlayer } from "$lib/playback.svelte";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import * as ContextMenu from "$lib/ui/components/context-menu";
 
   /* 全局迷你播放浮层:切到非笔记页后仍能看到并控制正在播放的笔记。
      形态选择:曾经是底部通栏(position:fixed + left/right:0),真机实测仍会遮住
@@ -57,11 +59,6 @@
     playback.clear();
   }
 
-  function openMenu(e: MouseEvent) {
-    e.preventDefault();
-    menuOpen = true;
-  }
-
   function closeMenu() {
     menuOpen = false;
   }
@@ -78,10 +75,12 @@
 </script>
 
 {#if show && playback.session}
-  <!-- 右键菜单是纯指针便利入口,键盘用户走圆心按钮(播放/暂停)与右键菜单里
-       的两个真按钮即可覆盖全部操作,故此处不需要额外 role/键盘处理 -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="orb" class:playing={playback.playing} title={playback.session.title} oncontextmenu={openMenu}>
+  <!-- 右键菜单(UI 改版:ContextMenu 组件)是纯指针便利入口:在光标处展开、贴边自动避让,
+       Esc / 点别处关闭由组件承担;键盘用户走圆心按钮(播放/暂停)与菜单里的两项即可覆盖全部操作。 -->
+  <ContextMenu.Root bind:open={menuOpen}>
+  <ContextMenu.Trigger>
+    {#snippet child({ props })}
+  <div {...props} class="orb" class:playing={playback.playing} title={playback.session?.title}>
     <svg class="ring" viewBox="0 0 {RING_VB} {RING_VB}" aria-hidden="true">
       <circle class="track" cx={RING_VB / 2} cy={RING_VB / 2} r={RING_R} />
       <circle
@@ -96,52 +95,35 @@
     <!-- 图标遵循 DESIGN.md 第 7 条:禁用 emoji/Unicode 符号字符(▶⏸ 各平台字形/基线不一),
          统一走 SVG 图形(fill: currentColor,随按钮的 --on-accent 走)——与
          AudioPlayer.svelte 的播放键同款,16 单位坐标系按 22px 渲染。 -->
-    <button
+    <Button
+      size="icon"
       class="toggle"
       onclick={toggle}
       aria-label={playback.playing ? t("notes.player.pause") : t("notes.player.play")}
     >
       {#if playback.playing}
-        <svg width="22" height="22" viewBox="0 0 16 16" aria-hidden="true">
+        <svg class="size-[22px]" width="22" height="22" viewBox="0 0 16 16" aria-hidden="true">
           <rect x="3" y="2.5" width="3.4" height="11" rx="1" fill="currentColor" />
           <rect x="9.6" y="2.5" width="3.4" height="11" rx="1" fill="currentColor" />
         </svg>
       {:else}
-        <svg width="22" height="22" viewBox="0 0 16 16" aria-hidden="true">
+        <svg class="size-[22px]" width="22" height="22" viewBox="0 0 16 16" aria-hidden="true">
           <path
             d="M4.5 2.8v10.4c0 .8.9 1.3 1.6.9l8-5.2c.6-.4.6-1.4 0-1.8l-8-5.2c-.7-.4-1.6.1-1.6.9z"
             fill="currentColor"
           />
         </svg>
       {/if}
-    </button>
+    </Button>
   </div>
-
-  {#if menuOpen}
-    <!-- 点击任意处关闭;键盘路径由 svelte:window 的 Esc 承担,遮罩是纯指针便利层 -->
-    <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-    <div
-      class="menu-overlay"
-      onclick={closeMenu}
-      oncontextmenu={(e) => {
-        e.preventDefault();
-        closeMenu();
-      }}
-    ></div>
-    <!-- 菜单锚定在浮层同一个角落(右/下),不跟随光标定位——浮层本身贴着视口
-         右下角,菜单从这个角向左上方长出去,天然不会被窗口边缘裁掉。 -->
-    <div class="ctx-menu">
-      <button class="ctx-item" onclick={backToNote}>{t("notes.player.backToNote")}</button>
-      <button class="ctx-item" onclick={stopPlayback}>{t("notes.player.stopPlayback")}</button>
-    </div>
-  {/if}
+    {/snippet}
+  </ContextMenu.Trigger>
+  <ContextMenu.Content class="min-w-36">
+    <ContextMenu.Item onSelect={backToNote}>{t("notes.player.backToNote")}</ContextMenu.Item>
+    <ContextMenu.Item onSelect={stopPlayback}>{t("notes.player.stopPlayback")}</ContextMenu.Item>
+  </ContextMenu.Content>
+  </ContextMenu.Root>
 {/if}
-
-<svelte:window
-  onkeydown={(e) => {
-    if (e.key === "Escape" && menuOpen) closeMenu();
-  }}
-/>
 
 <style>
   .orb {
@@ -236,7 +218,8 @@
   /* 圆心按钮走 accent 实心底(此前是 surface 灰底,和外壳同色调,不够醒目)——
      真正可点的控件用全局主强调色撑起来,和 accent 描边的进度环互相呼应,
      一眼能认出这是个"播放器"而不是一块装饰性圆牌。 */
-  .toggle {
+  /* 圆心按钮是 Button 组件(拿统一的焦点环);外观仍由这里定,:global 穿进组件根元素。 */
+  .orb > :global(.toggle) {
     position: absolute;
     /* 8px 留给外圈进度环,其余全部是可点的实心按钮——按钮本身要占大头,
        环只是它外面的一圈细边,不能反过来大半个浮层都是空的外壳。 */
@@ -247,6 +230,8 @@
       inset 0 1px 2px var(--orb-toggle-shade),
       inset 0 1px 0 var(--orb-toggle-sheen);
     border: none;
+    width: auto;
+    height: auto;
     color: var(--on-accent);
     cursor: pointer;
     display: flex;
@@ -254,44 +239,10 @@
     justify-content: center;
     transition: transform 0.1s ease, background-color 0.15s ease;
   }
-  .toggle:hover {
+  .orb > :global(.toggle:hover) {
     background: radial-gradient(circle at 34% 28%, var(--orb-toggle-sheen), transparent 65%), var(--accent-pressed);
   }
-  .toggle:active {
+  .orb > :global(.toggle:active) {
     transform: scale(0.92);
-  }
-  .menu-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 40;
-  }
-  .ctx-menu {
-    position: fixed;
-    right: var(--orb-inset);
-    /* 浮层顶边 + 8px 间距,随 --orb-size 变化自动跟着走,不用跟 .orb 的尺寸手动对账。 */
-    bottom: calc(var(--orb-inset) + var(--orb-size) + 8px);
-    z-index: 41;
-    min-width: 9rem;
-    background: var(--surface-press);
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-    padding: 4px;
-    display: flex;
-    flex-direction: column;
-  }
-  .ctx-item {
-    background: none;
-    border: none;
-    text-align: left;
-    color: var(--ink);
-    font: inherit;
-    font-size: 13px;
-    padding: 7px 10px;
-    border-radius: var(--radius-md);
-    cursor: pointer;
-  }
-  .ctx-item:hover {
-    background: var(--surface-soft);
   }
 </style>

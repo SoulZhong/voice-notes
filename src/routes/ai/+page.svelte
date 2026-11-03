@@ -35,6 +35,11 @@
   import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
   import EditableField from "$lib/EditableField.svelte";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
+  import { Button } from "$lib/ui/components/button";
+  import { Badge } from "$lib/ui/components/badge";
+  import { Switch } from "$lib/ui/components/switch";
+  import { Textarea } from "$lib/ui/components/textarea";
+  import * as Select from "$lib/ui/components/select";
 
   let settings = $state<Settings | null>(null);
   /** danger 横幅：本页保存类操作的错误统一在此显示(精简自设置页的全局 error 横幅)。 */
@@ -268,6 +273,34 @@
     { key: "pi", label: "Pi", modelHint: "ai.aing.agentModelHint.pi" },
   ];
   const selectedAgentOption = $derived(AGENT_OPTIONS.find((a) => a.key === refineAgent) ?? AGENT_OPTIONS[0]);
+
+  // 执行体选择器(Select 组件):空串(「不使用」/「跟随」)在控件层用哨兵值代表——
+  // bits Select 把空串当「未选」。选项文本与触发器显示文本共用同一组函数,未就绪标注不走样。
+  const EXEC_NONE = "__none__";
+  // 状态徽章:中性 / warning 两种语义色(沿用旧 .pill 的 token)。
+  const pillClass = "rounded-sm bg-muted text-muted-foreground";
+  const pillWarnClass = "rounded-sm border-[var(--warning-line)] bg-[var(--warning-tint)] text-[var(--warning-ink)]";
+  function llmOptionText(p: { label: string; api_key: string }): string {
+    return `${p.label}${p.api_key.trim() ? "" : ` · ${t("ai.exec.missingKey")}`}`;
+  }
+  function agentRelationsBlocked(key: string, forRelations: boolean): boolean {
+    return forRelations && !["claude", "gemini", "pi"].includes(key);
+  }
+  function agentOptionText(a: { key: string; label: string }, forRelations: boolean): string {
+    return `${a.label}${agentRelationsBlocked(a.key, forRelations)
+      ? ` · ${t("ai.exec.relationsUnsupported")}`
+      : !(a.key in agentProbe) || agentProbe[a.key]
+        ? ""
+        : ` · ${t("ai.exec.notDetected")}`}`;
+  }
+  function executorText(value: string, forRelations: boolean, emptyText: string): string {
+    if (!value) return emptyText;
+    const profile = llmProfiles.find((p) => "llm:" + p.id === value);
+    if (profile) return llmOptionText(profile);
+    const agent = AGENT_OPTIONS.find((a) => "agent:" + a.key === value);
+    if (agent) return agentOptionText(agent, forRelations);
+    return value;
+  }
   /** 家目录缩写为 ~,长路径在 row-desc 里不至于喧宾夺主。 */
   const shortPath = (p: string) => p.replace(/^\/Users\/[^/]+/, "~");
 
@@ -642,26 +675,21 @@
        跑一次预览/补建才发现必败(codex 2026-08-11 P2)。 -->
   {#snippet executorOptions(forRelations: boolean)}
     {#if llmProfiles.length}
-      <optgroup label={t("ai.exec.groupLlm")}>
+      <Select.Group>
+        <Select.GroupHeading>{t("ai.exec.groupLlm")}</Select.GroupHeading>
         {#each llmProfiles as p (p.id)}
-          <option value={"llm:" + p.id}>
-            {p.label}{p.api_key.trim() ? "" : ` · ${t("ai.exec.missingKey")}`}
-          </option>
+          <Select.Item value={"llm:" + p.id}>{llmOptionText(p)}</Select.Item>
         {/each}
-      </optgroup>
+      </Select.Group>
     {/if}
-    <optgroup label={t("ai.exec.groupAgent")}>
+    <Select.Group>
+      <Select.GroupHeading>{t("ai.exec.groupAgent")}</Select.GroupHeading>
       {#each AGENT_OPTIONS as a (a.key)}
-        {@const relationsBlocked = forRelations && !["claude", "gemini", "pi"].includes(a.key)}
-        <option value={"agent:" + a.key} disabled={relationsBlocked}>
-          {a.label}{relationsBlocked
-            ? ` · ${t("ai.exec.relationsUnsupported")}`
-            : !(a.key in agentProbe) || agentProbe[a.key]
-              ? ""
-              : ` · ${t("ai.exec.notDetected")}`}
-        </option>
+        <Select.Item value={"agent:" + a.key} disabled={agentRelationsBlocked(a.key, forRelations)}>
+          {agentOptionText(a, forRelations)}
+        </Select.Item>
       {/each}
-    </optgroup>
+    </Select.Group>
   {/snippet}
 
   {#if error}
@@ -676,7 +704,7 @@
       </div>
       <div class="quickstart-heading-actions">
         <span class="local-badge">{t("ai.quickstart.localBadge")}</span>
-        <button class="btn-secondary" onclick={() => { guideStep = 0; goto(`/ai?guide=${AI_TOOLS_GUIDE_ID}`); }}>{t("ai.quickstart.replay")}</button>
+        <Button variant="outline" size="sm" onclick={() => { guideStep = 0; goto(`/ai?guide=${AI_TOOLS_GUIDE_ID}`); }}>{t("ai.quickstart.replay")}</Button>
       </div>
     </div>
     <div class="quickstart-path">
@@ -685,7 +713,7 @@
         <div>
           <strong>{t("ai.quickstart.step1.title")}</strong>
           <p>{t("ai.quickstart.step1.desc")}</p>
-          <button class="text-action" onclick={() => scrollToSection("aing-settings")}>{t("ai.quickstart.step1.action")}</button>
+          <Button variant="link" size="xs" class="h-auto px-0 text-[0.78rem] font-normal text-ring" onclick={() => scrollToSection("aing-settings")}>{t("ai.quickstart.step1.action")}</Button>
         </div>
       </div>
       <div class="quickstep">
@@ -693,9 +721,9 @@
         <div>
           <strong>{t("ai.quickstart.step2.title")}</strong>
           <p>{t("ai.quickstart.step2.desc")}</p>
-          <button class="text-action" onclick={() => scrollToSection("assistant-connect")}>
+          <Button variant="link" size="xs" class="h-auto px-0 text-[0.78rem] font-normal text-ring" onclick={() => scrollToSection("assistant-connect")}>
             {mcpAgents.some((a) => a.registered) ? t("ai.quickstart.step2.viewConnected") : t("ai.quickstart.step2.choose")}
-          </button>
+          </Button>
         </div>
       </div>
       <div class="quickstep">
@@ -703,12 +731,12 @@
         <div>
           <strong>{t("ai.quickstart.step3.title")}</strong>
           <p class="starter-prompt">{t("ai.quickstart.step3.quote", { prompt: t("ai.quickstart.starterPrompt") })}</p>
-          <button class="text-action" onclick={copyStarterPrompt}>{promptCopied ? t("ai.quickstart.copied") : t("ai.quickstart.copyExample")}</button>
+          <Button variant="link" size="xs" class="h-auto px-0 text-[0.78rem] font-normal text-ring" onclick={copyStarterPrompt}>{promptCopied ? t("ai.quickstart.copied") : t("ai.quickstart.copyExample")}</Button>
         </div>
       </div>
     </div>
     <p class="quickstart-foot">
-      {t("ai.quickstart.foot.before")} <button class="text-action" onclick={() => goto("/hooks")}>{t("ai.quickstart.foot.hooks")}</button>
+      {t("ai.quickstart.foot.before")} <Button variant="link" size="xs" class="h-auto px-0 text-[0.78rem] font-normal text-ring" onclick={() => goto("/hooks")}>{t("ai.quickstart.foot.hooks")}</Button>
       {t("ai.quickstart.foot.after")}
     </p>
   </section>
@@ -731,14 +759,19 @@
             {/if}
           </span>
         </div>
-        <select
-          class="row-select"
-          value={refineExecutor}
-          onchange={(e) => setRefineExecutor(e.currentTarget.value)}
+        <Select.Root
+          type="single"
+          value={refineExecutor || EXEC_NONE}
+          onValueChange={(v) => setRefineExecutor(v === EXEC_NONE ? "" : v)}
         >
-          <option value="">{t("ai.exec.none")}</option>
-          {@render executorOptions(false)}
-        </select>
+          <Select.Trigger class="max-w-64 flex-none" aria-label={t("ai.exec.label")}>
+            <span class="truncate">{executorText(refineExecutor, false, t("ai.exec.none"))}</span>
+          </Select.Trigger>
+          <Select.Content>
+            <Select.Item value={EXEC_NONE}>{t("ai.exec.none")}</Select.Item>
+            {@render executorOptions(false)}
+          </Select.Content>
+        </Select.Root>
       </div>
       <p class="config-hint">{t("ai.aing.agentFailNote")}</p>
     </div>
@@ -750,31 +783,31 @@
     <div class="rows">
       <div class="provider-tabs" role="tablist">
         {#each llmProfiles as p (p.id)}
-          <button
+          <Button
+            variant="ghost"
             role="tab"
             aria-selected={selectedProfileId === p.id}
-            class="ptab"
-            class:active={selectedProfileId === p.id}
+            class="-mb-px h-auto gap-[0.4em] rounded-none border-0 border-b-2 border-transparent px-[0.15em] py-[0.45em] text-[0.88rem] text-muted-foreground hover:bg-transparent hover:text-foreground aria-selected:border-ring aria-selected:text-foreground dark:hover:bg-transparent"
             onclick={() => selectProfile(p.id)}
           >
             {p.label}
             {#if p.api_key.trim()}<span class="chip-dot"></span>{/if}
-          </button>
+          </Button>
         {/each}
         <!-- 模板平铺(2026-08-11 冒烟反馈:弹出菜单会被容器裁切):幽灵芯片直接
              排在档案 tab 之后,点即新建,tab 条自身 flex-wrap 窄窗换行,无遮挡面。 -->
         {#each REFINE_PRESETS as p (p.label)}
-          <button class="tpl-chip" title={t("ai.res.add")} onclick={() => addProfile(p)}>
+          <Button variant="outline" size="xs" class="self-center rounded-full border-dashed border-input bg-transparent font-normal text-muted-foreground hover:text-foreground dark:bg-transparent" title={t("ai.res.add")} onclick={() => addProfile(p)}>
             + {p.labelKey ? t(p.labelKey) : p.label}
-          </button>
+          </Button>
         {/each}
-        <button
-          class="tpl-chip"
+        <Button
+          variant="outline" size="xs" class="self-center rounded-full border-dashed border-input bg-transparent font-normal text-muted-foreground hover:text-foreground dark:bg-transparent"
           title={t("ai.res.add")}
           onclick={() => addProfile({ label: t("ai.aing.tab.custom"), base: "", model: "" })}
         >
           + {t("ai.aing.tab.custom")}
-        </button>
+        </Button>
       </div>
       {#if selectedProfile}
         <div class="row">
@@ -830,14 +863,14 @@
           </div>
           <div class="row-actions">
             {#if confirmDeleteProfile}
-              <button class="btn-secondary danger" onclick={deleteProfile}>{t("ai.res.confirmDelete")}</button>
-              <button class="btn-secondary" onclick={() => (confirmDeleteProfile = false)}>{t("settings.cancel")}</button>
+              <Button variant="destructive" size="sm" onclick={deleteProfile}>{t("ai.res.confirmDelete")}</Button>
+              <Button variant="outline" size="sm" onclick={() => (confirmDeleteProfile = false)}>{t("settings.cancel")}</Button>
             {:else}
-              <button class="btn-secondary danger" onclick={() => (confirmDeleteProfile = true)}>{t("ai.action.remove")}</button>
+              <Button variant="destructive" size="sm" onclick={() => (confirmDeleteProfile = true)}>{t("ai.action.remove")}</Button>
             {/if}
-            <button class="btn-secondary" onclick={runLlmTest} disabled={llmTesting || llmMissing}>
+            <Button variant="outline" size="sm" onclick={runLlmTest} disabled={llmTesting || llmMissing}>
               {llmTesting ? t("ai.aing.testing") : t("ai.aing.test")}
-            </button>
+            </Button>
           </div>
         </div>
         {#if llmTest}
@@ -863,16 +896,16 @@
            的五家(Claude Code/Codex/Gemini/Cursor/Pi)额外露出模型与路径配置。 -->
       <div class="provider-tabs" role="tablist">
         {#each mcpAgents as a (a.key)}
-          <button
+          <Button
+            variant="ghost"
             role="tab"
             aria-selected={selectedAgentKey === a.key}
-            class="ptab"
-            class:active={selectedAgentKey === a.key}
+            class="-mb-px h-auto gap-[0.4em] rounded-none border-0 border-b-2 border-transparent px-[0.15em] py-[0.45em] text-[0.88rem] text-muted-foreground hover:bg-transparent hover:text-foreground aria-selected:border-ring aria-selected:text-foreground dark:hover:bg-transparent"
             onclick={() => selectAgentTab(a.key)}
           >
             {a.name}
             {#if a.registered}<span class="chip-dot"></span>{/if}
-          </button>
+          </Button>
         {/each}
       </div>
       {#if currentAgent}
@@ -894,9 +927,9 @@
             </span>
           </div>
           {#if currentAgent.installed || currentAgent.registered}
-            <button class="btn-secondary" disabled={mcpBusy === currentAgent.key} onclick={() => currentAgent && mcpToggleRegister(currentAgent)}>
+            <Button variant="outline" size="sm" disabled={mcpBusy === currentAgent.key} onclick={() => currentAgent && mcpToggleRegister(currentAgent)}>
               {currentAgent.registered ? t("ai.action.remove") : t("ai.mcp.register")}
-            </button>
+            </Button>
           {/if}
         </div>
         {#if EXEC_KIND[currentAgent.key]}
@@ -930,9 +963,9 @@
               <span class="row-label">{t("ai.aing.testRun.label")}</span>
               <span class="row-desc">{t("ai.aing.testRun.desc")}</span>
             </div>
-            <button class="btn-secondary" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
+            <Button variant="outline" size="sm" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
               {agentTesting ? t("ai.aing.testing") : t("ai.aing.test")}
-            </button>
+            </Button>
           </div>
           {#if agentTest}
             <p class="test-result" class:ok={agentTest.ok} class:err={!agentTest.ok}>
@@ -945,9 +978,9 @@
             <div class="row-info">
               <span class="row-label-line">
                 <span class="row-label">{t("ai.mcp.skill.label")}</span>
-                {#if skillState === "current"}<span class="pill">{t("ai.mcp.skill.current")}</span>
-                {:else if skillState === "stale"}<span class="pill warn">{t("ai.mcp.skill.stale")}</span>
-                {:else if skillState === "unmanaged"}<span class="pill">{t("ai.mcp.skill.unmanaged")}</span>
+                {#if skillState === "current"}<Badge variant="outline" class={pillClass}>{t("ai.mcp.skill.current")}</Badge>
+                {:else if skillState === "stale"}<Badge variant="outline" class={pillWarnClass}>{t("ai.mcp.skill.stale")}</Badge>
+                {:else if skillState === "unmanaged"}<Badge variant="outline" class={pillClass}>{t("ai.mcp.skill.unmanaged")}</Badge>
                 {/if}
               </span>
               <span class="row-desc">
@@ -960,32 +993,32 @@
             </div>
             {#if skillState !== null}
               <div class="row-actions">
-                <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={() => (skillEditOpen ? (skillEditOpen = false) : openSkillEdit())}>
+                <Button variant="outline" size="sm" disabled={skillEditBusy || skillBusy} onclick={() => (skillEditOpen ? (skillEditOpen = false) : openSkillEdit())}>
                   {t("ai.mcp.skill.viewEdit")}
-                </button>
+                </Button>
                 {#if skillState !== "unmanaged"}
                   <!-- 忙时禁用而非消失(原可见性语义);加 skillEditBusy 与编辑卡操作互斥,防竞态 -->
-                  <button class="btn-secondary" disabled={skillBusy || skillEditBusy} onclick={toggleSkill}>
+                  <Button variant="outline" size="sm" disabled={skillBusy || skillEditBusy} onclick={toggleSkill}>
                     {skillState === "not_installed" ? t("ai.action.install") : t("ai.action.remove")}
-                  </button>
+                  </Button>
                 {/if}
               </div>
             {/if}
           </div>
           {#if skillEditOpen}
             <div class="config">
-              <textarea
-                class="skill-textarea mono"
+              <Textarea
+                class="field-sizing-fixed mb-2 font-mono h-[360px] resize-y rounded-sm bg-muted text-[0.8rem] leading-normal"
                 bind:value={skillContent}
                 spellcheck="false"
                 disabled={skillEditBusy}
-              ></textarea>
+              />
               <div class="skill-edit-actions">
                 <div class="skill-edit-buttons">
                   <!-- 保存/恢复默认加 skillBusy:与行上「安装/移除」互斥,防止卸载进行中把旧内容写回 -->
-                  <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={saveSkillEdit}>{t("ai.action.save")}</button>
-                  <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={restoreSkillDefault}>{t("ai.mcp.skill.restore")}</button>
-                  <button class="btn-secondary" disabled={skillEditBusy} onclick={() => (skillEditOpen = false)}>{t("ai.action.collapse")}</button>
+                  <Button variant="outline" size="sm" disabled={skillEditBusy || skillBusy} onclick={saveSkillEdit}>{t("ai.action.save")}</Button>
+                  <Button variant="outline" size="sm" disabled={skillEditBusy || skillBusy} onclick={restoreSkillDefault}>{t("ai.mcp.skill.restore")}</Button>
+                  <Button variant="outline" size="sm" disabled={skillEditBusy} onclick={() => (skillEditOpen = false)}>{t("ai.action.collapse")}</Button>
                 </div>
                 <p class="config-hint">{t("ai.mcp.skill.savedHint")}</p>
               </div>
@@ -1000,21 +1033,21 @@
           <span class="row-label">{t("ai.mcp.allowControl.label")}</span>
           <span class="row-desc">{t("ai.mcp.allowControl.desc")}</span>
         </div>
-        <input type="checkbox" class="ctl switch" bind:checked={mcpAllowControl} disabled={!settings} onchange={saveMcpAllowControl} />
+        <Switch class="flex-none" bind:checked={mcpAllowControl} disabled={!settings} onCheckedChange={saveMcpAllowControl} />
       </label>
       <div class="row">
         <div class="row-info">
           <span class="row-label">{t("ai.mcp.manual.label")}</span>
           <span class="row-desc">{t("ai.mcp.manual.desc")}</span>
         </div>
-        <button class="btn-secondary" onclick={() => (mcpSnippetOpen = !mcpSnippetOpen)}>
+        <Button variant="outline" size="sm" onclick={() => (mcpSnippetOpen = !mcpSnippetOpen)}>
           {mcpSnippetOpen ? t("ai.action.collapse") : t("ai.action.view")}
-        </button>
+        </Button>
       </div>
       {#if mcpSnippetOpen}
         <div class="config">
           <pre class="snippet">{mcpSnippet}</pre>
-          <button class="btn-secondary" onclick={copyMcpSnippet}>{t("ai.action.copy")}</button>
+          <Button variant="outline" size="sm" class="self-start" onclick={copyMcpSnippet}>{t("ai.action.copy")}</Button>
         </div>
       {/if}
       {#if mcpHealed > 0}
@@ -1022,7 +1055,7 @@
       {/if}
       <p class="config-hint">
         {t("ai.mcp.privacyNote")}
-        <button class="link" onclick={openMcpReadme}>{t("ai.mcp.readme")}</button>
+        <Button variant="link" size="xs" class="h-auto px-[0.3em] text-[0.85rem] font-normal text-ring" onclick={openMcpReadme}>{t("ai.mcp.readme")}</Button>
       </p>
     </div>
   </section>
@@ -1073,21 +1106,26 @@
           <span class="row-label">{t("ai.exec.label")}</span>
           <span class="row-desc">{t("ai.exec.relationsDesc")}</span>
         </div>
-        <select
-          class="row-select"
-          value={relationsExecutor}
-          onchange={(e) => setRelationsExecutor(e.currentTarget.value)}
+        <Select.Root
+          type="single"
+          value={relationsExecutor || EXEC_NONE}
+          onValueChange={(v) => setRelationsExecutor(v === EXEC_NONE ? "" : v)}
         >
-          <option value="">{t("ai.exec.follow")}</option>
-          {@render executorOptions(true)}
-        </select>
+          <Select.Trigger class="max-w-64 flex-none" aria-label={t("ai.exec.label")}>
+            <span class="truncate">{executorText(relationsExecutor, true, t("ai.exec.follow"))}</span>
+          </Select.Trigger>
+          <Select.Content>
+            <Select.Item value={EXEC_NONE}>{t("ai.exec.follow")}</Select.Item>
+            {@render executorOptions(true)}
+          </Select.Content>
+        </Select.Root>
       </div>
       <div class="row">
         <div class="row-info">
           <span class="row-label">{t("ai.relations.label")}</span>
           <span class="row-desc">{t("ai.relations.desc")}</span>
         </div>
-        <button class="btn-secondary" onclick={() => (backfillOpen = true)}>{t("ai.relations.analyze")}</button>
+        <Button variant="outline" size="sm" onclick={() => (backfillOpen = true)}>{t("ai.relations.analyze")}</Button>
       </div>
     </div>
   </section>
@@ -1102,7 +1140,7 @@
             {t("ai.logs.entry.desc")}{aiLogsTotal > 0 ? t("ai.logs.entry.count", { n: aiLogsTotal }) : ""}
           </span>
         </div>
-        <button class="btn-secondary" onclick={() => goto("/ai/logs")}>{t("ai.action.view")}</button>
+        <Button variant="outline" size="sm" onclick={() => goto("/ai/logs")}>{t("ai.action.view")}</Button>
       </div>
     </div>
   </section>
@@ -1124,12 +1162,12 @@
       <p>{t(currentGuide.body)}</p>
     </div>
     <div class="guide-actions">
-      <button class="text-action" onclick={() => completeGuide(false)}>{t("ai.guide.skip")}</button>
+      <Button variant="link" size="xs" class="h-auto px-0 text-[0.78rem] font-normal text-ring" onclick={() => completeGuide(false)}>{t("ai.guide.skip")}</Button>
       {#if guideStep === GUIDE_STEPS.length - 1}
-        <button class="btn-secondary" onclick={() => completeGuide(true)}>{t("ai.guide.hooksNext")}</button>
-        <button class="guide-next" onclick={nextGuideStep}>{t("ai.guide.done")}</button>
+        <Button variant="outline" size="sm" onclick={() => completeGuide(true)}>{t("ai.guide.hooksNext")}</Button>
+        <Button size="sm" class="rounded-full px-4 shadow-[var(--shadow-btn)]" onclick={nextGuideStep}>{t("ai.guide.done")}</Button>
       {:else}
-        <button class="guide-next" onclick={nextGuideStep}>{t("ai.guide.next")}</button>
+        <Button size="sm" class="rounded-full px-4 shadow-[var(--shadow-btn)]" onclick={nextGuideStep}>{t("ai.guide.next")}</Button>
       {/if}
     </div>
   </aside>
@@ -1207,16 +1245,6 @@
     gap: 0.65rem;
     margin-top: 0.75rem;
   }
-  .guide-next {
-    border: 1px solid transparent;
-    border-radius: var(--radius-full);
-    background: var(--primary);
-    color: var(--on-primary);
-    padding: 0.48em 1.15em;
-    font-size: 0.82rem;
-    cursor: pointer;
-    box-shadow: var(--shadow-btn);
-  }
   .quickstart {
     background: var(--surface);
     border-radius: var(--radius-lg);
@@ -1279,16 +1307,6 @@
     line-height: 1.5;
   }
   .quickstep .starter-prompt { color: var(--ink); }
-  .text-action {
-    border: none;
-    background: none;
-    color: var(--accent);
-    padding: 0;
-    font: inherit;
-    font-size: 0.78rem;
-    cursor: pointer;
-  }
-  .text-action:hover { color: var(--accent-pressed); text-decoration: underline; }
   .quickstart-foot {
     margin: 0;
     padding: 0.65rem 1rem;
@@ -1379,64 +1397,9 @@
     flex: none;
     gap: 0.4rem;
   }
-  /* 徽章:soft 底 + 中性文字色,micro 字级(尺寸沿用说话人徽章的形态,颜色改中性/warning 语义) */
   /* 控制类工具在「允许控制」关闭时整行置灰:状态用视觉表达,不用术语徽章。 */
   .row.dimmed {
     opacity: 0.45;
-  }
-  .pill {
-    flex: none;
-    font-size: 0.78rem;
-    font-weight: 500;
-    border-radius: var(--radius-sm);
-    padding: 0.1em 0.5em;
-    background: var(--surface-soft);
-    color: var(--ink-secondary);
-    border: 1px solid var(--hairline);
-    white-space: nowrap;
-  }
-  .pill.warn {
-    background: var(--warning-tint);
-    color: var(--warning-ink);
-    border-color: var(--warning-line);
-  }
-  /* 右侧控件 */
-  .ctl {
-    flex: none;
-    margin: 0;
-  }
-  /* button-secondary */
-  .btn-secondary {
-    flex: none;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    padding: 0.35em 0.9em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    cursor: pointer;
-    background: transparent;
-    color: var(--ink);
-  }
-  .btn-secondary:hover {
-    background: var(--surface-soft);
-  }
-  .btn-secondary:disabled {
-    opacity: 0.5;
-    cursor: default;
-    background: transparent;
-  }
-  /* button-link:详见 README */
-  .link {
-    background: none;
-    border: none;
-    font: inherit;
-    font-size: 0.85rem;
-    color: var(--accent);
-    cursor: pointer;
-    padding: 0.2em 0.3em;
-  }
-  .link:hover {
-    text-decoration: underline;
   }
   /* banner:错误用 danger 色系,提示用 warning 色系 */
   .banner {
@@ -1470,28 +1433,6 @@
     border-bottom: 1px solid var(--hairline-strong);
     flex-wrap: wrap;
   }
-  .ptab {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4em;
-    border: none;
-    background: none;
-    padding: 0.45em 0.15em;
-    margin-bottom: -1px; /* 下划线压住 tab 条 hairline */
-    font-size: 0.88rem;
-    font-weight: 500;
-    color: var(--ink-secondary);
-    cursor: pointer;
-    border-bottom: 2px solid transparent;
-    transition: color 0.15s ease, border-color 0.15s ease;
-  }
-  .ptab:hover {
-    color: var(--ink);
-  }
-  .ptab.active {
-    color: var(--ink);
-    border-bottom-color: var(--accent);
-  }
   /* 已存密钥标记:小绿点 */
   .chip-dot {
     width: 6px;
@@ -1500,49 +1441,11 @@
     background: var(--success, var(--accent));
     flex: none;
   }
-  /* 新建模板芯片:幽灵态(虚线胶囊)与真实档案 tab(下划线)可一眼区分 */
-  .tpl-chip {
-    display: inline-flex;
-    align-items: center;
-    align-self: center;
-    border: 1px dashed var(--hairline-strong);
-    border-radius: var(--radius-full);
-    background: none;
-    padding: 0.18em 0.7em;
-    font-size: 0.8rem;
-    color: var(--ink-faint, var(--ink-secondary));
-    cursor: pointer;
-    white-space: nowrap;
-    transition: color 0.15s ease, border-color 0.15s ease;
-  }
-  .tpl-chip:hover {
-    color: var(--ink);
-    border-color: var(--ink-secondary);
-  }
-  /* 执行体选择器:与 row-input 同语言的原生 select */
-  .row-select {
-    flex: none;
-    max-width: 16rem;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink);
-    padding: 0.4em 0.6em;
-    font-size: 0.88rem;
-  }
-  .row-select:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
   /* 资源区行尾的按钮组(删除+测试并排) */
   .row-actions {
     display: flex;
     gap: 0.45rem;
     margin-left: auto;
-  }
-  .btn-secondary.danger {
-    color: var(--danger-ink);
-    border-color: var(--danger-ink);
   }
   .config-hint {
     font-size: 0.8rem;
@@ -1563,29 +1466,6 @@
     font-size: 0.8rem;
     overflow-x: auto;
     user-select: text;
-  }
-  /* 技能查看/编辑卡:.snippet 同族(surface-soft 底、radius-sm),可拖高、等宽字体 */
-  .skill-textarea {
-    box-sizing: border-box;
-    width: 100%;
-    height: 360px;
-    margin: 0 0 0.5rem;
-    padding: 0.6rem 0.8rem;
-    background: var(--surface-soft);
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-sm);
-    color: var(--ink);
-    font-size: 0.8rem;
-    line-height: 1.5;
-    resize: vertical;
-  }
-  .skill-textarea:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-  .skill-textarea:disabled {
-    opacity: 0.7;
   }
   .skill-edit-actions {
     display: flex;

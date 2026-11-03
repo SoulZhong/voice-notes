@@ -5,6 +5,8 @@
   import PersonPickList from "$lib/PersonPickList.svelte";
   import { localeVariants, t } from "$lib/i18n/index.svelte";
   import { describeActionError } from "$lib/speakerAction";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
 
   let {
     speakers,
@@ -336,6 +338,8 @@
           <span class="multi-tag">{t("speakers.chipMultiTag")}</span>
         {/if}
         {#if editable}
+          <!-- chip 本体(说话人色块里的名字)保持原生按钮:它是徽章的一部分,配色走 tint 内联
+               style,套 Button 会带进组件的边框/高度/悬停底,改掉徽章外观。 -->
           <button
             class="name"
             title={t("speakers.chipTitle")}
@@ -365,7 +369,7 @@
             }}
           >
             <!-- svelte-ignore a11y_autofocus -->
-            <input
+            <Input
               class="panel-input"
               autofocus
               placeholder={t("speakers.chipRenamePlaceholder")}
@@ -376,6 +380,7 @@
                 dupPending = null;
               }}
               onkeydown={(e) => {
+                if (e.isComposing) return;
                 if (e.key === "Enter") commitEdit();
                 if (e.key === "Escape") cancelEdit();
               }}
@@ -392,18 +397,18 @@
                       recent: recentLabel(dupPending.person),
                     })}
                   </div>
-                  <button class="row strong" onclick={dupAssign}>{t("speakers.chipDupAssign")}</button>
-                  <button class="row" onclick={dupRename}>{t("speakers.dupKeepNo")}</button>
+                  <Button variant="ghost" class="row strong" onclick={dupAssign}>{t("speakers.chipDupAssign")}</Button>
+                  <Button variant="ghost" class="row" onclick={dupRename}>{t("speakers.dupKeepNo")}</Button>
                 {:else}
                   <div class="dup-msg">
                     {t("speakers.chipDupLinked", { name: dupPending.person.name })}
                   </div>
-                  <a class="row" href="/speakers/{dupPending.person.id}" onclick={cancelEdit}
-                    >{t("speakers.chipViewThat", { name: dupPending.person.name })}</a
+                  <Button variant="ghost" class="row" href="/speakers/{dupPending.person.id}" onclick={cancelEdit}
+                    >{t("speakers.chipViewThat", { name: dupPending.person.name })}</Button
                   >
-                  <button class="row" onclick={dupRename}>{t("speakers.chipRenameAnyway")}</button>
+                  <Button variant="ghost" class="row" onclick={dupRename}>{t("speakers.chipRenameAnyway")}</Button>
                 {/if}
-                <button class="row quiet" onclick={cancelEdit}>{t("speakers.cancel")}</button>
+                <Button variant="ghost" class="row quiet" onclick={cancelEdit}>{t("speakers.cancel")}</Button>
               </div>
             {:else}
               <!-- 试听区打字时也保留(2026-09-22 实报):改名会带上这里勾的样本,先敲名字再边听边勾
@@ -413,7 +418,7 @@
                 {@const clips = previewClips(id)}
                 {#if clips.length === 0}
                   <div class="row row-off">
-                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <path d="M5 3.5v9l7.5-4.5z" />
                     </svg>
                     {t("speakers.chipPreview")}
@@ -431,29 +436,30 @@
                       <!-- 播放态只靠均衡器动画 + accent 高亮传达,不再塞行内状态文字——
                            浮层定宽,长文字会把「作为样本」挤压重叠(2026-09-05 用户截图);
                            「再点停止」的说明进 title。 -->
-                      <button
-                        class="row clip"
-                        class:playing
+                      <Button
+                        variant="ghost"
+                        class="row clip{playing ? ' playing' : ''}"
                         title={playing ? t("speakers.chipClipPlaying") : t("speakers.chipClipPlayTitle")}
                         onclick={() => { lastPlayed[id] = c.seq; onPreviewClip(id, c.seq); }}
                       >
                         {#if playing}
                           <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
                         {:else}
-                          <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path d="M5 3.5v9l7.5-4.5z" />
                           </svg>
                         {/if}
                         <span class="clip-idx">{i + 1}</span>
                         <span class="clip-at">{clockOf(c.start_ms)}</span>
                         <span class="row-sub">{t("speakers.chipClipDur", { s: Math.round((c.end_ms - c.start_ms) / 1000) })}</span>
-                      </button>
+                      </Button>
                       <!-- 两个动作都用带文字的小胶囊,不再靠图标猜(2026-09-05 用户实报:
                            外链样图标被当成"跳转",裸勾选框不像操作)。
                            「＋样本/✓样本」切换态,「拆出」明说动作。 -->
-                      <button
-                        class="clip-act"
-                        class:on={picked}
+                      <Button
+                        variant="outline"
+                        size="xs"
+                        class="clip-act{picked ? ' on' : ''}"
                         title={t("speakers.chipClipPickTitle")}
                         aria-pressed={picked}
                         onclick={() => {
@@ -461,14 +467,16 @@
                         }}
                       >
                         {#if picked}
-                          <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
+                          <svg class="size-2.5" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
                         {:else}
-                          <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                          <svg class="size-2.5" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
                         {/if}
                         {t("speakers.chipClipPick")}
-                      </button>
+                      </Button>
                       {#if onDetachClip}
-                        <button
+                        <Button
+                          variant="outline"
+                          size="xs"
                           class="clip-act"
                           title={t("speakers.chipClipDetachTitle")}
                           onclick={async () => {
@@ -477,10 +485,12 @@
                           }}
                         >
                           {t("speakers.chipClipDetachShort")}
-                        </button>
+                        </Button>
                       {/if}
                       {#if onMarkMultiClip}
-                        <button
+                        <Button
+                          variant="outline"
+                          size="xs"
                           class="clip-act"
                           title={t("speakers.chipClipMultiTitle")}
                           onclick={async () => {
@@ -489,7 +499,7 @@
                           }}
                         >
                           {t("speakers.chipClipMulti")}
-                        </button>
+                        </Button>
                       {/if}
                       </div>
                     {/each}
@@ -511,20 +521,20 @@
                   <!-- 名下已无段落(如拆分后清空的原始说话人):试听无物可放,静默
                        没反应会被当成坏了(2026-08-22 用户实测)——置灰并说明白。 -->
                   <div class="row row-off">
-                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <path d="M5 3.5v9l7.5-4.5z" />
                     </svg>
                     {t("speakers.chipPreview")}
                     <span class="row-sub">{t("speakers.chipPreviewEmpty")}</span>
                   </div>
                 {:else}
-                  <button class="row" onclick={() => onPreview(id)}>
-                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <Button variant="ghost" class="row" onclick={() => onPreview(id)}>
+                    <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <path d="M5 3.5v9l7.5-4.5z" />
                     </svg>
                     {t("speakers.chipPreview")}
                     {#if previewingId === id}<span class="row-sub">{t("speakers.chipPreviewPlaying")}</span>{/if}
-                  </button>
+                  </Button>
                 {/if}
               {/if}
               <!-- 动作行常驻(输入名字时也在):拆分排第一——分人错了是最常见、
@@ -532,7 +542,7 @@
               {#if onMarkMulti && !speakers[id]?.multi_speaker}
                 {#if blockedReason}
                   <div class="row row-off">
-                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                    <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                       <circle cx="5.5" cy="5.5" r="2.6" /><circle cx="10.5" cy="5.5" r="2.6" />
                       <path d="M2.2 13.4c.6-2.1 1.9-3.2 3.3-3.2m5 0c1.4 0 2.7 1.1 3.3 3.2" />
                     </svg>
@@ -540,40 +550,40 @@
                     <span class="row-sub">{blockedReason}</span>
                   </div>
                 {:else}
-                  <button class="row" title={t("speakers.chipMarkMultiTitle")} onclick={() => { cancelEdit(); onMarkMulti(id); }}>
-                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                  <Button variant="ghost" class="row" title={t("speakers.chipMarkMultiTitle")} onclick={() => { cancelEdit(); onMarkMulti(id); }}>
+                    <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                       <circle cx="5.5" cy="5.5" r="2.6" /><circle cx="10.5" cy="5.5" r="2.6" />
                       <path d="M2.2 13.4c.6-2.1 1.9-3.2 3.3-3.2m5 0c1.4 0 2.7 1.1 3.3 3.2" />
                     </svg>
                     {t("speakers.chipMarkMulti")}
-                  </button>
+                  </Button>
                 {/if}
               {/if}
-              <button class="row" onclick={() => markAsMe(id)}>
-                <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+              <Button variant="ghost" class="row" onclick={() => markAsMe(id)}>
+                <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                   <circle cx="8" cy="5.2" r="2.6" />
                   <path d="M2.8 13.4c.9-2.4 2.9-3.6 5.2-3.6s4.3 1.2 5.2 3.6" />
                 </svg>
                 {t("speakers.chipMe")}
-              </button>
+              </Button>
               {#if onUnlink && speakers[id]?.person_id}
                 <!-- 取消关联:文案里点名当前关联的是谁(2026-09-20 用户点名)。
                      原文案「取消关联人物」不说是哪一个——而用到这一行的场景恰恰是
                      "它关错人了",用户需要先确认关的是谁才敢按。副标题说明这一下
                      不删段落、不造新人物,正是"关错了但又不想新建人物"该走的路。 -->
-                <button class="row" onclick={() => commitUnlink(id)}>
-                  <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                <Button variant="ghost" class="row" onclick={() => commitUnlink(id)}>
+                  <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                     <path d="M6.5 9.5 4.8 11.2a2.4 2.4 0 0 1-3.4-3.4l1.7-1.7M9.5 6.5l1.7-1.7a2.4 2.4 0 0 1 3.4 3.4l-1.7 1.7M6 10l4-4" />
                   </svg>
                   <span class="row-stack">
                     <span class="row-main">{t("speakers.chipUnlinkNamed", { name: label(id) })}</span>
                     <span class="row-note">{t("speakers.chipUnlinkSub")}</span>
                   </span>
-                </button>
+                </Button>
               {/if}
               {#if onDelete && blockedReason}
                 <div class="row row-off">
-                  <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                  <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                     <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.7 8.5h4.6l.7-8.5" />
                   </svg>
                   {t("speakers.chipDelete")}
@@ -581,15 +591,15 @@
                 </div>
               {:else if onDelete}
                 {#if deletePending}
-                  <button class="row strong" onclick={() => commitDelete(id)}>{t("speakers.chipDeleteConfirm")}</button>
-                  <button class="row quiet" onclick={() => (deletePending = false)}>{t("speakers.cancel")}</button>
+                  <Button variant="ghost" class="row strong" onclick={() => commitDelete(id)}>{t("speakers.chipDeleteConfirm")}</Button>
+                  <Button variant="ghost" class="row quiet" onclick={() => (deletePending = false)}>{t("speakers.cancel")}</Button>
                 {:else}
-                  <button class="row" onclick={() => (deletePending = true)}>
-                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                  <Button variant="ghost" class="row" onclick={() => (deletePending = true)}>
+                    <svg class="row-icon size-3.5" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                       <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.7 8.5h4.6l.7-8.5" />
                     </svg>
                     {t("speakers.chipDelete")}
-                  </button>
+                  </Button>
                 {/if}
               {/if}
               {#if attendees && attendees.length > 0}
@@ -598,17 +608,18 @@
                 <div class="att-wrap">
                   {#each attendees as an (an.name)}
                     {@const used = usedNames.has(an.name)}
-                    <button
-                      class="att-pill"
-                      class:used
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      class="att-pill{used ? ' used' : ''}"
                       title={used ? t("speakers.attendeeUsed", { name: an.name }) : t("speakers.attendeePick", { name: an.name })}
                       onclick={() => void pickAttendee(id, an.name, an.email)}
                     >
                       {#if used}
-                        <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
+                        <svg class="size-2.5" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
                       {/if}
                       {an.name}
-                    </button>
+                    </Button>
                   {/each}
                 </div>
               {/if}
@@ -632,11 +643,11 @@
     {/each}
     {#if collapsible}
       <!-- 碎片折叠钮:声纹没归成簇的一次性说话人收进来,别摊满一整条 -->
-      <button class="chip more" onclick={() => (showFragments = !showFragments)}>
+      <Button variant="outline" size="xs" class="chip more" onclick={() => (showFragments = !showFragments)}>
         {showFragments
           ? t("speakers.collapse")
           : t("speakers.fragmentsN", { n: fragmentIds.length })}
-      </button>
+      </Button>
     {/if}
   </div>
 {/if}
@@ -697,15 +708,19 @@
     box-shadow: 0 0 0 2px var(--accent-tint);
   }
   /* 碎片折叠钮:button-secondary 语言(透明底+hairline 边),不与粉彩说话人色争 */
-  .chip.more {
-    border: 1px solid var(--hairline-strong);
+  /* 折叠钮是 Button 组件(outline xs),类名不带本组件作用域,用 :global 落到它身上;
+     形状与说话人 chip 对齐(rounded-full、同字号同内距)。 */
+  .chips :global(.chip.more) {
+    height: auto;
+    border-radius: var(--radius-full);
+    padding: 0.2em 0.6em;
+    border-color: var(--hairline-strong);
     background: transparent;
     color: var(--ink-secondary);
-    font: inherit;
     font-size: 0.85em;
-    cursor: pointer;
+    font-weight: 400;
   }
-  .chip.more:hover {
+  .chips :global(.chip.more:hover) {
     background: var(--surface-soft);
     color: var(--ink);
   }
@@ -752,18 +767,18 @@
       transform: none;
     }
   }
-  /* 改名输入:面板首行,无框(面板本身就是聚焦语境),下缘发丝线分隔 */
-  .panel-input {
-    width: 100%;
-    box-sizing: border-box;
+  /* 改名输入(Input 组件):面板首行,无框无聚焦环(面板本身就是聚焦语境),下缘发丝线分隔 */
+  .panel :global(.panel-input) {
+    height: auto;
     padding: 0.45rem 0.55rem;
     background: transparent;
     border: none;
-    outline: none;
+    box-shadow: none;
+    border-radius: 0;
     font: inherit;
     color: var(--ink);
   }
-  .panel-input::placeholder {
+  .panel :global(.panel-input::placeholder) {
     color: var(--ink-faint);
   }
   /* 全出血分隔线:负外边距抵掉面板内距 */
@@ -779,29 +794,21 @@
     gap: 0.3rem;
     padding: 0.1rem 0.15rem 0.35rem;
   }
-  .att-pill {
-    display: inline-flex;
-    align-items: center;
+  .panel :global(.att-pill) {
+    height: auto;
     gap: 0.3em;
-    border: 1px solid var(--hairline-strong);
+    border-color: var(--hairline-strong);
     background: transparent;
     color: var(--ink);
     border-radius: var(--radius-full);
     padding: 0.15em 0.6em;
     font-size: 0.78rem;
-    cursor: pointer;
-    transition:
-      background 120ms ease,
-      color 120ms ease,
-      border-color 120ms ease;
+    font-weight: 400;
   }
-  .att-pill:hover {
+  .panel :global(.att-pill:hover) {
     background: var(--surface-soft);
   }
-  .att-pill:active {
-    transform: translateY(0.5px);
-  }
-  .att-pill.used {
+  .panel :global(.att-pill.used) {
     color: var(--accent);
     border-color: var(--accent);
     opacity: 0.75;
@@ -812,23 +819,22 @@
     color: var(--ink-faint);
     letter-spacing: 0.02em;
   }
-  /* 菜单行(「这是我」与人物行同形态):全宽、radius-md、hover surface-soft */
-  .row {
+  /* 菜单行(「这是我」与人物行同形态):全宽、radius-md、hover surface-soft。
+     行多数是 Button(ghost,悬停底由组件给),少数置灰说明行是 div;两者共用这条,
+     故用 :global。覆盖 Button 的定高/居中/不换行/加粗,让行能装两行说明。 */
+  .panel :global(.row) {
     display: flex;
     align-items: center;
+    justify-content: flex-start;
     gap: 0.5rem;
     width: 100%;
+    height: auto;
     padding: 0.38rem 0.55rem;
-    background: none;
-    border: none;
     border-radius: var(--radius-md);
     color: var(--ink);
     font: inherit;
     text-align: left;
-    cursor: pointer;
-  }
-  .row:hover {
-    background: var(--surface-soft);
+    white-space: normal;
   }
   /* 片段列表(显式试听) */
   .clips {
@@ -855,7 +861,7 @@
   .clip-line.picked {
     background: var(--surface-soft);
   }
-  .clip-line .row.clip {
+  .clip-line :global(.row.clip) {
     flex: 1 1 auto;
     width: auto;
     /* 溢出保护:浮层定宽,行内容再长也不许压到右侧勾选/跳转(2026-09-05 截图教训) */
@@ -864,37 +870,29 @@
   }
   /* 片段行动作胶囊(样本切换/拆出):带文字的小 secondary,不再靠图标猜。
      选中态(✓样本)accent 描边点亮。 */
-  .clip-act {
-    display: inline-flex;
-    align-items: center;
+  .clip-line :global(.clip-act) {
+    height: auto;
     gap: 0.3em;
-    border: 1px solid var(--hairline-strong);
+    border-color: var(--hairline-strong);
     background: transparent;
     color: var(--ink-secondary);
     border-radius: var(--radius-full);
     padding: 0.1em 0.55em;
     font-size: 0.72rem;
-    cursor: pointer;
+    font-weight: 400;
     white-space: nowrap;
     flex: none;
-    transition:
-      background 120ms ease,
-      color 120ms ease,
-      border-color 120ms ease;
   }
-  .clip-act:hover {
+  .clip-line :global(.clip-act:hover) {
     background: var(--surface-soft);
     color: var(--ink);
   }
-  .clip-act:active {
-    transform: translateY(0.5px);
-  }
-  .clip-act.on {
+  .clip-line :global(.clip-act.on) {
     color: var(--accent);
     border-color: var(--accent);
     background: var(--accent-tint);
   }
-  .clip-act:last-child {
+  .clip-line :global(.clip-act:last-child) {
     margin-right: 0.25rem;
   }
   /* 片段动作回执:accent 小字,4 秒消散 */
@@ -906,12 +904,12 @@
   .clips-hint.warn {
     color: var(--warning-ink);
   }
-  .row.clip {
+  .panel :global(.row.clip) {
     padding: 0.3rem 0.55rem;
     font-size: 0.84rem;
     font-variant-numeric: tabular-nums;
   }
-  .row.clip.playing {
+  .panel :global(.row.clip.playing) {
     background: var(--accent-tint);
     color: var(--accent);
   }
@@ -959,16 +957,15 @@
     line-height: 1.5;
     max-width: 15rem;
   }
-  .row.strong {
+  .panel :global(.row.strong) {
     color: var(--accent);
     font-weight: 500;
   }
-  .row.quiet {
+  .panel :global(.row.quiet) {
     color: var(--ink-faint);
   }
-  a.row {
+  .panel :global(a.row) {
     text-decoration: none;
-    box-sizing: border-box;
   }
   /* 行内次要信息(最近出现日期):faint 小字,不与名字争 */
   .row-sub {

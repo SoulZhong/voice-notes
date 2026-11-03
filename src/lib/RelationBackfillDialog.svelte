@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Checkbox } from "$lib/ui/components/checkbox";
+  import { Progress } from "$lib/ui/components/progress";
   import {
     createRelationBackfillController,
     type RelationBackfillState,
@@ -21,7 +24,9 @@
   const controller = createRelationBackfillController();
   let state = $state<RelationBackfillState>(controller.state);
   let dialog: HTMLDialogElement;
-  let closeButton: HTMLButtonElement;
+  // 只在打开时命令式聚焦,不参与渲染,无需 $state(与旧 bind:this 用法一致)。
+  // svelte-ignore non_reactive_update
+  let closeButton: HTMLElement | null = null;
   let unsubscribeState: (() => void) | null = null;
   let lastReportedGeneration: number | null = null;
 
@@ -88,6 +93,10 @@
     onClose();
   }
 
+  // 主操作:Button 默认变体(bg-primary / text-primary-foreground = --primary / --on-primary),
+  // 补设计系统的胶囊外形与按钮阴影。
+  const primaryCta = "rounded-full shadow-[var(--shadow-btn)] hover:bg-[var(--primary-pressed)]";
+
   function start() {
     void controller.start().catch(() => {});
   }
@@ -112,14 +121,14 @@
         <p class="eyebrow">{t("governance.backfill.eyebrow")}</p>
         <h2 id="relation-backfill-title">{t("governance.backfill.title")}</h2>
       </div>
-      <button
-        bind:this={closeButton}
-        class="close-button"
-        type="button"
+      <Button
+        bind:ref={closeButton}
+        variant="outline"
+        size="sm"
         aria-label={t("governance.backfill.closeAria")}
         disabled={closeBlocked}
         onclick={closeDialog}
-      >{t("governance.backfill.close")}</button>
+      >{t("governance.backfill.close")}</Button>
     </header>
 
     <div class="status" aria-live="polite" aria-atomic="false">
@@ -130,7 +139,7 @@
         {#if state.technicalError}
           <details class="technical"><summary>{t("governance.backfill.technicalDetails")}</summary><pre>{state.technicalError}</pre></details>
         {/if}
-        <button class="secondary" type="button" onclick={() => controller.preview(noteIds)}>{t("governance.backfill.repreview")}</button>
+        <Button variant="outline" size="sm" class="mt-3" onclick={() => controller.preview(noteIds)}>{t("governance.backfill.repreview")}</Button>
       {:else if state.preview && (state.phase === "preview-ready")}
         <p class="lead">{t("governance.backfill.lead")}</p>
         <dl class="facts">
@@ -149,10 +158,10 @@
           <p class="message">{t("governance.backfill.nothingToAnalyze")}</p>
         {:else}
           <label class="consent">
-            <input
-              type="checkbox"
+            <Checkbox
+              class="mt-1"
               checked={state.acknowledged}
-              onchange={(event) => controller.acknowledge(event.currentTarget.checked)}
+              onCheckedChange={(checked) => controller.acknowledge(checked)}
             />
             <span>{t("governance.backfill.consent")}</span>
           </label>
@@ -173,7 +182,7 @@
           </p>
           <strong>{state.completed} / {state.total}</strong>
         </div>
-        <progress max={Math.max(state.total, 1)} value={state.completed}>{state.completed} / {state.total}</progress>
+        <Progress class="my-4 h-[0.45rem]" max={Math.max(state.total, 1)} value={state.completed} aria-valuetext={`${state.completed} / ${state.total}`} />
         {#if state.currentNoteId}
           <div class="current"><span>{t("governance.backfill.currentNote")}</span><strong>{state.currentNoteId}</strong></div>
         {/if}
@@ -206,20 +215,19 @@
 
     <footer>
       {#if state.phase === "preview-ready"}
-        <button
-          class="primary"
-          type="button"
+        <Button
+          class={primaryCta}
           disabled={!state.acknowledged || !state.preview || state.preview.note_ids.length === 0}
           onclick={start}
-        >{t("governance.backfill.start")}</button>
+        >{t("governance.backfill.start")}</Button>
       {:else if state.phase === "running"}
-        <button class="secondary danger" type="button" onclick={cancel}>{t("governance.backfill.stop")}</button>
+        <Button variant="destructive" onclick={cancel}>{t("governance.backfill.stop")}</Button>
       {:else if state.phase === "cancel-requested"}
-        <button class="secondary" type="button" onclick={closeDialog}>{t("governance.backfill.closeWindow")}</button>
+        <Button variant="outline" onclick={closeDialog}>{t("governance.backfill.closeWindow")}</Button>
       {:else if state.phase === "index-failed"}
-        <button class="primary" type="button" onclick={retryIndex}>{t("governance.backfill.retryIndex")}</button>
+        <Button class={primaryCta} onclick={retryIndex}>{t("governance.backfill.retryIndex")}</Button>
       {:else if state.phase === "failed" || state.phase === "partial" || state.phase === "cancelled"}
-        <button class="primary" type="button" onclick={resume}>{t("governance.backfill.resume")}</button>
+        <Button class={primaryCta} onclick={resume}>{t("governance.backfill.resume")}</Button>
       {/if}
     </footer>
   </div>
@@ -259,10 +267,8 @@
   .selection ul, .failures ul { margin: 0; padding: 0; list-style: none; }
   .selection li { padding: 0.35rem 0; color: var(--ink); overflow-wrap: anywhere; }
   .consent { display: grid; grid-template-columns: auto 1fr; gap: 0.75rem; align-items: start; padding: 1rem; background: var(--surface); border-radius: var(--radius-md); color: var(--ink); font-size: 0.86rem; line-height: 1.6; cursor: pointer; }
-  .consent input { width: 1.1rem; height: 1.1rem; margin-top: 0.2rem; accent-color: var(--accent); }
   .progress-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
   .progress-heading strong { font-variant-numeric: tabular-nums; }
-  progress { width: 100%; height: 0.45rem; margin: 1rem 0; accent-color: var(--accent); }
   .current { display: grid; gap: 0.2rem; padding: 0.8rem 0; }
   .current span { color: var(--ink-faint); font-size: 0.75rem; }
   .current strong { font-size: 0.88rem; overflow-wrap: anywhere; }
@@ -274,14 +280,7 @@
   .technical { margin-top: 0.65rem; color: var(--ink-secondary); font-size: 0.78rem; }
   .technical summary { min-height: 2.25rem; display: flex; align-items: center; cursor: pointer; }
   .technical pre { max-height: 12rem; margin: 0.35rem 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); font: 0.76rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  button { min-height: 2.25rem; padding: 0.45rem 0.85rem; border-radius: var(--radius-md); font: inherit; cursor: pointer; }
-  button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  button:disabled { cursor: default; opacity: 0.48; }
-  .primary { border: 1px solid var(--primary); border-radius: var(--radius-full); background: var(--primary); color: var(--on-primary); box-shadow: var(--shadow-btn); }
-  .primary:hover:not(:disabled) { background: var(--primary-pressed); }
-  .primary:active:not(:disabled) { transform: translateY(0.5px); }
-  .secondary, .close-button { border: 1px solid var(--hairline); background: var(--surface); color: var(--ink); }
-  .danger { color: var(--danger); }
+  summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   @media (max-width: 34rem) {
     dialog { width: calc(100vw - 1rem); max-height: calc(100dvh - 1rem); }
     header, footer { padding: 0.8rem 1rem; }
@@ -289,6 +288,6 @@
     .facts div:nth-child(n) { padding: 0.7rem 0; border-left: 0; }
     .facts div:nth-child(n + 2) { border-top: 1px solid var(--hairline); }
   }
-  @media (pointer: coarse) { button, .selection summary, .consent, .technical summary { min-height: 44px; } }
+  @media (pointer: coarse) { .selection summary, .consent, .technical summary { min-height: 44px; } }
   @media (prefers-reduced-motion: reduce) { dialog { scroll-behavior: auto; } }
 </style>

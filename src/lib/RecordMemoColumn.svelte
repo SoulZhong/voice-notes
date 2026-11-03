@@ -3,6 +3,8 @@
   // (不跳播放——会中本来就不回放)。栏可收起;展开/收起由页面按容器宽度与用户偏好决定。
   import { t } from "$lib/i18n/index.svelte";
   import { fmtClock, type Memo } from "$lib/memos";
+  import { Button } from "$lib/ui/components/button";
+  import { Badge } from "$lib/ui/components/badge";
 
   let {
     memos,
@@ -25,8 +27,10 @@
       <span class="title">{t("memo.column.title")}</span>
       <span class="count">{t("memo.column.count", { n: memos.length })}</span>
     {/if}
-    <button
-      class="toggle"
+    <Button
+      variant="ghost"
+      size="icon-xs"
+      class="relative ml-auto text-muted-foreground"
       title={open ? t("memo.column.close") : t("memo.column.open")}
       aria-label={open ? t("memo.column.close") : t("memo.column.open")}
       aria-expanded={open}
@@ -35,8 +39,8 @@
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         {#if open}<path d="M6 4l4 4-4 4" />{:else}<path d="M10 4L6 8l4 4" />{/if}
       </svg>
-      {#if !open && memos.length > 0}<span class="badge">{memos.length}</span>{/if}
-    </button>
+      {#if !open && memos.length > 0}<Badge class="absolute -top-1.5 -right-2 h-4 min-w-4 bg-ring px-1 text-[0.68rem] font-normal text-primary-foreground">{memos.length}</Badge>{/if}
+    </Button>
   </header>
   {#if open}
     {#if memos.length === 0}
@@ -45,14 +49,18 @@
       <ol>
         {#each memos as m (m.id)}
           <li>
-            <button class="item" onclick={() => onPick(m)}>
+            <Button
+              variant="ghost"
+              class="h-auto w-full items-start justify-start gap-[0.45rem] px-1.5 py-1.5 text-left text-[length:inherit] font-normal whitespace-normal"
+              onclick={() => onPick(m)}
+            >
               <span class="clock">{fmtClock(m.at_ms)}</span>
               {#if m.text}
                 <span class="text">{m.text}</span>
               {:else}
                 <span class="marker">{t("memo.marker")}</span>
               {/if}
-            </button>
+            </Button>
           </li>
         {/each}
       </ol>
@@ -89,49 +97,10 @@
     color: var(--ink-faint);
     font-size: 0.8rem;
   }
-  .toggle {
-    margin-left: auto;
-    position: relative;
-    border: none;
-    background: none;
-    color: var(--ink-secondary);
-    cursor: pointer;
-    padding: 0.2rem;
-    border-radius: var(--radius-sm);
-  }
-  .toggle:hover {
-    background: var(--surface-soft);
-  }
-  .badge {
-    position: absolute;
-    top: -0.3rem;
-    right: -0.4rem;
-    font-size: 0.68rem;
-    background: var(--accent);
-    color: var(--on-primary);
-    border-radius: var(--radius-full);
-    padding: 0 0.3rem;
-  }
   ol {
     list-style: none;
     margin: 0;
     padding: 0;
-  }
-  .item {
-    display: flex;
-    gap: 0.45rem;
-    width: 100%;
-    text-align: left;
-    border: none;
-    background: none;
-    color: var(--ink);
-    font: inherit;
-    padding: 0.35rem 0.4rem;
-    border-radius: var(--radius-md);
-    cursor: pointer;
-  }
-  .item:hover {
-    background: var(--surface-soft);
   }
   .clock {
     flex: none;

@@ -5,6 +5,7 @@
   import type { PersonSummary } from "$lib/people";
   import { dupNameSet, filterPeople, personLabel, recentLabel } from "$lib/personPick";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
 
   let {
     people,
@@ -43,7 +44,11 @@
 {#if candidates.length > 0}
   <div class="list">
     {#each candidates as p (p.id)}
-      <button class="row" onclick={() => onpick(p)}>
+      <Button
+        variant="ghost"
+        class="h-auto w-full justify-start gap-2 rounded-md px-[0.55rem] py-[0.38rem] text-left font-normal text-foreground hover:bg-muted"
+        onclick={() => onpick(p)}
+      >
         <!-- 色点用 ink 变体:soft 底(15% alpha)做 9px 点几乎不可见 -->
         <span class="dot" style="background: {speakerInk(p.id, 'mic')}"></span>
         <span class="row-label">{personLabel(p)}</span>
@@ -57,7 +62,7 @@
             <path d="M3 8.5l3.2 3.2L13 5" />
           </svg>
         {/if}
-      </button>
+      </Button>
     {/each}
   </div>
 {:else}
@@ -69,24 +74,7 @@
     max-height: 13rem;
     overflow-y: auto;
   }
-  /* 菜单行:全宽、radius-md、hover surface-soft */
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    width: 100%;
-    padding: 0.38rem 0.55rem;
-    background: none;
-    border: none;
-    border-radius: var(--radius-md);
-    color: var(--ink);
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-  }
-  .row:hover {
-    background: var(--surface-soft);
-  }
+  /* 菜单行:Button ghost 外壳(全宽、radius-md、hover surface-soft),样式在 class 上 */
   /* 人物色点:与徽章同一调色板按 P 号取色(跨会议恒定) */
   .dot {
     width: 9px;

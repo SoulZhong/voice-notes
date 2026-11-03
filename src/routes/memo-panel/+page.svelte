@@ -13,6 +13,7 @@
     MEMO_MAX_CHARS,
     type MemoPanelOpen,
   } from "$lib/memos";
+  import { Textarea } from "$lib/ui/components/textarea";
 
   let cur = $state<MemoPanelOpen | null>(null);
   let text = $state("");
@@ -94,14 +95,16 @@
     <span class="hint">{t("memo.panel.hint")}</span>
   </div>
   <!-- svelte-ignore a11y_autofocus -->
-  <textarea
-    bind:this={input}
+  <!-- 浮窗本身就是输入语境(外框即面板),组件去边去底去聚焦环,只留文字区。 -->
+  <Textarea
+    bind:ref={input}
     bind:value={text}
     autofocus
-    rows="2"
+    rows={2}
+    class="min-h-0 flex-1 resize-none rounded-none border-0 bg-transparent p-0 text-[0.95rem] leading-normal shadow-none field-sizing-fixed focus-visible:ring-0 md:text-[0.95rem] dark:bg-transparent"
     placeholder={t("memo.panel.placeholder")}
     onkeydown={onKeydown}
-  ></textarea>
+  />
   {#if error}<div class="err">{error}</div>{/if}
 </div>
 
@@ -137,17 +140,6 @@
     margin-left: auto;
     color: var(--ink-faint);
     font-size: 0.75rem;
-  }
-  textarea {
-    flex: 1;
-    resize: none;
-    border: none;
-    outline: none;
-    background: transparent;
-    color: var(--ink);
-    font: inherit;
-    font-size: 0.95rem;
-    line-height: 1.5;
   }
   .err {
     color: var(--danger);

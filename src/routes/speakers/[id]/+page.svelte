@@ -22,6 +22,11 @@
   import PersonPickList from "$lib/PersonPickList.svelte";
   import { onPersonSampleJob } from "$lib/events";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import { Badge } from "$lib/ui/components/badge";
+  import * as Popover from "$lib/ui/components/popover";
+  import { cn } from "$lib/ui/utils";
 
   // 主从结构的"从":本页只呈现/操作一个人;人物索引在侧栏声纹库页签。
   const personId = $derived($page.params.id as string);
@@ -456,6 +461,20 @@
   }
 
   $effect(() => stopSample);
+
+  // 圆形试听小钮(上下文整理行):播放中用焦点蓝描边/文字(旧 .listen-mini.playing)。
+  function listenMiniClass(playing: boolean): string {
+    return cn("size-[1.35rem] rounded-full text-muted-foreground", playing && "border-ring text-ring hover:text-ring");
+  }
+  // 样本行的大播放钮:播放中实心焦点蓝(旧 .play.playing)。
+  function playBtnClass(playing: boolean): string {
+    return cn(
+      "size-[2.1rem] rounded-full bg-[var(--surface-press)] text-foreground hover:border-ring hover:text-ring active:scale-[0.94] dark:bg-[var(--surface-press)]",
+      playing && "border-ring bg-[var(--accent)] text-[var(--on-accent)] hover:bg-[var(--accent)] hover:text-[var(--on-accent)] dark:bg-[var(--accent)]",
+    );
+  }
+  // 弹层(合并到…/归到别人)内容的公共外观:与旧 .menu 同尺寸。
+  const menuContentClass = "max-h-64 w-auto min-w-64 gap-1 overflow-y-auto p-[0.35rem]";
 </script>
 
 <main class="container">
@@ -466,8 +485,8 @@
   {#if tidy.lastManual}
     <div class="undo-strip">
       {t("speakers.mergedLabel", { label: tidy.lastManual.label })}
-      <button class="mini" disabled={recording.isLive || undoing} onclick={undoLastMerge}>{t("speakers.undo")}</button>
-      <button class="mini" onclick={() => (tidy.lastManual = null)}>{t("speakers.ok")}</button>
+      <Button variant="outline" size="sm" disabled={recording.isLive || undoing} onclick={undoLastMerge}>{t("speakers.undo")}</Button>
+      <Button variant="outline" size="sm" onclick={() => (tidy.lastManual = null)}>{t("speakers.ok")}</Button>
     </div>
   {/if}
 
@@ -496,14 +515,15 @@
         <div class="name-line">
           {#if editingId === person.id}
             <!-- svelte-ignore a11y_autofocus -->
-            <input
-              class="name-input"
+            <Input
+              class="h-auto w-auto min-w-52 border-ring bg-background px-[0.4em] py-[0.1em] text-[1.2rem] font-medium md:text-[1.2rem] dark:bg-background"
               autofocus
               placeholder={t("speakers.namePlaceholder")}
               bind:value={editingName}
               oninput={() => (dupRename = null)}
               onkeydown={(e) => {
-                if (e.key === "Enter") commitRename();
+                // 中文输入法选词的 Enter 不算提交(迁移约定)
+                if (e.key === "Enter" && !e.isComposing) commitRename();
                 if (e.key === "Escape") {
                   editingId = null;
                   dupRename = null;
@@ -528,52 +548,57 @@
                 </div>
                 {#if dupRename.others.length === 1}
                   <div class="confirm-row">
-                    <button class="mini accent" onmousedown={(e) => e.preventDefault()} onclick={() => dupMerge(dupRename!.others[0])}>{t("speakers.dupMergeYes")}</button>
-                    <button class="mini" onmousedown={(e) => e.preventDefault()} onclick={dupKeep}>{t("speakers.dupKeepNo")}</button>
-                    <button
-                      class="mini quiet"
+                    <Button variant="default" size="sm" onmousedown={(e) => e.preventDefault()} onclick={() => dupMerge(dupRename!.others[0])}>{t("speakers.dupMergeYes")}</Button>
+                    <Button variant="outline" size="sm" onmousedown={(e) => e.preventDefault()} onclick={dupKeep}>{t("speakers.dupKeepNo")}</Button>
+                    <Button
+                      variant="ghost"
+                      size="sm" class="text-[var(--ink-faint)]"
                       onmousedown={(e) => e.preventDefault()}
                       onclick={() => {
                         editingId = null;
                         dupRename = null;
-                      }}>{t("speakers.cancel")}</button
-                    >
+                      }}>{t("speakers.cancel")}</Button>
                   </div>
                 {:else}
                   {#each dupRename.others as o (o.id)}
                     <div class="confirm-row">
-                      <button class="mini accent" onmousedown={(e) => e.preventDefault()} onclick={() => dupMerge(o)}>
+                      <Button variant="default" size="sm" onmousedown={(e) => e.preventDefault()} onclick={() => dupMerge(o)}>
                         {t("speakers.dupMergeThis", {
                           date: formatDate(o.last_seen),
                           dur: formatDuration(Math.floor(o.total_ms / 1000)),
                         })}
-                      </button>
+                      </Button>
                     </div>
                   {/each}
                   <div class="confirm-row">
-                    <button class="mini" onmousedown={(e) => e.preventDefault()} onclick={dupKeep}>{t("speakers.dupKeepNone")}</button>
-                    <button
-                      class="mini quiet"
+                    <Button variant="outline" size="sm" onmousedown={(e) => e.preventDefault()} onclick={dupKeep}>{t("speakers.dupKeepNone")}</Button>
+                    <Button
+                      variant="ghost"
+                      size="sm" class="text-[var(--ink-faint)]"
                       onmousedown={(e) => e.preventDefault()}
                       onclick={() => {
                         editingId = null;
                         dupRename = null;
-                      }}>{t("speakers.cancel")}</button
-                    >
+                      }}>{t("speakers.cancel")}</Button>
                   </div>
                 {/if}
               </div>
             {/if}
           {:else if person.name}
-            <button class="name-btn" title={t("speakers.clickRename")} onclick={beginRename}>
+            <Button
+              variant="ghost"
+              class="group/name -mx-[0.35em] -my-[0.05em] h-auto gap-[0.4em] rounded-sm px-[0.35em] py-[0.05em] text-inherit hover:bg-[var(--accent-tint)] dark:hover:bg-[var(--accent-tint)]"
+              title={t("speakers.clickRename")}
+              onclick={beginRename}
+            >
               <h1>{person.name}</h1>
-              <svg class="pencil" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <svg class="text-[var(--ink-faint)] group-hover/name:text-ring" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M11.3 2.4l2.3 2.3L5.3 13l-3 .7.7-3z" />
               </svg>
-            </button>
+            </Button>
           {:else}
             <h1 class="unnamed">{t("speakers.personFallback", { n: person.id.replace(/^P/, "") })}</h1>
-            <button class="name-cta" onclick={beginRename}>{t("speakers.nameCta")}</button>
+            <Button size="sm" class="rounded-full px-[0.9em] shadow-[var(--shadow-btn)]" onclick={beginRename}>{t("speakers.nameCta")}</Button>
           {/if}
         </div>
         <div class="meta-line">
@@ -585,7 +610,7 @@
             dur: formatDuration(Math.floor(person.total_ms / 1000)),
           })}</span>
           {#each person.sources as s (s)}
-            <span class="badge">{sourceLabel(s)}</span>
+            <Badge variant="secondary" class="h-auto rounded-md bg-[var(--surface-press)] px-[0.5em] py-[0.02em] text-[0.78rem] font-normal text-muted-foreground">{sourceLabel(s)}</Badge>
           {/each}
         </div>
         {#if !person.name}
@@ -611,9 +636,10 @@
             </span>
             {#if (people.find((o) => o.id === other.id)?.sample_paths.length ?? 0) > 0}
               <!-- 对方原声试听:不听没法拍板该不该合 -->
-              <button
-                class="listen-mini"
-                class:playing={ctxPlayingId === other.id}
+              <Button
+                variant="outline"
+                size="icon-xs"
+                class={listenMiniClass(ctxPlayingId === other.id)}
                 title={ctxPlayingId === other.id ? t("speakers.stop") : t("speakers.auditionOther")}
                 aria-label={ctxPlayingId === other.id ? t("speakers.stop") : t("speakers.auditionOther")}
                 onclick={() => toggleCtxSample(other.id)}
@@ -623,15 +649,15 @@
                 {:else}
                   <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" /></svg>
                 {/if}
-              </button>
+              </Button>
             {/if}
-            <button
-              class="mini accent"
+            <Button
+              variant="default"
+              size="sm"
               disabled={recording.isLive}
               title={recording.isLive ? t("speakers.noMergeWhileRecording") : t("speakers.ctxMergeTitle")}
-              onclick={() => applyCtxSuggestion(s)}>{t("speakers.merge")}</button
-            >
-            <button class="mini" onclick={() => tidy.ignore(s)}>{t("speakers.ignore")}</button>
+              onclick={() => applyCtxSuggestion(s)}>{t("speakers.merge")}</Button>
+            <Button variant="outline" size="sm" onclick={() => tidy.ignore(s)}>{t("speakers.ignore")}</Button>
           </div>
         {/each}
         {#if sameName}
@@ -643,9 +669,10 @@
               })}
             </span>
             {#if sameName.sample_paths.length > 0}
-              <button
-                class="listen-mini"
-                class:playing={ctxPlayingId === sameName.id}
+              <Button
+                variant="outline"
+                size="icon-xs"
+                class={listenMiniClass(ctxPlayingId === sameName.id)}
                 title={ctxPlayingId === sameName.id ? t("speakers.stop") : t("speakers.auditionOther")}
                 aria-label={ctxPlayingId === sameName.id ? t("speakers.stop") : t("speakers.auditionOther")}
                 onclick={() => toggleCtxSample(sameName.id)}
@@ -655,9 +682,9 @@
                 {:else}
                   <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" /></svg>
                 {/if}
-              </button>
+              </Button>
             {/if}
-            <a class="mini ctx-link" href="/speakers/{sameName.id}">{t("speakers.viewOther")}</a>
+            <Button variant="outline" size="sm" href="/speakers/{sameName.id}">{t("speakers.viewOther")}</Button>
           </div>
         {/if}
       </div>
@@ -678,9 +705,9 @@
             <span class="status">{sampleMsg || rebuildMsg}</span>
           {/if}
           {#if person.sample_paths.length > 0}
-            <button class="mini quiet" disabled={rebuilding || sampleJobRunning || recording.isLive} title={t("speakers.rebuildTitle")} onclick={doRebuildFromSamples}>
+            <Button variant="ghost" size="sm" class="text-[var(--ink-faint)]" disabled={rebuilding || sampleJobRunning || recording.isLive} title={t("speakers.rebuildTitle")} onclick={doRebuildFromSamples}>
               {t("speakers.rebuildFromSamples")}
-            </button>
+            </Button>
           {/if}
         </div>
       </div>
@@ -690,9 +717,10 @@
             {@const origin = person.sample_notes[i] ?? null}
             {@const date = formatDate(person.sample_dates[i] ?? "")}
             <li class="sample-row" class:active={moveSampleIdx === i || confirmSampleIdx === i} class:playing={playingIdx === i}>
-              <button
-                class="play"
-                class:playing={playingIdx === i}
+              <Button
+                variant="outline"
+                size="icon"
+                class={playBtnClass(playingIdx === i)}
                 title={playingIdx === i ? t("speakers.stop") : t("speakers.playSample")}
                 aria-label={playingIdx === i ? t("speakers.stop") : t("speakers.playSample")}
                 onclick={() => toggleSample(i)}
@@ -704,7 +732,7 @@
                     <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
                   </svg>
                 {/if}
-              </button>
+              </Button>
               <div class="sample-main">
                 <div class="sample-title">
                   <span class="sample-name">{t("speakers.sampleN", { n: i + 1 })}</span>
@@ -724,21 +752,53 @@
               <div class="sample-ops">
                 {#if confirmSampleIdx === i}
                   <span class="confirm-text">{t("speakers.deleteSampleConfirm")}</span>
-                  <button class="mini danger" onclick={() => doDeleteSample(i)}>{t("speakers.confirmDelete")}</button>
-                  <button class="mini" onclick={() => (confirmSampleIdx = null)}>{t("speakers.cancel")}</button>
+                  <Button variant="destructive" size="sm" onclick={() => doDeleteSample(i)}>{t("speakers.confirmDelete")}</Button>
+                  <Button variant="outline" size="sm" onclick={() => (confirmSampleIdx = null)}>{t("speakers.cancel")}</Button>
                 {:else}
-                  <button
-                    class="mini"
-                    disabled={recording.isLive || moving || others.length === 0}
-                    title={recording.isLive ? t("speakers.noMergeWhileRecording") : t("speakers.moveSample")}
-                    onclick={() => {
-                      const opening = moveSampleIdx !== i;
+                  <!-- 归到别人:与「合并到…」同一套选人菜单;选定后二段确认。开合仍归 moveSampleIdx 管,
+                       点外面/Esc 经 onOpenChange 走 closeAllOps(旧透明遮罩的语义)。 -->
+                  <Popover.Root
+                    open={moveSampleIdx === i}
+                    onOpenChange={(open) => {
                       closeAllOps();
-                      if (opening) moveSampleIdx = i;
-                    }}>{t("speakers.moveSample")}</button
+                      if (open) moveSampleIdx = i;
+                    }}
                   >
-                  <button
-                    class="icon-btn danger-hover"
+                    <Popover.Trigger>
+                      {#snippet child({ props })}
+                        <Button
+                          {...props}
+                          variant="outline"
+                          size="sm"
+                          disabled={recording.isLive || moving || others.length === 0}
+                          title={recording.isLive ? t("speakers.noMergeWhileRecording") : t("speakers.moveSample")}
+                        >{t("speakers.moveSample")}</Button>
+                      {/snippet}
+                    </Popover.Trigger>
+                    <Popover.Content align="end" class={menuContentClass}>
+                      {#if !moveTarget}
+                        <div class="menu-title">{t("speakers.moveSampleTitle", { n: i + 1 })}</div>
+                        <!-- svelte-ignore a11y_autofocus -->
+                        <Input class="mb-1" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={moveQuery} />
+                        <PersonPickList people={others} query={moveQuery} onpick={(p) => (moveTarget = p.id)} />
+                      {:else}
+                        {@const target = people.find((o) => o.id === moveTarget)}
+                        <div class="menu-title confirm-title">
+                          {t("speakers.moveSampleConfirm", { n: i + 1, name: target ? displayName(target) : "?" })}
+                        </div>
+                        <div class="confirm-row">
+                          <Button variant="default" size="sm" disabled={moving} onclick={doMoveSample}>
+                            {moving ? t("speakers.rebuilding") : t("speakers.moveSampleGo")}
+                          </Button>
+                          <Button variant="outline" size="sm" onclick={closeAllOps}>{t("speakers.cancel")}</Button>
+                        </div>
+                      {/if}
+                    </Popover.Content>
+                  </Popover.Root>
+                  <Button
+                    variant="outline"
+                    size="icon-sm"
+                    class="size-[1.7rem] text-muted-foreground hover:border-destructive hover:text-destructive"
                     title={t("speakers.deleteSample")}
                     aria-label={t("speakers.deleteSample")}
                     onclick={() => {
@@ -749,36 +809,9 @@
                     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
                       <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.6 8h4.8l.6-8" />
                     </svg>
-                  </button>
+                  </Button>
                 {/if}
               </div>
-              {#if moveSampleIdx === i}
-                <!-- 归到别人:与「合并到…」同一套选人菜单;选定后二段确认 -->
-                <div class="merge-anchor sample-move">
-                  <button class="menu-scrim" aria-label={t("speakers.closeMenu")} onclick={closeAllOps}></button>
-                  {#if !moveTarget}
-                    <div class="menu">
-                      <div class="menu-title">{t("speakers.moveSampleTitle", { n: i + 1 })}</div>
-                      <!-- svelte-ignore a11y_autofocus -->
-                      <input class="pick-input" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={moveQuery} />
-                      <PersonPickList people={others} query={moveQuery} onpick={(p) => (moveTarget = p.id)} />
-                    </div>
-                  {:else}
-                    {@const target = people.find((o) => o.id === moveTarget)}
-                    <div class="menu confirm">
-                      <div class="menu-title">
-                        {t("speakers.moveSampleConfirm", { n: i + 1, name: target ? displayName(target) : "?" })}
-                      </div>
-                      <div class="confirm-row">
-                        <button class="mini accent" disabled={moving} onclick={doMoveSample}>
-                          {moving ? t("speakers.rebuilding") : t("speakers.moveSampleGo")}
-                        </button>
-                        <button class="mini" onclick={closeAllOps}>{t("speakers.cancel")}</button>
-                      </div>
-                    </div>
-                  {/if}
-                </div>
-              {/if}
             </li>
           {/each}
         </ul>
@@ -819,38 +852,40 @@
         <h2 class="panel-title">{t("speakers.manage")}</h2>
       </div>
       <div class="ops">
-        <div class="merge-anchor">
-          <button
-            class="op-btn"
-            disabled={others.length === 0 || recording.isLive}
-            title={recording.isLive
-              ? t("speakers.noMergeWhileRecording")
-              : others.length === 0
-                ? t("speakers.noOthers")
-                : t("speakers.mergeTitle")}
-            onclick={() => {
-              const opening = !mergeOpen;
-              closeAllOps();
-              mergeOpen = opening;
-            }}
-          >
-            {t("speakers.mergeTo")}
-          </button>
-          {#if mergeOpen || pendingMergeWinner}
-            <!-- 透明遮罩:点击菜单外任意处关闭(popover 惯例;此前只能再点一次按钮) -->
-            <button class="menu-scrim" aria-label={t("speakers.closeMenu")} onclick={closeAllOps}></button>
-          {/if}
-          {#if mergeOpen && !pendingMergeWinner}
-            <div class="menu">
+        <!-- 合并到…:开合仍归 mergeOpen/pendingMergeWinner 管;点外面/Esc 经 onOpenChange 走
+             closeAllOps(旧透明遮罩的语义),再点按钮同样收起。 -->
+        <Popover.Root
+          open={mergeOpen || Boolean(pendingMergeWinner)}
+          onOpenChange={(open) => {
+            closeAllOps();
+            mergeOpen = open;
+          }}
+        >
+          <Popover.Trigger>
+            {#snippet child({ props })}
+              <Button
+                {...props}
+                variant="outline"
+                disabled={others.length === 0 || recording.isLive}
+                title={recording.isLive
+                  ? t("speakers.noMergeWhileRecording")
+                  : others.length === 0
+                    ? t("speakers.noOthers")
+                    : t("speakers.mergeTitle")}
+              >
+                {t("speakers.mergeTo")}
+              </Button>
+            {/snippet}
+          </Popover.Trigger>
+          <Popover.Content align="start" class={menuContentClass}>
+            {#if !pendingMergeWinner}
               <div class="menu-title">{t("speakers.mergeInto", { name: displayName(person) })}</div>
               <!-- svelte-ignore a11y_autofocus -->
-              <input class="pick-input" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={mergeQuery} />
+              <Input class="mb-1" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={mergeQuery} />
               <PersonPickList people={others} query={mergeQuery} onpick={(p) => (pendingMergeWinner = p.id)} />
-            </div>
-          {:else if pendingMergeWinner}
-            {@const target = people.find((o) => o.id === pendingMergeWinner)}
-            <div class="menu confirm">
-              <div class="menu-title">
+            {:else}
+              {@const target = people.find((o) => o.id === pendingMergeWinner)}
+              <div class="menu-title confirm-title">
                 {t("speakers.confirmMergeTitle", { name: target ? displayName(target) : "?" })}
                 {#if mergePreview}{t("speakers.confirmMergePreview", {
                     name: mergePreview.name || t("speakers.unnamed"),
@@ -862,25 +897,26 @@
                 <div class="menu-note">{t("speakers.reverseNote")}</div>
               {/if}
               <div class="confirm-row">
-                <button class="mini danger" disabled={merging} onclick={doMerge}>
+                <Button variant="destructive" size="sm" disabled={merging} onclick={doMerge}>
                   {merging ? t("speakers.merging") : t("speakers.confirmMerge")}
-                </button>
-                <button class="mini" onclick={closeAllOps}>{t("speakers.cancel")}</button>
+                </Button>
+                <Button variant="outline" size="sm" onclick={closeAllOps}>{t("speakers.cancel")}</Button>
               </div>
-            </div>
-          {/if}
-        </div>
+            {/if}
+          </Popover.Content>
+        </Popover.Root>
 
         {#if confirmDelete}
           <div class="confirm-inline">
             <!-- 删除后果一句话说清:笔记文字不动,只是不再认得这个人 -->
             <span class="delete-hint">{t("speakers.deleteHint")}</span>
-            <button class="mini danger" onclick={doDelete}>{t("speakers.confirmDelete")}</button>
-            <button class="mini" onclick={() => (confirmDelete = false)}>{t("speakers.cancel")}</button>
+            <Button variant="destructive" size="sm" onclick={doDelete}>{t("speakers.confirmDelete")}</Button>
+            <Button variant="outline" size="sm" onclick={() => (confirmDelete = false)}>{t("speakers.cancel")}</Button>
           </div>
         {:else}
-          <button
-            class="op-btn danger-hover"
+          <Button
+            variant="outline"
+            class="hover:border-destructive hover:bg-transparent hover:text-destructive dark:hover:bg-transparent"
             disabled={recording.isLive}
             title={recording.isLive ? t("speakers.noDeleteWhileRecording") : t("speakers.deleteTitle")}
             onclick={() => {
@@ -889,7 +925,7 @@
             }}
           >
             {t("speakers.deleteFromList")}
-          </button>
+          </Button>
         {/if}
       </div>
     </section>
@@ -951,17 +987,6 @@
     line-height: 1.45;
     padding: 0 0.5rem 0.35rem;
   }
-  .mini.accent {
-    border-color: var(--accent);
-    color: var(--accent);
-    font-weight: 500;
-  }
-  .mini.accent:hover {
-    background: var(--accent-tint);
-  }
-  .mini.quiet {
-    color: var(--ink-faint);
-  }
   .delete-hint {
     color: var(--warning-ink);
     font-size: 0.78rem;
@@ -991,88 +1016,13 @@
   .ctx-text a {
     color: var(--accent);
   }
-  .ctx-link {
-    text-decoration: none;
-    display: inline-flex;
-    align-items: center;
-  }
-  /* 行内试听小钮(与概览整理卡同形态):圆形图标钮,播放中 accent */
-  .listen-mini {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 1.35rem;
-    height: 1.35rem;
-    padding: 0;
-    flex: none;
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-full);
-    background: transparent;
-    color: var(--ink-secondary);
-    cursor: pointer;
-  }
-  .listen-mini:hover {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .listen-mini.playing {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
   h1 {
     margin: 0;
     display: inline;
   }
-  /* editable-text:静态无边,hover accent-tint 底 */
-  .name-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4em;
-    background: none;
-    border: none;
-    color: inherit;
-    cursor: pointer;
-    border-radius: var(--radius-sm);
-    padding: 0.05em 0.35em;
-    margin: -0.05em -0.35em;
-  }
-  .name-btn:hover {
-    background: var(--accent-tint);
-  }
-  .pencil {
-    color: var(--ink-faint);
-  }
-  .name-btn:hover .pencil {
-    color: var(--accent);
-  }
   .unnamed {
     font-style: italic;
     color: var(--ink-faint);
-  }
-  .name-cta {
-    background: var(--primary);
-    color: var(--on-primary);
-    border: none;
-    border-radius: var(--radius-full);
-    padding: 0.2em 0.9em;
-    font-size: 0.88rem;
-    font-weight: 500;
-    cursor: pointer;
-    box-shadow: var(--shadow-btn);
-  }
-  .name-cta:hover {
-    background: var(--primary-pressed);
-  }
-  .name-input {
-    font: inherit;
-    font-weight: 500;
-    font-size: 1.2rem;
-    border: 1px solid var(--accent);
-    border-radius: var(--radius-md);
-    background: var(--canvas);
-    color: var(--ink);
-    padding: 0.1em 0.4em;
-    min-width: 13rem;
   }
   .meta-line {
     color: var(--ink-faint);
@@ -1082,13 +1032,6 @@
     align-items: center;
     gap: 0.4rem;
     flex-wrap: wrap;
-  }
-  .badge {
-    font-size: 0.78rem;
-    border-radius: var(--radius-md);
-    padding: 0.02em 0.5em;
-    background: var(--surface-press);
-    color: var(--ink-secondary);
   }
   .naming-hint {
     color: var(--ink-secondary);
@@ -1222,32 +1165,6 @@
   .sample-row.playing {
     background: var(--accent-tint);
   }
-  .play {
-    width: 2.1rem;
-    height: 2.1rem;
-    border-radius: var(--radius-full);
-    border: 1px solid var(--hairline-strong);
-    background: var(--surface-press);
-    color: var(--ink);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    cursor: pointer;
-    transition: background 0.12s ease, border-color 0.12s ease, transform 0.08s ease;
-  }
-  .play:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  .play:active {
-    transform: scale(0.94);
-  }
-  .play.playing {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: var(--on-accent);
-  }
   .sample-main {
     min-width: 0;
     display: flex;
@@ -1317,33 +1234,6 @@
     font-size: 0.78rem;
     margin-right: 0.2rem;
   }
-  .icon-btn {
-    width: 1.7rem;
-    height: 1.7rem;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--ink-secondary);
-    cursor: pointer;
-  }
-  .icon-btn:hover {
-    background: var(--surface-press);
-    color: var(--ink);
-  }
-  .icon-btn.danger-hover:hover {
-    color: var(--danger);
-    border-color: var(--danger);
-  }
-  .sample-move {
-    position: absolute;
-    left: 2.9rem;
-    top: 100%;
-    z-index: 5;
-  }
   /* ── 会议列表:整行可点,标题 · 日期 · 箭头 ── */
   .appear-list {
     list-style: none;
@@ -1409,43 +1299,8 @@
     gap: 0.6rem;
     flex-wrap: wrap;
   }
-  /* 操作按钮:secondary 形态;删除 hover 变 danger */
-  .op-btn {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink);
-    border-radius: var(--radius-md);
-    font-size: 0.85rem;
-    font-weight: 500;
-    padding: 0.3em 0.9em;
-    cursor: pointer;
-  }
-  .op-btn:hover:not(:disabled) {
-    background: var(--surface-soft);
-  }
-  .op-btn:disabled {
-    color: var(--ink-faint);
-    cursor: default;
-  }
-  .op-btn.danger-hover:hover:not(:disabled) {
-    color: var(--danger);
-    border-color: var(--danger);
-    background: transparent;
-  }
-  /* menu/popover:surface-press 底(暗色下 canvas 会成"洞") */
-  .merge-anchor {
-    position: relative;
-  }
-  /* 全屏透明遮罩:承接"点击外部关闭",在菜单(z-index 10)之下 */
-  .menu-scrim {
-    position: fixed;
-    inset: 0;
-    z-index: 9;
-    border: 0;
-    padding: 0;
-    background: transparent;
-    cursor: default;
-  }
+  /* 改名重名确认条(.dup-menu)仍是行内浮层:surface-press 底(暗色下 canvas 会成"洞");
+     合并/归到别人两个选人菜单已换 Popover */
   .menu {
     position: absolute;
     top: calc(100% + 4px);
@@ -1466,24 +1321,7 @@
     line-height: 1.45;
     padding: 0.25rem 0.5rem 0.35rem;
   }
-  /* 检索输入:与 SpeakerChips .panel-input 同形态(无框,面板本身即聚焦语境) */
-  .pick-input {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 0.35rem 0.5rem;
-    margin-bottom: 0.25rem;
-    background: transparent;
-    border: none;
-    border-bottom: 1px solid var(--hairline);
-    outline: none;
-    font: inherit;
-    font-size: 0.85rem;
-    color: var(--ink);
-  }
-  .pick-input::placeholder {
-    color: var(--ink-faint);
-  }
-  .menu.confirm .menu-title {
+  .confirm-title {
     color: var(--warning-ink);
   }
   .confirm-row {
@@ -1495,27 +1333,6 @@
     display: flex;
     gap: 0.4rem;
     align-items: center;
-  }
-  .mini {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink);
-    border-radius: var(--radius-md);
-    font-size: 0.8rem;
-    padding: 0.2em 0.7em;
-    cursor: pointer;
-  }
-  .mini:hover {
-    background: var(--surface-soft);
-  }
-  .mini.danger {
-    border-color: var(--danger);
-    color: var(--danger);
-    font-weight: 500;
-  }
-  .mini.danger:hover {
-    background: var(--danger);
-    color: var(--on-record);
   }
   .empty {
     background: var(--surface);

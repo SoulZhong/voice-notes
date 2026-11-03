@@ -4,7 +4,8 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import { recording } from "$lib/recording.svelte";
-  import { applyTheme } from "$lib/theme";
+  import { applyTheme, normalizeFamily, type ThemeFamily } from "$lib/theme";
+  import ThemeFamilyPicker from "$lib/ThemeFamilyPicker.svelte";
   import { i18n, t } from "$lib/i18n/index.svelte";
   import { acceleratorFromEvent, displayShortcut } from "$lib/shortcut";
   import {
@@ -44,8 +45,19 @@
   import Segmented from "$lib/Segmented.svelte";
   import { applyTelemetrySetting, reportError } from "$lib/analytics";
   import type { SegmentedItem } from "$lib/segmented";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import { Switch } from "$lib/ui/components/switch";
+  import { Progress } from "$lib/ui/components/progress";
+  import * as RadioGroup from "$lib/ui/components/radio-group";
+  import { cn } from "$lib/ui/utils";
 
   let settings = $state<Settings | null>(null);
+
+  // 文字链式按钮(行级删除/取消/复制):Button link 变体 + 本应用链接蓝(ring = --accent)。
+  const linkCls = "h-auto px-[0.3em] py-[0.2em] text-[0.85rem] font-normal text-ring";
+  const linkDangerCls = cn(linkCls, "text-destructive");
+  const badgeLinkCls = "h-auto px-[0.2em] py-0 text-[length:inherit] font-normal text-ring";
 
   // —— 关于 / 更新 ——
   let appVersion = $state("");
@@ -144,6 +156,7 @@
   // 勾选/选中改到新态),本地 state 显式改回旧值必触发 DOM 对齐——与 asrChoice 同理。
   /** 外观主题 radio:"light" | "dark" | "system"。 */
   let themeChoice = $state("system");
+  let familyChoice = $state<ThemeFamily>("classic");
   /** UI 语言 radio:"system" | "zh" | "en"。 */
   let langChoice = $state("system");
   /** 设置开关的本地镜像(为什么用本地 state 见上方注释)。 */
@@ -313,6 +326,19 @@
     { id: "volcano", label: t("settings.cloud.volcano"), disabled: recording.isLive || !settings },
     { id: "aliyun", label: t("settings.cloud.aliyun"), disabled: recording.isLive || !settings },
   ]);
+  // 本地识别引擎:原 radio 组(bind:group + onchange=changeAsr)改走 Segmented,同一套
+  // 「录制中/未回填即禁用」纪律;Apple 项仅在系统引擎可用/可下载时出现(showAppleAsr)。
+  // 引擎名是专有名词,不进字典(与原 radio 版一致)。
+  const asrEngineItems = $derived<SegmentedItem[]>([
+    ...(showAppleAsr
+      ? [{ id: "apple", label: t("settings.asr.appleLabel"), disabled: recording.isLive || !settings }]
+      : []),
+    { id: "sense_voice", label: "SenseVoice", disabled: recording.isLive || !settings },
+    { id: "whisper", label: "Whisper", disabled: recording.isLive || !settings },
+    { id: "paraformer", label: "Paraformer", disabled: recording.isLive || !settings },
+    { id: "qwen3", label: "Qwen3", disabled: recording.isLive || !settings },
+    { id: "firered", label: "FireRed", disabled: recording.isLive || !settings },
+  ]);
 
   async function refreshSettings() {
     try {
@@ -344,6 +370,7 @@
   /** 把后端真值同步到各本地镜像(初始化 / 保存失败回弹后重新对齐 DOM)。 */
   function syncLocalFromSettings(s: Settings) {
     themeChoice = s.theme;
+    familyChoice = normalizeFamily(s.theme_family);
     langChoice = s.ui_lang;
     langFilter = s.language_filter;
     autoInputPick = s.auto_input_pick;
@@ -556,9 +583,10 @@
     try {
       const fresh = await getSettings();
       fresh.theme = themeChoice;
+      fresh.theme_family = familyChoice;
       await setSettings(fresh);
       settings = fresh;
-      applyTheme(themeChoice);
+      applyTheme(themeChoice, familyChoice);
     } catch (e) {
       error = t("settings.theme.switchFailed", { e });
       settings = await getSettings().catch(() => settings);
@@ -909,12 +937,11 @@
           <span class="row-label">{t("settings.mode.label")}</span>
           <span class="row-desc">{t("settings.mode.desc")}</span>
         </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="ctl"
           checked={full}
           disabled={!settings}
-          onchange={(e) => toggleShowAll((e.target as HTMLInputElement).checked)}
+          onCheckedChange={(on) => toggleShowAll(on)}
         />
       </label>
     </div>
@@ -936,6 +963,20 @@
         />
       </div>
       <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.themeFamily.label")}</span>
+          <span class="row-desc">{t("settings.themeFamily.desc")}</span>
+        </div>
+        <ThemeFamilyPicker
+          value={familyChoice}
+          disabled={!settings}
+          onSelect={(f) => {
+            familyChoice = f;
+            changeTheme();
+          }}
+        />
+      </div>
+      <div class="row">
         <div class="row-info"><span class="row-label">{t("common.language.label")}</span></div>
         <Segmented
           items={langItems}
@@ -952,8 +993,8 @@
           <span class="row-desc">{t("settings.shortcut.desc")}</span>
         </div>
         {#if shortcutEnabled}
-          <input
-            class="shortcut-input"
+          <Input
+            class="ctl h-7 w-40 cursor-pointer text-[0.88rem] md:text-[0.88rem]"
             readonly
             value={capturingShortcut ? "" : displayShortcut(settings?.shortcut ?? "")}
             placeholder={t("settings.shortcut.placeholder")}
@@ -962,13 +1003,12 @@
             onkeydown={onShortcutKeydown}
           />
         {/if}
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="ctl"
           aria-label={t("settings.shortcut.enableAria")}
           bind:checked={shortcutEnabled}
           disabled={!settings}
-          onchange={toggleShortcutEnabled}
+          onCheckedChange={() => toggleShortcutEnabled()}
         />
       </div>
       <div class="row">
@@ -977,8 +1017,8 @@
           <span class="row-desc">{t("memo.settings.desc")}</span>
         </div>
         {#if memoShortcutEnabled}
-          <input
-            class="shortcut-input"
+          <Input
+            class="ctl h-7 w-40 cursor-pointer text-[0.88rem] md:text-[0.88rem]"
             readonly
             value={capturingMemoShortcut ? "" : displayShortcut(settings?.memo_shortcut ?? "")}
             placeholder={t("settings.shortcut.placeholder")}
@@ -987,18 +1027,17 @@
             onkeydown={onMemoShortcutKeydown}
           />
         {/if}
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="ctl"
           aria-label={t("memo.settings.label")}
           bind:checked={memoShortcutEnabled}
           disabled={!settings}
-          onchange={() => void saveMemoShortcut({ enabled: memoShortcutEnabled })}
+          onCheckedChange={() => void saveMemoShortcut({ enabled: memoShortcutEnabled })}
         />
       </div>
       <label class="row">
         <div class="row-info"><span class="row-label">{t("settings.autostart.label")}</span></div>
-        <input type="checkbox" class="ctl switch" bind:checked={autostartEnabled} onchange={toggleAutostart} />
+        <Switch class="ctl" bind:checked={autostartEnabled} onCheckedChange={() => toggleAutostart()} />
       </label>
       {#if full}
       <label class="row">
@@ -1006,12 +1045,11 @@
           <span class="row-label">{t("settings.tray.label")}</span>
           <span class="row-desc">{t("settings.tray.desc")}</span>
         </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="ctl"
           bind:checked={trayEnabled}
           disabled={!settings}
-          onchange={() => saveSetting((s) => (s.tray_enabled = trayEnabled))}
+          onCheckedChange={() => saveSetting((s) => (s.tray_enabled = trayEnabled))}
         />
       </label>
       <!-- 设备(AI Passport 听写)总开关:关掉即隐藏左侧「设备」菜单并断开设备 -->
@@ -1020,13 +1058,11 @@
           <span class="row-label">{t("settings.device.label")}</span>
           <span class="row-desc">{t("settings.device.desc")}</span>
         </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="ctl"
           checked={settings?.device_enabled ?? true}
           disabled={!settings}
-          onchange={async (e) => {
-            const on = (e.target as HTMLInputElement).checked;
+          onCheckedChange={async (on) => {
             await saveSetting((s) => (s.device_enabled = on));
             if (settings) syncUiMode(settings);
           }}
@@ -1040,12 +1076,11 @@
           <span class="row-label">{t("settings.privacy.label")}</span>
           <span class="row-desc">{t("settings.privacy.desc")}</span>
         </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="ctl"
           bind:checked={telemetryEnabled}
           disabled={!settings || telemetrySaving}
-          onchange={async () => {
+          onCheckedChange={async () => {
             // desired 当场定格,后面一律用它:saveSetting 内部会 syncLocalFromSettings,
             // 把 telemetryEnabled 改回磁盘真值,再读共享变量就读到了别人的值
             // (codex review 二轮 P1#2)。同时保存期间禁用控件,不给快速连点留窗口。
@@ -1086,14 +1121,13 @@
           </span>
         </div>
         {#if !showPurge}
-          <button
-            class="btn-secondary row-action"
+          <Button variant="outline" size="sm" class="ctl row-action disabled:pointer-events-auto disabled:cursor-default"
             disabled={recording.isLive}
             title={recording.isLive ? t("settings.store.purgeBlockedRecording") : t("settings.store.purgeTitle")}
             onclick={() => {
               freedText = "";
               showPurge = true;
-            }}>{t("settings.store.purge")}</button
+            }}>{t("settings.store.purge")}</Button
           >
         {/if}
       </div>
@@ -1114,21 +1148,26 @@
     </div>
     {#if showPurge}
       <div class="purge-bar">
-        <div class="purge-choices">
+        <RadioGroup.Root
+          class="flex w-auto flex-wrap gap-x-[1.1rem] gap-y-[0.4rem]"
+          name="purge"
+          orientation="horizontal"
+          bind:value={() => purgeChoice, (v) => (purgeChoice = v as "30" | "90" | "all")}
+        >
           <label class="mini-radio">
-            <input type="radio" name="purge" value="30" bind:group={purgeChoice} />{t("settings.store.purge30")}
+            <RadioGroup.Item value="30" />{t("settings.store.purge30")}
           </label>
           <label class="mini-radio">
-            <input type="radio" name="purge" value="90" bind:group={purgeChoice} />{t("settings.store.purge90")}
+            <RadioGroup.Item value="90" />{t("settings.store.purge90")}
           </label>
           <label class="mini-radio">
-            <input type="radio" name="purge" value="all" bind:group={purgeChoice} />{t("settings.store.purgeAll")}
+            <RadioGroup.Item value="all" />{t("settings.store.purgeAll")}
           </label>
-        </div>
+        </RadioGroup.Root>
         <span class="confirm-text">{t("settings.store.purgeNote")}</span>
         <div class="purge-actions">
-          <button class="link danger" onclick={doPurge}>{t("settings.store.purgeConfirm")}</button>
-          <button class="link" onclick={() => (showPurge = false)}>{t("settings.cancel")}</button>
+          <Button variant="link" size="sm" class={linkDangerCls} onclick={doPurge}>{t("settings.store.purgeConfirm")}</Button>
+          <Button variant="link" size="sm" class={linkCls} onclick={() => (showPurge = false)}>{t("settings.cancel")}</Button>
         </div>
       </div>
     {/if}
@@ -1160,12 +1199,11 @@
             <span class="row-label">{t("settings.calendar.label")}</span>
             <span class="row-desc">{t("settings.calendar.desc")}</span>
           </div>
-          <input
-            type="checkbox"
-            class="ctl switch"
+          <Switch
+            class="ctl"
             bind:checked={calendarMatch}
             disabled={!settings}
-            onchange={() => saveSetting((s) => (s.calendar_match_enabled = calendarMatch))}
+            onCheckedChange={() => saveSetting((s) => (s.calendar_match_enabled = calendarMatch))}
           />
         </label>
         {#if calendarMatch && calPerm === "not_determined"}
@@ -1174,9 +1212,9 @@
               <span class="row-label">{t("settings.calendar.cardTitle")}</span>
               <span class="row-desc">{t("settings.calendar.cardBody")}</span>
             </div>
-            <button class="ctl" disabled={calRequesting} onclick={() => void requestCalendarAuth()}>
+            <Button variant="outline" size="sm" class="ctl" disabled={calRequesting} onclick={() => void requestCalendarAuth()}>
               {calRequesting ? t("settings.calendar.requesting") : t("settings.calendar.cardContinue")}
-            </button>
+            </Button>
           </div>
         {:else if calendarMatch && calPerm === "denied"}
           <div class="row"><div class="row-info"><span class="row-desc">{t("settings.calendar.denied")}</span></div></div>
@@ -1284,13 +1322,15 @@
               {/if}
             </span>
           </div>
-          <button
-            class="btn-secondary"
+          <Button
+            variant="outline"
+            size="sm"
+            class="ctl"
             onclick={doTestCloud}
             disabled={testingCloud || recording.isLive}
           >
             {testingCloud ? t("settings.testing") : t("settings.cloud.test")}
-          </button>
+          </Button>
         </div>
       {/if}
       <!-- 本地引擎选型:local 与 local_cloud 都要(后者实时仍走本地引擎)。 -->
@@ -1312,70 +1352,14 @@
                         : t("settings.asr.senseVoiceDesc")}
             </span>
           </div>
-          <div class="seg" class:disabled={recording.isLive}>
-            {#if showAppleAsr}
-              <label class="seg-item">
-                <input
-                  type="radio"
-                  name="asr"
-                  value="apple"
-                  bind:group={asrChoice}
-                  disabled={recording.isLive || !settings}
-                  onchange={() => changeAsr("apple")}
-                />{t("settings.asr.appleLabel")}
-              </label>
-            {/if}
-            <label class="seg-item">
-              <input
-                type="radio"
-                name="asr"
-                value="sense_voice"
-                bind:group={asrChoice}
-                disabled={recording.isLive || !settings}
-                onchange={() => changeAsr("sense_voice")}
-              />SenseVoice
-            </label>
-            <label class="seg-item">
-              <input
-                type="radio"
-                name="asr"
-                value="whisper"
-                bind:group={asrChoice}
-                disabled={recording.isLive || !settings}
-                onchange={() => changeAsr("whisper")}
-              />Whisper
-            </label>
-            <label class="seg-item">
-              <input
-                type="radio"
-                name="asr"
-                value="paraformer"
-                bind:group={asrChoice}
-                disabled={recording.isLive || !settings}
-                onchange={() => changeAsr("paraformer")}
-              />Paraformer
-            </label>
-            <label class="seg-item">
-              <input
-                type="radio"
-                name="asr"
-                value="qwen3"
-                bind:group={asrChoice}
-                disabled={recording.isLive || !settings}
-                onchange={() => changeAsr("qwen3")}
-              />Qwen3
-            </label>
-            <label class="seg-item">
-              <input
-                type="radio"
-                name="asr"
-                value="firered"
-                bind:group={asrChoice}
-                disabled={recording.isLive || !settings}
-                onchange={() => changeAsr("firered")}
-              />FireRed
-            </label>
-          </div>
+          <Segmented
+            items={asrEngineItems}
+            value={asrChoice}
+            onSelect={(id) => {
+              asrChoice = id;
+              changeAsr(id);
+            }}
+          />
         </div>
         {#if asrChoice === "apple" && appleAsr === "needs_download"}
           <div class="row">
@@ -1383,9 +1367,9 @@
               <span class="row-label">{t("settings.asr.appleInstallLabel")}</span>
               <span class="row-desc">{t("settings.asr.appleInstallDesc")}</span>
             </div>
-            <button class="btn-secondary" onclick={doInstallAppleAsr} disabled={installingAppleAsr}>
+            <Button variant="outline" size="sm" class="ctl" onclick={doInstallAppleAsr} disabled={installingAppleAsr}>
               {installingAppleAsr ? t("settings.asr.appleInstalling") : t("settings.asr.appleInstall")}
-            </button>
+            </Button>
           </div>
         {/if}
         {#if asrChoice === "qwen3"}
@@ -1438,9 +1422,9 @@
             })}
           </span>
           <div class="purge-actions">
-            <button class="link" onclick={doRebuildVoiceprints} disabled={rebuilding || recording.isLive}>
+            <Button variant="link" size="sm" class={linkCls} onclick={doRebuildVoiceprints} disabled={rebuilding || recording.isLive}>
               {t("settings.speaker.rebuildNow")}
-            </button>
+            </Button>
           </div>
         </div>
       {/if}
@@ -1457,8 +1441,8 @@
               : t("settings.speaker.confirmText", { n: speakerNoSampleCount })}
           </span>
           <div class="purge-actions">
-            <button class="link danger" onclick={confirmSpeakerModelChange}>{t("settings.speaker.confirmSwitch")}</button>
-            <button class="link" onclick={cancelSpeakerModelChange}>{t("settings.cancel")}</button>
+            <Button variant="link" size="sm" class={linkDangerCls} onclick={confirmSpeakerModelChange}>{t("settings.speaker.confirmSwitch")}</Button>
+            <Button variant="link" size="sm" class={linkCls} onclick={cancelSpeakerModelChange}>{t("settings.cancel")}</Button>
           </div>
         </div>
       {/if}
@@ -1493,18 +1477,17 @@
           {#if refineOn && !refineConfigReady}
             <span class="row-badge">
               {t("settings.refine.notReady")}
-              <button type="button" class="link" onclick={() => goto("/ai")}>
+              <Button variant="link" size="sm" class={badgeLinkCls} onclick={() => goto("/ai")}>
                 {t("settings.refine.goConfig")}
-              </button>
+              </Button>
             </span>
           {/if}
         </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="ctl"
           bind:checked={refineOn}
           disabled={!settings}
-          onchange={() => saveSetting((s) => (s.refine_enabled = refineOn))}
+          onCheckedChange={() => saveSetting((s) => (s.refine_enabled = refineOn))}
         />
       </div>
     </div>
@@ -1527,7 +1510,7 @@
           <span class="row-desc">{modelsSummary}</span>
         </div>
         {#if missingRequired.length > 0 && downloadingAll.length === 0}
-          <button class="btn-secondary row-action" onclick={downloadMissing}>{t("settings.models.download")}</button>
+          <Button variant="outline" size="sm" class="ctl row-action disabled:pointer-events-auto disabled:cursor-default" onclick={downloadMissing}>{t("settings.models.download")}</Button>
         {/if}
       </div>
     </div>
@@ -1571,22 +1554,21 @@
                     · {t("settings.models.mirrorSwitched")}
                   {/if}
                 </span>
-                <div class="bar"><div class="fill" style="width:{pct(prog[a.id])}%"></div></div>
+                <Progress value={pct(prog[a.id])} class="mt-1 h-1.5" />
                 <!-- 镜像僵死等场景的逃生口:后端置取消标志,worker 发 cancelled 事件清本行。
                      已下字节保留在 .part,再点下载走 Range 续传不白费。 -->
                 {#if prog[a.id].phase === "downloading"}
-                  <button class="link" onclick={() => cancelModelsDownload()}>{t("settings.cancel")}</button>
+                  <Button variant="link" size="sm" class={linkCls} onclick={() => cancelModelsDownload()}>{t("settings.cancel")}</Button>
                 {/if}
               </div>
             {:else if a.present}
               {#if confirmDeleteId === a.id}
                 <div class="confirm-inline">
-                  <button class="link danger" onclick={() => doDelete(a.id)}>{t("settings.models.confirmDelete")}</button>
-                  <button class="link" onclick={() => (confirmDeleteId = null)}>{t("settings.cancel")}</button>
+                  <Button variant="link" size="sm" class={linkDangerCls} onclick={() => doDelete(a.id)}>{t("settings.models.confirmDelete")}</Button>
+                  <Button variant="link" size="sm" class={linkCls} onclick={() => (confirmDeleteId = null)}>{t("settings.cancel")}</Button>
                 </div>
               {:else}
-                <button
-                  class="link danger row-action"
+                <Button variant="link" size="sm" class={cn(linkDangerCls, "row-action disabled:pointer-events-auto disabled:cursor-default")}
                   disabled={recording.isLive || downloadingActive}
                   title={recording.isLive
                     ? t("settings.models.deleteBlockedRecording")
@@ -1595,11 +1577,11 @@
                       : t("settings.models.deleteTitle")}
                   onclick={() => {
                     confirmDeleteId = a.id;
-                  }}>{t("settings.models.delete")}</button
+                  }}>{t("settings.models.delete")}</Button
                 >
               {/if}
             {:else}
-              <button class="btn-secondary" onclick={() => download(a.id)}>{t("settings.models.download")}</button>
+              <Button variant="outline" size="sm" class="ctl" onclick={() => download(a.id)}>{t("settings.models.download")}</Button>
             {/if}
           </div>
           {#if expandedId === a.id}
@@ -1607,12 +1589,12 @@
               <div class="url-line">
                 <span class="url-tag">{t("settings.models.originUrl")}</span>
                 <code class="url-text">{a.url}</code>
-                <button class="link" onclick={() => navigator.clipboard.writeText(a.url)}>{t("settings.models.copy")}</button>
+                <Button variant="link" size="sm" class={linkCls} onclick={() => navigator.clipboard.writeText(a.url)}>{t("settings.models.copy")}</Button>
               </div>
               <div class="url-line">
                 <span class="url-tag">{t("settings.models.mirrorUrl")}</span>
                 <code class="url-text">{mirrorUrl(a.url)}</code>
-                <button class="link" onclick={() => navigator.clipboard.writeText(mirrorUrl(a.url))}>{t("settings.models.copy")}</button>
+                <Button variant="link" size="sm" class={linkCls} onclick={() => navigator.clipboard.writeText(mirrorUrl(a.url))}>{t("settings.models.copy")}</Button>
               </div>
             </div>
           {/if}
@@ -1657,12 +1639,11 @@
               <span class="row-label">{t("settings.record.langFilter.label")}</span>
               <span class="row-desc">{t("settings.record.langFilter.desc")}</span>
             </div>
-            <input
-              type="checkbox"
-              class="ctl switch"
+            <Switch
+              class="ctl"
               bind:checked={langFilter}
               disabled={!settings}
-              onchange={() => saveSetting((s) => (s.language_filter = langFilter))}
+              onCheckedChange={() => saveSetting((s) => (s.language_filter = langFilter))}
             />
           </label>
           <label class="row">
@@ -1670,12 +1651,11 @@
               <span class="row-label">{t("settings.record.autoInput.label")}</span>
               <span class="row-desc">{t("settings.record.autoInput.desc")}</span>
             </div>
-            <input
-              type="checkbox"
-              class="ctl switch"
+            <Switch
+              class="ctl"
               bind:checked={autoInputPick}
               disabled={!settings}
-              onchange={() => saveSetting((s) => (s.auto_input_pick = autoInputPick))}
+              onCheckedChange={() => saveSetting((s) => (s.auto_input_pick = autoInputPick))}
             />
           </label>
           <label class="row">
@@ -1683,12 +1663,11 @@
               <span class="row-label">{t("settings.identifyAuto.label")}</span>
               <span class="row-desc">{t("settings.identifyAuto.desc")}</span>
             </div>
-            <input
-              type="checkbox"
-              class="ctl switch"
+            <Switch
+              class="ctl"
               bind:checked={identifyAuto}
               disabled={!settings || !refineOn}
-              onchange={() => saveSetting((s) => (s.identify_auto_apply = identifyAuto))}
+              onCheckedChange={() => saveSetting((s) => (s.identify_auto_apply = identifyAuto))}
             />
           </label>
         </div>
@@ -1720,22 +1699,24 @@
           </span>
         </div>
         {#if updateInfo?.has_update}
-          <button
-            class="btn-secondary"
+          <Button
+            variant="outline"
+            size="sm"
+            class="ctl disabled:pointer-events-auto disabled:cursor-default"
             onclick={doOneClickUpdate}
             disabled={updating || updateBlocked}
             title={updateBlocked ? t("settings.update.blockedRecording") : undefined}
           >
             {updating ? updatingLabel : t("settings.update.oneClick", { v: updateInfo.latest })}
-          </button>
+          </Button>
           {#if updateFallback}
             <!-- 一键失败(签名/网络/latest.json 未就绪)兜底手动路径,绝不堵死更新。 -->
-            <button class="link" onclick={() => updateInfo && openUrl(updateInfo.url)}>{t("settings.update.openRelease")}</button>
+            <Button variant="link" size="sm" class={linkCls} onclick={() => updateInfo && openUrl(updateInfo.url)}>{t("settings.update.openRelease")}</Button>
           {/if}
         {:else}
-          <button class="btn-secondary" disabled={updateChecking} onclick={doCheckUpdate}>
+          <Button variant="outline" size="sm" class="ctl" disabled={updateChecking} onclick={doCheckUpdate}>
             {updateChecking ? t("settings.update.checkingBtn") : t("settings.update.check")}
-          </button>
+          </Button>
         {/if}
       </div>
     </div>
@@ -1750,11 +1731,10 @@
       <span class="row-path">{path}</span>
     </div>
     {#if !(pendingMigrate && pendingMigrate.kind === kind)}
-      <button
-        class="btn-secondary row-action"
+      <Button variant="outline" size="sm" class="ctl row-action disabled:pointer-events-auto disabled:cursor-default"
         disabled={!!migrateBlockReason || !!pendingMigrate}
         title={migrateBlockReason || t("settings.store.changeTitle")}
-        onclick={() => chooseDir(kind)}>{t("settings.store.change")}</button
+        onclick={() => chooseDir(kind)}>{t("settings.store.change")}</Button
       >
     {/if}
   </div>
@@ -1768,8 +1748,8 @@
           >{t("settings.migrate.confirmSuffix")}</span
         >
         <div class="confirm-actions">
-          <button class="btn-primary" onclick={startMigrate}>{t("settings.migrate.start")}</button>
-          <button class="btn-secondary" onclick={() => (pendingMigrate = null)}>{t("settings.cancel")}</button>
+          <Button size="sm" class="ctl rounded-full" onclick={startMigrate}>{t("settings.migrate.start")}</Button>
+          <Button variant="outline" size="sm" class="ctl" onclick={() => (pendingMigrate = null)}>{t("settings.cancel")}</Button>
         </div>
       {/if}
     </div>
@@ -1894,10 +1874,6 @@
     font-size: 0.78rem;
     color: var(--warning-ink);
   }
-  .row-badge .link {
-    font-size: inherit;
-    padding: 0 0.2em;
-  }
   /* 「语音模型」区的存储位置行:整行可点,在文件管理器中打开目录。 */
   .models-path {
     display: flex;
@@ -1924,116 +1900,22 @@
     align-items: baseline;
     gap: 0.6rem;
   }
-  /* 右侧控件与行级操作 */
-  .ctl {
+  /* 右侧控件与行级操作(控件是组件,class 透传到组件根上,须 :global 才能命中) */
+  .row :global(.ctl),
+  .confirm-actions :global(.ctl) {
     flex: none;
     margin: 0;
   }
-  .row-action {
+  .row :global(.row-action) {
     visibility: hidden;
   }
-  .row:hover .row-action {
+  .row:hover :global(.row-action) {
     visibility: visible;
-  }
-  /* segmented(分段选择):surface-press 槽 + 选中项 canvas 浮起,单行放下多选一 */
-  .seg {
-    display: flex;
-    gap: 2px;
-    flex: none;
-    background: var(--surface-press);
-    border-radius: var(--radius-md);
-    padding: 2px;
-  }
-  .seg-item {
-    position: relative;
-    padding: 0.26em 0.7em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    color: var(--ink-secondary);
-    border-radius: calc(var(--radius-md) - 2px);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .seg-item:hover {
-    color: var(--ink);
-  }
-  .seg-item:has(input:checked) {
-    background: var(--canvas);
-    color: var(--ink);
-    box-shadow: var(--shadow-btn);
-  }
-  .seg-item input {
-    position: absolute;
-    opacity: 0;
-    pointer-events: none;
-  }
-  .seg.disabled {
-    opacity: 0.6;
-  }
-  .seg.disabled .seg-item {
-    cursor: default;
   }
   .mtest-ok { color: var(--success, var(--ink-secondary)); }
   .mtest-err { color: var(--danger-ink); }
   /* 行内输入(与 AI 页 .row-input 同款):surface-press 底、无边,聚焦浮出 canvas + accent 环。
      云端 ASR 凭证输入(APP ID / Access Token / API Key)复用此形态。 */
-  /* button-secondary */
-  .btn-secondary {
-    flex: none;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    padding: 0.35em 0.9em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    cursor: pointer;
-    background: transparent;
-    color: var(--ink);
-  }
-  .btn-secondary:hover {
-    background: var(--surface-soft);
-  }
-  .btn-secondary:disabled {
-    opacity: 0.5;
-    cursor: default;
-    background: transparent;
-  }
-  /* button-primary:开始迁移是确认条唯一主动作 */
-  .btn-primary {
-    flex: none;
-    border-radius: var(--radius-full);
-    border: 1px solid transparent;
-    padding: 0.35em 0.9em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    cursor: pointer;
-    background: var(--primary);
-    color: var(--on-primary);
-    box-shadow: var(--shadow-btn);
-  }
-  .btn-primary:hover {
-    background: var(--primary-pressed);
-  }
-  /* button-link:行级删除/取消 */
-  .link {
-    background: none;
-    border: none;
-    font: inherit;
-    font-size: 0.85rem;
-    color: var(--accent);
-    cursor: pointer;
-    padding: 0.2em 0.3em;
-  }
-  .link:hover {
-    text-decoration: underline;
-  }
-  .link.danger {
-    color: var(--danger);
-  }
-  .link:disabled {
-    color: var(--ink-faint);
-    cursor: default;
-    text-decoration: none;
-  }
   .confirm-inline {
     display: flex;
     align-items: center;
@@ -2072,7 +1954,7 @@
     color: var(--warning-ink);
     font-weight: 500;
   }
-  /* 下载进度:轨 hairline、填充 accent、rounded-full(复用 download-card) */
+  /* 下载进度(Progress 组件)所在列 */
   .dl {
     flex: none;
     min-width: 9rem;
@@ -2081,42 +1963,10 @@
     color: var(--ink-secondary);
     font-size: 0.8rem;
   }
-  .bar {
-    height: 6px;
-    background: var(--hairline);
-    border-radius: var(--radius-full);
-    margin-top: 0.25rem;
-    overflow: hidden;
-  }
-  .fill {
-    height: 100%;
-    background: var(--accent);
-    transition: width 0.3s;
-  }
   .lock-hint {
     font-size: 0.8rem;
     color: var(--ink-faint);
     margin: 0.45rem 0 0;
-  }
-  /* 快捷键录入框:input 形态(聚焦浮出 canvas + accent 环) */
-  .shortcut-input {
-    flex: none;
-    width: 10rem;
-    box-sizing: border-box;
-    padding: 0.3em 0.6em;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    background: var(--surface-press);
-    color: var(--ink);
-    font-size: 0.88rem;
-    font-family: -apple-system, system-ui, sans-serif;
-    cursor: pointer;
-  }
-  .shortcut-input:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
-    background: var(--canvas);
   }
   /* 磁盘清理确认条:warning 色系,行内展开三选 + 两段确认 */
   .purge-bar {
@@ -2128,11 +1978,6 @@
     background: var(--warning-tint);
     border: 1px solid var(--warning-line);
     border-radius: var(--radius-lg);
-  }
-  .purge-choices {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem 1.1rem;
   }
   .mini-radio {
     display: flex;

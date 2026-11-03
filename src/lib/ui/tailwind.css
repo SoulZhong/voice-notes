@@ -1,0 +1,99 @@
+/* ============================================================
+ * Tailwind 4 + shadcn-svelte 适配层(UI 改版 #730 一期)
+ *
+ * 1. **不引 Preflight**:全局 reset 会改掉现有每个页面的标题、按钮、列表,还会动
+ *    ProseMirror 正文。只引 theme + utilities 两层;shadcn 组件需要的那一小撮 reset
+ *    (边框实线 0 宽、border-box)只作用在带 data-slot 的组件元素上,见文末。
+ * 2. **颜色唯一真值仍是 app.css 的语义 token**(canvas/surface/ink/accent…)。这里只把
+ *    shadcn 的颜色名映射过去,不另起一套变量:
+ *    - shadcn 的 accent 是「菜单悬停底色」,与本应用 --accent(链接/焦点蓝)不是一个意思,
+ *      所以 --color-accent 映射到 surface-press,**不碰** --accent 本身;
+ *    - 圆角沿用 app.css 的 --radius-sm/md/lg/xl(同名同值,Tailwind 生成的类直接吃它们)。
+ * 3. **dark: 变体跟主题控制器走**(根元素 data-vn-mode,见 src/lib/theme.ts),
+ *    不看 prefers-color-scheme——否则「跟随系统」以外的手动明暗会和组件对不上。
+ * ============================================================ */
+/* 层序必须先声明:没引 tailwindcss/index.css,不写这行的话下面的 @layer base 会排在
+   utilities 之后,组件 reset 反过来盖掉 border/bg 等工具类(实测边框与开关全没了)。 */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+/* 扫描范围:整个 src(页面逐步迁移到组件,不必每迁一页补一条 @source)。但旧页面里有些
+   自定义类名恰好与 Tailwind 工具类同名,全量扫描会为它们生成全局工具类、悄悄改掉旧页面
+   (最危险的是 .container:Tailwind 会给它设 width/max-width,旧页面根容器全叫这个名)。
+   2026-11-04 实测冲突集 = container/hidden/inline/ring,在这里排除;新代码别用这四个裸类名
+   (改用 w-full、sr-only、inline-block、ring-1 等)。判据见 tailwindGuard.test.ts。 */
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
+@source "../../";
+@source not inline("{container,hidden,inline,ring}");
+/* 弹层进出场动画(animate-in/fade-in-0/zoom-in-95…),shadcn 模板依赖它;纯 CSS 无运行时。 */
+@import "tw-animate-css";
+
+@custom-variant dark (&:where([data-vn-mode="dark"], [data-vn-mode="dark"] *));
+
+/* 组件状态变体:shadcn 模板写 data-checked:/data-open: 这类简写(期待布尔属性),而 bits-ui 2
+   实际输出的是 data-state="checked"/"open"/"active"、data-orientation="horizontal"。在这里一次映射,
+   两种写法都认,组件源码不用逐个改(实测开关因此永远画成关)。 */
+@custom-variant data-checked (&:where([data-state="checked"], [data-checked]));
+@custom-variant data-unchecked (&:where([data-state="unchecked"], [data-unchecked]));
+@custom-variant data-open (&:where([data-state="open"], [data-open]));
+@custom-variant data-closed (&:where([data-state="closed"], [data-closed]));
+@custom-variant data-active (&:where([data-state="active"], [data-active]));
+@custom-variant data-horizontal (&:where([data-orientation="horizontal"], [data-horizontal]));
+@custom-variant data-vertical (&:where([data-orientation="vertical"], [data-vertical]));
+
+@theme inline {
+  --color-background: var(--canvas);
+  --color-foreground: var(--ink);
+  --color-card: var(--surface);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--surface);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--on-primary);
+  --color-secondary: var(--surface-soft);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--surface-soft);
+  --color-muted-foreground: var(--ink-secondary);
+  --color-accent: var(--surface-press);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--danger);
+  --color-border: var(--hairline);
+  --color-input: var(--hairline-strong);
+  --color-ring: var(--accent);
+
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+  --radius-xl: var(--radius-xl);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+/* shadcn 组件里有两处直接写了 var(--foreground)/var(--secondary)(color-mix 悬停色),
+   给它们一个落点;两个名字本应用此前都没用过,不冲突。 */
+:root {
+  --foreground: var(--ink);
+  --secondary: var(--surface-soft);
+}
+
+/* 组件专用的最小 reset(替代 Preflight):只管 shadcn/bits 组件自己的元素。 */
+@layer base {
+  [data-slot],
+  [data-slot] *,
+  [data-slot]::before,
+  [data-slot]::after {
+    box-sizing: border-box;
+    border: 0 solid;
+  }
+  /* 弹层(菜单/对话框/选择器)经 portal 挂到 body 下,不在应用外壳里,继承不到外壳字体——
+     不补这一条就落到浏览器默认衬线体(实测下拉菜单)。 */
+  [data-slot] {
+    font-family: var(--font-sans);
+  }
+  [data-slot]:where(button, input, textarea, select),
+  [data-slot] :where(button, input, textarea, select) {
+    font: inherit;
+    color: inherit;
+    background-color: transparent;
+    margin: 0;
+  }
+}

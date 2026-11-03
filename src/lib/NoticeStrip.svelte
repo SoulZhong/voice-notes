@@ -4,6 +4,12 @@
   // 「知道了」按 (笔记, key, epoch) 记在 localStorage,数据变了自动回来。
   import { splitNotices, noticeEpoch, type Notice } from "$lib/notices";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { cn } from "$lib/ui/utils";
+
+  // 行内文字按钮:accent 链接式,字号随通知行;quiet = 「知道了 / 还有 N 条」这类次要动作。
+  const linkBtn = (quiet = false) =>
+    cn("h-auto px-0 py-0 text-[length:inherit] font-normal text-ring", quiet && "opacity-60 hover:opacity-100");
 
   let {
     notices,
@@ -46,16 +52,16 @@
     <div class="n-main">
       <span class="n-text">{n.text}</span>
       {#each n.actions ?? [] as a (a.label)}
-        <button class="link" disabled={a.disabled} onclick={a.run}>{a.label}</button>
+        <Button variant="link" class={linkBtn()} disabled={a.disabled} onclick={a.run}>{a.label}</Button>
       {/each}
       {#if n.level !== "error" && n.dismissible !== false}
-        <button class="link n-quiet" onclick={() => dismiss(n)}>{t("notes.notice.gotIt")}</button>
+        <Button variant="link" class={linkBtn(true)} onclick={() => dismiss(n)}>{t("notes.notice.gotIt")}</Button>
       {/if}
       {#if !sub && view.others.length > 0}
         <span class="n-spacer"></span>
-        <button class="link n-quiet" onclick={() => (expanded = !expanded)}>
+        <Button variant="link" class={linkBtn(true)} aria-expanded={expanded} onclick={() => (expanded = !expanded)}>
           {expanded ? t("notes.notice.collapse") : t("notes.notice.more", { n: view.others.length })}
-        </button>
+        </Button>
       {/if}
     </div>
     {#if sub && n.detail}
@@ -87,10 +93,11 @@
     gap: 4px;
     margin: 6px 0;
   }
+  /* 色值全部走 app.css 语义 token(UI 改版:不再硬编码),双主题与各皮肤自动跟随。 */
   .n-row {
-    border-left: 3px solid var(--n-bar, #8a8a8a);
-    background: var(--n-bg, rgba(255, 255, 255, 0.04));
-    border-radius: 6px;
+    border-left: 3px solid var(--n-bar, var(--hairline-strong));
+    background: var(--n-bg, var(--surface-soft));
+    border-radius: var(--radius-md);
     padding: 5px 10px;
     font-size: 13px;
     line-height: 1.5;
@@ -104,9 +111,6 @@
   .n-spacer {
     flex: 1;
   }
-  .n-quiet {
-    opacity: 0.6;
-  }
   .n-detail {
     opacity: 0.6;
     font-size: 12px;
@@ -116,19 +120,19 @@
     margin-left: 14px;
   }
   .n-error {
-    --n-bar: #e5484d;
-    --n-bg: rgba(229, 72, 77, 0.09);
+    --n-bar: var(--danger);
+    --n-bg: var(--danger-tint);
   }
   .n-action {
-    --n-bar: #d9a521;
-    --n-bg: rgba(217, 165, 33, 0.08);
+    --n-bar: var(--warning-ink);
+    --n-bg: var(--warning-tint);
   }
   .n-suggest {
-    --n-bar: #9a8a4a;
-    --n-bg: rgba(154, 138, 74, 0.06);
+    --n-bar: var(--warning-line);
+    --n-bg: color-mix(in srgb, var(--warning-tint) 60%, transparent);
   }
   .n-info {
-    --n-bar: #6b6f76;
-    --n-bg: rgba(255, 255, 255, 0.03);
+    --n-bar: var(--hairline-strong);
+    --n-bg: var(--surface-soft);
   }
 </style>

@@ -3,6 +3,8 @@
   // 录制中可改文字、可删(删后由页面给「撤销」);时间点在会后笔记页调整。
   import { t } from "$lib/i18n/index.svelte";
   import { editMemo, deleteMemo, fmtClock, MEMO_MAX_CHARS, type Memo } from "$lib/memos";
+  import { Button } from "$lib/ui/components/button";
+  import { Textarea } from "$lib/ui/components/textarea";
 
   let {
     memo,
@@ -58,10 +60,10 @@
   <div class="body">
     {#if editing}
       <!-- svelte-ignore a11y_autofocus -->
-      <textarea
-        class="edit"
+      <Textarea
+        class="min-h-0 resize-y rounded-sm bg-card px-1.5 py-0.5 text-[length:inherit] leading-[inherit] field-sizing-fixed md:text-[length:inherit] dark:bg-card"
         autofocus
-        rows="2"
+        rows={2}
         bind:value={draft}
         onkeydown={(e) => {
           if (e.isComposing) return;
@@ -73,7 +75,7 @@
           }
         }}
         onblur={() => void commit()}
-      ></textarea>
+      />
     {:else if memo.text}
       <span class="text">{memo.text}</span>
     {:else}
@@ -82,8 +84,8 @@
   </div>
   {#if !editing}
     <span class="acts">
-      <button class="act" onclick={begin}>{memo.text ? t("memo.action.edit") : t("memo.action.addText")}</button>
-      <button class="act" onclick={() => void remove()}>{t("memo.action.delete")}</button>
+      <Button variant="ghost" size="xs" class="h-5 px-1 font-normal text-ring hover:text-ring" onclick={begin}>{memo.text ? t("memo.action.edit") : t("memo.action.addText")}</Button>
+      <Button variant="ghost" size="xs" class="h-5 px-1 font-normal text-ring hover:text-ring" onclick={() => void remove()}>{t("memo.action.delete")}</Button>
     </span>
   {/if}
 </div>
@@ -133,17 +135,6 @@
   .marker {
     color: var(--ink-secondary);
   }
-  .edit {
-    width: 100%;
-    box-sizing: border-box;
-    resize: vertical;
-    font: inherit;
-    color: var(--ink);
-    background: var(--surface);
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-sm);
-    padding: 0.2rem 0.4rem;
-  }
   .acts {
     flex: none;
     display: flex;
@@ -154,13 +145,5 @@
   .memo-bookmark:hover .acts,
   .memo-bookmark:focus-within .acts {
     opacity: 1;
-  }
-  .act {
-    border: none;
-    background: none;
-    color: var(--accent);
-    font-size: 0.8rem;
-    cursor: pointer;
-    padding: 0 0.25rem;
   }
 </style>

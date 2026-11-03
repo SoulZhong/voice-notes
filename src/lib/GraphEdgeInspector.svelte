@@ -2,6 +2,7 @@
   import { kindLabel, type GraphEdgeDetailItem } from "$lib/graph";
   import { formatDate, formatDuration } from "$lib/notes";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
 
   let {
     perspective,
@@ -40,7 +41,7 @@
     <p class="eyebrow">{t("graph.edgeDetail.eyebrow")}</p>
     <h2>{title}</h2>
   </div>
-  <button class="close" type="button" aria-label={t("graph.edgeDetail.closeAria")} onclick={onClose}>×</button>
+  <Button variant="ghost" size="icon" class="shrink-0 rounded-full text-lg text-muted-foreground" aria-label={t("graph.edgeDetail.closeAria")} onclick={onClose}>×</Button>
 </header>
 
 <div class="endpoints" aria-label={t("graph.edgeDetail.endpointsAria")}>
@@ -54,7 +55,7 @@
 {:else if error}
   <div class="state" aria-live="polite">
     <p>{error}</p>
-    <button type="button" onclick={onRetry}>{t("graph.retryRead")}</button>
+    <Button variant="outline" size="sm" onclick={onRetry}>{t("graph.retryRead")}</Button>
   </div>
 {:else}
   <div class="list-heading">
@@ -85,19 +86,6 @@
   .header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
   .eyebrow { margin: 0 0 5px; color: var(--ink-faint); font-size: 0.7rem; letter-spacing: 0.08em; }
   h2 { margin: 0; color: var(--ink); font-size: 1.15rem; font-weight: 550; letter-spacing: -0.02em; }
-  .close {
-    width: 36px;
-    height: 36px;
-    padding: 0;
-    border: 0;
-    border-radius: var(--radius-full);
-    background: transparent;
-    color: var(--ink-secondary);
-    font: inherit;
-    font-size: 1.3rem;
-    cursor: pointer;
-  }
-  .close:hover { background: var(--surface-soft); color: var(--ink); }
   .endpoints {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr);
@@ -138,6 +126,5 @@
   li small { flex: none; color: var(--ink-faint); font-size: 0.7rem; white-space: nowrap; }
   .state { margin: 40px 0 0; color: var(--ink-secondary); font-size: 0.84rem; line-height: 1.6; }
   .state p { margin: 0 0 14px; }
-  .state button { min-height: 36px; padding: 7px 12px; border: 1px solid var(--hairline-strong); border-radius: var(--radius-md); background: transparent; color: var(--ink-secondary); font: inherit; cursor: pointer; }
   button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 </style>

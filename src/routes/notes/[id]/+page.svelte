@@ -95,6 +95,10 @@
   import Segmented from "$lib/Segmented.svelte";
   import type { SegmentedItem } from "$lib/segmented";
   import MemoColumn from "$lib/MemoColumn.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import * as DropdownMenu from "$lib/ui/components/dropdown-menu";
+  import * as Popover from "$lib/ui/components/popover";
   import {
     addMemo,
     clampAt,
@@ -2611,19 +2615,24 @@
         <div class="header-main">
           {#if editing}
             <!-- svelte-ignore a11y_autofocus -->
-            <input
-              class="rename"
+            <Input
+              class="rename h-auto rounded-lg border-ring bg-background px-[0.3em] py-[0.1em] text-[1.6em] font-medium md:text-[1.6em] dark:bg-background"
               autofocus
               bind:value={editingTitle}
               onkeydown={(e) => {
-                if (e.key === "Enter") commitRename();
+                if (e.key === "Enter" && !e.isComposing) commitRename();
                 if (e.key === "Escape") editing = false;
               }}
               onblur={commitRename}
             />
           {:else}
             <h1 class="title">
-              <button class="title-btn" title={t("notes.title.renameHint")} onclick={beginRename}>{note.meta.title}</button>
+              <Button
+                variant="ghost"
+                class="title-btn"
+                title={t("notes.title.renameHint")}
+                onclick={beginRename}>{note.meta.title}</Button
+              >
             </h1>
           {/if}
 
@@ -2649,10 +2658,10 @@
                     · {t("notes.calendar.attendeeN", { n: note.meta.calendar.attendees.length })}
                   {/if}
                 </span>
-                <button class="mini plain" disabled={calBusy} onclick={() => void openCalMenu()}>{t("notes.calendar.reselect")}</button>
-                <button class="mini plain" disabled={calBusy} onclick={() => void pickCalEvent(null)}>{t("notes.calendar.clear")}</button>
+                <Button variant="link" size="xs" class="mini h-auto px-0.5 text-ring" disabled={calBusy} onclick={() => void openCalMenu()}>{t("notes.calendar.reselect")}</Button>
+                <Button variant="link" size="xs" class="mini h-auto px-0.5 text-ring" disabled={calBusy} onclick={() => void pickCalEvent(null)}>{t("notes.calendar.clear")}</Button>
               {:else if calPerm === "full"}
-                <button class="mini plain" disabled={calBusy} onclick={() => void openCalMenu()}>{t("notes.calendar.link")}</button>
+                <Button variant="link" size="xs" class="mini h-auto px-0.5 text-ring" disabled={calBusy} onclick={() => void openCalMenu()}>{t("notes.calendar.link")}</Button>
               {:else}
                 <span class="cal-hint">{t("notes.calendar.needAuth")}</span>
               {/if}
@@ -2668,27 +2677,41 @@
                 {#if !a.is_me && (a.name || a.email) && !attendeeRemoved(a)}
                   <span class="att-tag cal" title={t("notes.attendees.fromCalendar")}>
                     {attendeeDisplay(a)}
-                    <button class="att-x" title={t("notes.attendees.removeCal", { name: attendeeDisplay(a) })} onclick={() => void removeCalAttendee(a)}>×</button>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      class="att-x size-4 rounded-full"
+                      title={t("notes.attendees.removeCal", { name: attendeeDisplay(a) })}
+                      aria-label={t("notes.attendees.removeCal", { name: attendeeDisplay(a) })}
+                      onclick={() => void removeCalAttendee(a)}><svg width="8" height="8" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg></Button
+                    >
                   </span>
                 {/if}
               {/each}
               {#if (note.meta.attendees_removed ?? []).length > 0}
-                <button class="att-restore" onclick={() => void restoreCalAttendees()}>
+                <Button variant="link" size="xs" class="att-restore h-auto px-0" onclick={() => void restoreCalAttendees()}>
                   {t("notes.attendees.restoreN", { n: (note.meta.attendees_removed ?? []).length })}
-                </button>
+                </Button>
               {/if}
               {#each note.meta.attendees ?? [] as n (n)}
                 <span class="att-tag">
                   {n}
-                  <button class="att-x" title={t("notes.attendees.remove", { name: n })} onclick={() => removeAttendee(n)}>×</button>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    class="att-x size-4 rounded-full"
+                    title={t("notes.attendees.remove", { name: n })}
+                    aria-label={t("notes.attendees.remove", { name: n })}
+                    onclick={() => removeAttendee(n)}><svg width="8" height="8" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg></Button
+                  >
                 </span>
               {/each}
-              <input
-                class="att-input"
+              <Input
+                class="att-input h-6 w-auto max-w-full min-w-[14em] flex-[1_1_14em] rounded-sm border-transparent bg-transparent px-[0.3em] text-[0.78rem] hover:bg-muted focus-visible:bg-muted md:text-[0.78rem] dark:bg-transparent"
                 placeholder={t("notes.attendees.placeholder")}
                 bind:value={attendeeInput}
                 onkeydown={(e) => {
-                  if (e.key === "Enter") addAttendee();
+                  if (e.key === "Enter" && !e.isComposing) addAttendee();
                 }}
                 onblur={addAttendee}
               />
@@ -2702,10 +2725,10 @@
                   <p class="hint">{t("notes.calendar.noCandidates")}</p>
                 {:else}
                   {#each calCandidates as c (c.event_id)}
-                    <button class="cal-item" disabled={calBusy} onclick={() => void pickCalEvent(c.event_id)}>
+                    <Button variant="ghost" size="sm" class="cal-item h-auto justify-between gap-2.5 px-2 py-1 text-left font-normal" disabled={calBusy} onclick={() => void pickCalEvent(c.event_id)}>
                       <span class="cal-title">{c.title}</span>
                       <span class="cal-time">{fmtCalTime(c.start_ms)}–{fmtCalTime(c.end_ms)}{#if c.overlap_ms > 0} · {t("notes.calendar.overlapMin", { n: Math.round(c.overlap_ms / 60000) })}{/if}</span>
-                    </button>
+                    </Button>
                   {/each}
                 {/if}
               </div>
@@ -2718,8 +2741,10 @@
              名称与说明;aria-label 保读屏可达)。运行态图标加 .spin 旋转反馈。
              txt 渲染能力在导出层与 CLI(notes get --format txt)保留,GUI 不再暴露。 -->
         <div class="row">
-          <button
-            class="ghost"
+          <Button
+            variant="ghost"
+            size="icon"
+            class="ghost text-muted-foreground"
             disabled={identifying}
             title={identifying ? t("notes.identify.running") : `${t("notes.identify.rerun")}——${t("notes.identify.rerunHint")}`}
             aria-label={t("notes.identify.rerun")}
@@ -2731,17 +2756,21 @@
               <path d="M13.8 11.2a2.9 2.9 0 1 1-.9-2.1" />
               <path d="M13.9 6.9v2.4h-2.4" />
             </svg>
-          </button>
-          <div class="export-wrap">
-            <button
-              class="ghost"
-              aria-haspopup="menu"
-              aria-expanded={exportMenuOpen}
+          </Button>
+          <!-- 导出菜单:开合交给 DropdownMenu(bind 到 exportMenuOpen,window 的 click/Esc
+               关闭处理照旧生效);触发钮 stopPropagation,免得刚打开就被 window onclick 关掉。 -->
+          <DropdownMenu.Root bind:open={exportMenuOpen}>
+            <DropdownMenu.Trigger>
+              {#snippet child({ props })}
+            <Button
+              {...props}
+              variant="ghost"
+              class="ghost gap-1 px-2 text-muted-foreground"
               title={t("notes.export.button")}
               aria-label={t("notes.export.button")}
-              onclick={(e) => {
+              onclick={(e: MouseEvent) => {
+                (props.onclick as ((e: MouseEvent) => void) | undefined)?.(e);
                 e.stopPropagation();
-                exportMenuOpen = !exportMenuOpen;
               }}
             >
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2752,37 +2781,35 @@
               <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M2.5 4 5 6.5 7.5 4" />
               </svg>
-            </button>
-            {#if exportMenuOpen}
-              <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_interactive_supports_focus -->
-              <div class="export-menu" role="menu" onclick={(e) => e.stopPropagation()}>
-                {#if exportRange()}
-                  {@const r = exportRange()!}
-                  <p class="export-range-note">{t("notes.export.rangeNote", { start: formatTs(r.start), end: formatTs(r.end) })}</p>
-                {/if}
-                <button
-                  class="export-item"
-                  role="menuitem"
-                  onclick={() => {
-                    exportMenuOpen = false;
-                    void doExport("md");
-                  }}>{t("notes.export.md")}</button
-                >
-                <button
-                  class="export-item"
-                  role="menuitem"
-                  disabled={!mixedInfo?.track}
-                  title={mixedInfo?.track ? "" : t("notes.export.audioNone")}
-                  onclick={() => {
-                    exportMenuOpen = false;
-                    void doExportAudio();
-                  }}>{t("notes.export.audio")}</button
-                >
-              </div>
-            {/if}
-          </div>
-          <button
-            class="ghost"
+            </Button>
+              {/snippet}
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Content align="end" class="min-w-36" onclick={(e: MouseEvent) => e.stopPropagation()}>
+              {#if exportRange()}
+                {@const r = exportRange()!}
+                <DropdownMenu.Label class="text-xs font-normal whitespace-nowrap text-muted-foreground tabular-nums">{t("notes.export.rangeNote", { start: formatTs(r.start), end: formatTs(r.end) })}</DropdownMenu.Label>
+                <DropdownMenu.Separator />
+              {/if}
+              <DropdownMenu.Item
+                onSelect={() => {
+                  exportMenuOpen = false;
+                  void doExport("md");
+                }}>{t("notes.export.md")}</DropdownMenu.Item
+              >
+              <DropdownMenu.Item
+                disabled={!mixedInfo?.track}
+                title={mixedInfo?.track ? "" : t("notes.export.audioNone")}
+                onSelect={() => {
+                  exportMenuOpen = false;
+                  void doExportAudio();
+                }}>{t("notes.export.audio")}</DropdownMenu.Item
+              >
+            </DropdownMenu.Content>
+          </DropdownMenu.Root>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="ghost text-muted-foreground"
             title={`${t("notes.dir.open")}——${t("notes.dir.openHint")}`}
             aria-label={t("notes.dir.open")}
             onclick={() => void doOpenDir()}
@@ -2790,7 +2817,7 @@
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M1.8 4.2c0-.5.4-.9.9-.9h3.1l1.5 1.6h5.9c.5 0 .9.4.9.9v6.9c0 .5-.4.9-.9.9H2.7a.9.9 0 0 1-.9-.9z" />
             </svg>
-          </button>
+          </Button>
         </div>
       </div>
 
@@ -2816,7 +2843,9 @@
             {#if editsRowOn}
               <div class="edits-row">
                 {#if editsRange}
-                  <button
+                  <Button
+                    variant="outline"
+                    size="sm"
                     class="edits-btn edits-del"
                     title={t("notes.edits.deleteTitle", { start: formatTs(editsRange.start), end: formatTs(editsRange.end) })}
                     onclick={() => void deleteRange()}
@@ -2827,46 +2856,57 @@
                       <path d="M5.9 5.9 13.6 12.4M5.9 10.1 13.6 3.6" />
                     </svg>
                     {t("notes.edits.deleteRange", { dur: fmtDur(editsRange.end - editsRange.start) })}
-                  </button>
+                  </Button>
                 {/if}
                 {#if edits.length > 0}
-                  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-                  <div class="edits-menu" onclick={(e) => e.stopPropagation()}>
-                    <button
-                      class="edits-btn"
-                      class:open={editsManage}
-                      aria-expanded={editsManage}
-                      aria-haspopup="menu"
-                      onclick={() => (editsManage = !editsManage)}
-                    >
-                      {t("notes.edits.count", { n: edits.length, dur: fmtDur(edits.reduce((a, c) => a + c.end_ms - c.start_ms, 0)) })}
-                      <svg class="chev" class:open={editsManage} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d="M4 6l4 4 4-4" />
-                      </svg>
-                    </button>
-                    {#if editsManage}
-                      <div class="edits-pop" role="menu">
-                        <p class="edits-pop-hint">{t("notes.edits.popHint")}</p>
-                        {#each edits as c (c.start_ms)}
-                          <div class="edits-item">
-                            <span class="edits-span">{formatTs(c.start_ms)} – {formatTs(c.end_ms)}</span>
-                            <button class="edits-restore" onclick={() => void restoreCut(c)}>{t("notes.edits.restore")}</button>
-                          </div>
-                        {/each}
-                        {#if edits.length > 1}
-                          <button
-                            class="edits-restore edits-restore-all"
-                            onclick={async () => {
-                              for (const c of [...edits]) await restoreCut(c);
-                            }}>{t("notes.edits.restoreAll")}</button
-                          >
-                        {/if}
-                      </div>
-                    {/if}
-                  </div>
+                  <!-- 删减管理浮层:Popover bind 到 editsManage。触发钮与浮层内容都 stopPropagation
+                       (同原 .edits-menu 外壳):否则 window onclick 会把它刚打开/点「恢复」时就关掉。 -->
+                  <Popover.Root bind:open={editsManage}>
+                    <Popover.Trigger>
+                      {#snippet child({ props })}
+                        <Button
+                          {...props}
+                          variant="outline"
+                          size="sm"
+                          class="edits-btn"
+                          aria-haspopup="menu"
+                          onclick={(e: MouseEvent) => {
+                            (props.onclick as ((e: MouseEvent) => void) | undefined)?.(e);
+                            e.stopPropagation();
+                          }}
+                        >
+                          {t("notes.edits.count", { n: edits.length, dur: fmtDur(edits.reduce((a, c) => a + c.end_ms - c.start_ms, 0)) })}
+                          <svg class="chev" class:open={editsManage} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M4 6l4 4 4-4" />
+                          </svg>
+                        </Button>
+                      {/snippet}
+                    </Popover.Trigger>
+                    <Popover.Content align="start" sideOffset={6} class="w-auto min-w-60 gap-0 p-2" onclick={(e: MouseEvent) => e.stopPropagation()}>
+                      <p class="edits-pop-hint">{t("notes.edits.popHint")}</p>
+                      {#each edits as c (c.start_ms)}
+                        <div class="edits-item">
+                          <span class="edits-span">{formatTs(c.start_ms)} – {formatTs(c.end_ms)}</span>
+                          <Button variant="outline" size="xs" class="rounded-full font-normal" onclick={() => void restoreCut(c)}>{t("notes.edits.restore")}</Button>
+                        </div>
+                      {/each}
+                      {#if edits.length > 1}
+                        <Button
+                          variant="outline"
+                          size="xs"
+                          class="mt-1.5 w-full rounded-full font-normal"
+                          onclick={async () => {
+                            for (const c of [...edits]) await restoreCut(c);
+                          }}>{t("notes.edits.restoreAll")}</Button
+                        >
+                      {/if}
+                    </Popover.Content>
+                  </Popover.Root>
                   {#if lastCut}
                     {@const undoTarget = lastCut}
-                    <button
+                    <Button
+                      variant="outline"
+                      size="sm"
                       class="edits-btn"
                       title={t("notes.edits.undoTitle", { start: formatTs(undoTarget.start_ms), end: formatTs(undoTarget.end_ms) })}
                       onclick={() => void restoreCut(undoTarget)}
@@ -2876,7 +2916,7 @@
                         <path d="M6 3.9 3.3 6.6l2.7 2.7" />
                       </svg>
                       {t("notes.edits.undo")}
-                    </button>
+                    </Button>
                   {/if}
                 {/if}
                 {#if editsErr}<span class="edits-err">{editsErr}</span>{/if}
@@ -2885,13 +2925,13 @@
           </div>
           <!-- 加备注:在当前播放位置插一个草稿书签(同 M 键);录制中本区不出现,入口归录制页 -->
           <div class="memo-add-wrap">
-            <button class="memo-add" title={`${t("memo.note.add")} (M)`} onclick={startMemoDraft}>
+            <Button variant="outline" class="memo-add" title={`${t("memo.note.add")} (M)`} onclick={startMemoDraft}>
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M3.5 14.5V2" />
                 <path d="M3.5 2.5h8.2l-1.9 2.9 1.9 2.9H3.5" />
               </svg>
               {t("memo.note.add")}
-            </button>
+            </Button>
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
@@ -2980,7 +3020,7 @@
           {#if autoToast.kind === "split"}
             {t("speakers.autosplit.done", { n: autoToast.out.groups.length })}
             {#if autoToast.out.kept > 0}{t("speakers.autosplit.kept", { n: autoToast.out.kept })}{/if}
-            <button class="link" onclick={undoSplitToast}>{t("speakers.autosplit.undo")}</button>
+            <Button variant="link" size="xs" class="h-auto px-1 text-ring" onclick={undoSplitToast}>{t("speakers.autosplit.undo")}</Button>
           {:else if autoToast.kind === "nochange"}
             {t("speakers.autosplit.nochange")}
           {:else if autoToast.kind === "undone"}
@@ -2988,7 +3028,7 @@
           {:else}
             {t("speakers.autosplit.failed", { e: autoToast.msg })}
           {/if}
-          <button class="link" onclick={() => (autoToast = null)}>{t("speakers.autosplit.dismiss")}</button>
+          <Button variant="link" size="xs" class="h-auto px-1 text-ring" onclick={() => (autoToast = null)}>{t("speakers.autosplit.dismiss")}</Button>
         </div>
       {/if}
 
@@ -3015,9 +3055,9 @@
         <!-- 魔杖(重新 Aing)恒渲染:PR#141 重构误把上面的 {/if} 挪到按钮之后,魔杖被
              吞进 refining && aingProg——普通完成笔记从此没有这个按钮,整理中还会
              整个消失。按钮自身的 disabled/casting 已按 refining 处理,无需条件包裹。 -->
-        <button
-            class="reaing"
-            class:casting={refining}
+        <Button
+            variant="outline"
+            class={["reaing", refining && "casting"]}
             disabled={refining || note.meta.state !== "complete"}
             onclick={rerunRefine}
             title={aiState === "running" ? t("notes.refine.running") : aiState === "complete" ? t("notes.refine.completeHint") : aiState === "failed" ? t("notes.refine.failedHint") : t("notes.refine.run")}
@@ -3046,65 +3086,68 @@
               />
             </svg>
             <AiStateLabel state={aiState} label={t("notes.refine.label")} />
-          </button>
+          </Button>
 
         <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
              自动备份为 segments.orig.jsonl),二段确认走 retransConfirm 胶囊。
              来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
              判定可用性并置灰+tooltip 给原因)。 -->
-        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-        <div class="retrans-wrap" onclick={(e) => e.stopPropagation()}>
-          <!-- 带文字的「重新分析」入口(2026-09-07 用户点名):此前是纯图标幽灵钮,
-               和当年"拆分按钮在但没人找到"同病——重切段/重认人的算法升级后,
-               这个入口是存量笔记受益的唯一通道,必须一眼可见。 -->
-          <button
-            class="retrans-btn"
-            class:open={retransConfirm}
-            aria-haspopup="menu"
-            aria-expanded={retransConfirm}
-            disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
-            title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
-            onclick={() => {
-              // 先关同工具条里的其它浮层:本 wrap 会 stopPropagation(不然点自己
-              // 就被 window 的关闭处理吞掉),于是"点开这个顺带关掉那个"的默认
-              // 行为也一起没了,两层浮层会在吸顶栏里叠着。
-              exportMenuOpen = false;
-              editsManage = false;
-              entityChipsEl?.closeAll();
-              retransConfirm = !retransConfirm;
-            }}
-          >
-            <svg class:spin={retranscribing} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
-              <path d="M13.4 1.8v2.8h-2.8" />
-            </svg>
-            {retranscribing ? t("notes.retrans.runningShort") : t("notes.retrans.run")}
-          </button>
-          {#if retransConfirm}
-            <!-- 二段确认改成**锚定浮层**(2026-09-20 用户实报「设计粗糙、布局被改变」):
-                 原先是把按钮整个替换成一条横向胶囊,宽度是按钮的好几倍,一点就把
-                 吸顶操作栏顶变形。浮层挂在按钮下方、absolute 定位,开合不占版面;
-                 形态沿用本页导出菜单(同底色/同圆角/同投影),不另造一套。 -->
-            <div class="retrans-menu" role="menu">
-              <p class="retrans-menu-note">{t("notes.retrans.warn")}</p>
-              <button class="retrans-item" onclick={() => startRetranscribe("dual")}>
-                <span class="retrans-item-main">{t("notes.retrans.confirmDual")}</span>
-                <span class="retrans-item-sub">{t("notes.retrans.dualSub")}</span>
-              </button>
-              <button
-                class="retrans-item"
-                disabled={mixedReason !== null}
-                onclick={() => startRetranscribe("mixed")}
+        <!-- 带文字的「重新分析」入口(2026-09-07 用户点名):此前是纯图标幽灵钮,
+             和当年"拆分按钮在但没人找到"同病——重切段/重认人的算法升级后,
+             这个入口是存量笔记受益的唯一通道,必须一眼可见。
+             二段确认是**锚定浮层**(2026-09-20 用户实报「设计粗糙、布局被改变」):浮层挂在
+             按钮下方、开合不占版面。开合交给 Popover(bind 到 retransConfirm);触发钮与浮层
+             都 stopPropagation(同原 .retrans-wrap),否则 window onclick 会把它刚开就关掉。 -->
+        <Popover.Root bind:open={retransConfirm}>
+          <Popover.Trigger>
+            {#snippet child({ props })}
+              <Button
+                {...props}
+                variant="outline"
+                class="retrans-btn"
+                aria-haspopup="menu"
+                disabled={retranscribing || refining || recording.isLive || note?.meta.state !== "complete"}
+                title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
+                onclick={(e: MouseEvent) => {
+                  // 先关同工具条里的其它浮层:本按钮会 stopPropagation(不然点自己
+                  // 就被 window 的关闭处理吞掉),于是"点开这个顺带关掉那个"的默认
+                  // 行为也一起没了,两层浮层会在吸顶栏里叠着。
+                  exportMenuOpen = false;
+                  editsManage = false;
+                  entityChipsEl?.closeAll();
+                  (props.onclick as ((e: MouseEvent) => void) | undefined)?.(e);
+                  e.stopPropagation();
+                }}
               >
-                <span class="retrans-item-main">{t("notes.retrans.confirmMixed")}</span>
-                <span class="retrans-item-sub">{mixedReason ?? t("notes.retrans.mixedSub")}</span>
-              </button>
-              <button class="retrans-item quiet" onclick={() => (retransConfirm = false)}>
-                <span class="retrans-item-main">{t("notes.cancel")}</span>
-              </button>
-            </div>
-          {/if}
-        </div>
+                <svg class:spin={retranscribing} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
+                  <path d="M13.4 1.8v2.8h-2.8" />
+                </svg>
+                {retranscribing ? t("notes.retrans.runningShort") : t("notes.retrans.run")}
+              </Button>
+            {/snippet}
+          </Popover.Trigger>
+          <!-- 右对齐——按钮在操作栏右侧,左展开会顶出视口。 -->
+          <Popover.Content align="end" class="w-68 gap-0 p-1" onclick={(e: MouseEvent) => e.stopPropagation()}>
+            <p class="retrans-menu-note">{t("notes.retrans.warn")}</p>
+            <Button variant="ghost" class="retrans-item" onclick={() => startRetranscribe("dual")}>
+              <span class="retrans-item-main">{t("notes.retrans.confirmDual")}</span>
+              <span class="retrans-item-sub">{t("notes.retrans.dualSub")}</span>
+            </Button>
+            <Button
+              variant="ghost"
+              class="retrans-item"
+              disabled={mixedReason !== null}
+              onclick={() => startRetranscribe("mixed")}
+            >
+              <span class="retrans-item-main">{t("notes.retrans.confirmMixed")}</span>
+              <span class="retrans-item-sub">{mixedReason ?? t("notes.retrans.mixedSub")}</span>
+            </Button>
+            <Button variant="ghost" class="retrans-item quiet" onclick={() => (retransConfirm = false)}>
+              <span class="retrans-item-main">{t("notes.cancel")}</span>
+            </Button>
+          </Popover.Content>
+        </Popover.Root>
       </div>
     </div>
 
@@ -3192,7 +3235,7 @@
         {#if memoErr}<span class="memo-toast-err">{memoErr}</span>{/if}
         {#if memoUndo}
           <span>{t("memo.deleted")}</span>
-          <button class="link" onclick={() => void undoMemoDelete()}>{t("memo.undo")}</button>
+          <Button variant="link" size="xs" class="h-auto px-1 text-ring" onclick={() => void undoMemoDelete()}>{t("memo.undo")}</Button>
         {/if}
       </div>
     {/if}
@@ -3236,21 +3279,23 @@
     {#if selMode}
       <div class="sel-bar">
         <span>{t("notes.segpick.selectedN", { n: selected.length })}</span>
-        <button
-          class="link"
+        <Button
+          variant="link"
+          size="xs"
+          class="h-auto px-1 text-ring"
           disabled={selected.length === 0}
-          onclick={(e) => (selPick = (e.currentTarget as HTMLElement).getBoundingClientRect())}
+          onclick={(e: MouseEvent) => (selPick = (e.currentTarget as HTMLElement).getBoundingClientRect())}
         >
           {t("notes.segpick.changeTo")}
-        </button>
+        </Button>
         {#if selDeleteConfirm}
-          <button class="link danger" onclick={applySelDelete}>{t("notes.segpick.deleteConfirm", { n: selected.length })}</button>
-          <button class="link" onclick={() => (selDeleteConfirm = false)}>{t("notes.cancel")}</button>
+          <Button variant="link" size="xs" class="h-auto px-1 text-ring font-medium text-destructive" onclick={applySelDelete}>{t("notes.segpick.deleteConfirm", { n: selected.length })}</Button>
+          <Button variant="link" size="xs" class="h-auto px-1 text-ring" onclick={() => (selDeleteConfirm = false)}>{t("notes.cancel")}</Button>
         {:else}
-          <button class="link danger" disabled={selected.length === 0} onclick={() => (selDeleteConfirm = true)}>{t("notes.segpick.deleteSel")}</button>
+          <Button variant="link" size="xs" class="h-auto px-1 text-ring font-medium text-destructive" disabled={selected.length === 0} onclick={() => (selDeleteConfirm = true)}>{t("notes.segpick.deleteSel")}</Button>
         {/if}
-        <button class="link" disabled={selected.length === 0} onclick={() => (selected = [])}>{t("notes.segpick.clearSel")}</button>
-        <button class="link" onclick={exitSelMode}>{t("notes.segpick.exitSel")}</button>
+        <Button variant="link" size="xs" class="h-auto px-1 text-ring" disabled={selected.length === 0} onclick={() => (selected = [])}>{t("notes.segpick.clearSel")}</Button>
+        <Button variant="link" size="xs" class="h-auto px-1 text-ring" onclick={exitSelMode}>{t("notes.segpick.exitSel")}</Button>
       </div>
     {/if}
     {#if selPick && note}
@@ -3283,8 +3328,8 @@
         class="badge-menu floating"
         style="position: fixed; left: {segDeletePop.rect.left}px; top: {segDeletePop.rect.bottom + 4}px;"
       >
-        <button class="menu-item danger" onclick={() => doDeleteSeg(segDeletePop!.seq)}>{t("notes.menu.confirmDelete")}</button>
-        <button class="menu-item" onclick={() => (segDeletePop = null)}>{t("notes.cancel")}</button>
+        <Button variant="destructive" size="xs" onclick={() => doDeleteSeg(segDeletePop!.seq)}>{t("notes.menu.confirmDelete")}</Button>
+        <Button variant="ghost" size="xs" onclick={() => (segDeletePop = null)}>{t("notes.cancel")}</Button>
       </div>
     {/if}
 
@@ -3301,8 +3346,10 @@
       >
         <span>{entityName(entityPop.entityId)}</span>
         {#if entityLinks[entityPop.entityId]}
-          <button
-            class="link"
+          <Button
+            variant="link"
+            size="xs"
+            class="h-auto px-1 text-ring"
             onclick={() => {
               cancelHideEntityPop();
               gotoEntity(entityPop!.entityId);
@@ -3310,7 +3357,7 @@
             }}
           >
             {t("notes.entity.openGraph")}
-          </button>
+          </Button>
         {/if}
       </div>
     {/if}
@@ -3321,7 +3368,7 @@
         style="position: fixed; left: {refinedBadgePop.rect.left}px; top: {refinedBadgePop.rect.bottom + 4}px;"
       >
         <span>{refinedBadge(refinedBadgePop.attrs).label}</span>
-        <button class="link" onclick={() => (refinedBadgePop = null)}>{t("notes.close")}</button>
+        <Button variant="link" size="xs" class="h-auto px-1 text-ring" onclick={() => (refinedBadgePop = null)}>{t("notes.close")}</Button>
       </div>
     {/if}
 
@@ -3342,7 +3389,7 @@
     <!-- 跟随被用户上滑打断时的返回入口(与录制页同款):sticky 钉滚动视口底部 -->
     <div class="jump-anchor">
       {#if !follow && playerPlaying}
-        <button class="jump" onclick={resumeFollow}>{t("notes.jumpBack")}</button>
+        <Button class="jump rounded-full shadow-[var(--shadow-popover)]" onclick={resumeFollow}>{t("notes.jumpBack")}</Button>
       {/if}
     </div>
   {:else if !error}
@@ -3368,35 +3415,21 @@
     cursor: text;
     margin: 0 0 0.25rem;
   }
-  /* editable-text（标题）：静态时无边，hover accent-tint 底 + rounded-sm，focus accent outline */
-  .title-btn {
-    background: none;
-    border: none;
+  /* editable-text(标题,Button ghost 外壳):静态无边,hover accent-tint 底 + rounded-sm,
+     字号/字重/行高全部沿用 h1;焦点环由组件给。 */
+  .title :global(.title-btn) {
+    height: auto;
     padding: 0;
-    margin: 0;
     font: inherit;
     color: inherit;
-    cursor: text;
     text-align: left;
+    white-space: normal;
+    cursor: text;
     border-radius: var(--radius-sm);
   }
-  .title-btn:hover {
+  .title :global(.title-btn:hover) {
     background: var(--accent-tint);
-  }
-  .title-btn:focus-visible {
-    outline: 2px solid var(--accent);
-    border-radius: var(--radius-sm);
-  }
-  .rename {
-    font-size: 1.6em;
-    font-weight: 500;
-    width: 100%;
-    box-sizing: border-box;
-    padding: 0.1em 0.3em;
-    border-radius: var(--radius-lg);
-    border: 1px solid var(--accent);
-    background: var(--canvas);
-    color: var(--ink);
+    color: inherit;
   }
   .meta {
     color: var(--ink-secondary);
@@ -3445,24 +3478,6 @@
     padding-top: 0.2rem;
     margin-left: auto;
   }
-  /* 头部动作钮:幽灵族(.ghost)+图标文字并排;「导出」带浮层菜单(DESIGN 浮层规范) */
-  .export-wrap {
-    position: relative;
-  }
-  .export-menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    right: 0;
-    z-index: 30;
-    min-width: 9rem;
-    display: flex;
-    flex-direction: column;
-    padding: 4px;
-    background: var(--surface-press);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-  }
   /* 音频剪辑行:播放器卡片的第二行——同底色、hairline 分隔、下缘补回卡片圆角 */
   .edits-row {
     display: flex;
@@ -3475,74 +3490,41 @@
     border-top: 1px solid var(--hairline);
     border-radius: 0 0 var(--radius-lg) var(--radius-lg);
   }
-  /* 胶囊按钮:track-btn 同语言(hairline-strong 边、圆角满、图标+文字),
-     数字走 tabular 对齐;按压下沉 0.5px 给触感 */
-  .edits-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4em;
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink-secondary);
+  /* 胶囊按钮(Button outline):track-btn 同语言(hairline-strong 边、圆角满、图标+文字),
+     数字走 tabular 对齐 */
+  .edits-row :global(.edits-btn) {
+    border-color: var(--hairline-strong);
     border-radius: var(--radius-full);
     padding: 0.3em 0.8em;
     font-size: 0.78rem;
+    font-weight: 400;
     font-variant-numeric: tabular-nums;
-    cursor: pointer;
-    white-space: nowrap;
-    transition:
-      background 120ms ease,
-      color 120ms ease,
-      border-color 120ms ease;
+    color: var(--ink-secondary);
   }
-  .edits-btn:hover {
+  .edits-row :global(.edits-btn[aria-expanded="true"]) {
     background: var(--surface-soft);
     color: var(--ink);
   }
-  .edits-btn:active {
-    transform: translateY(0.5px);
-  }
-  .edits-btn.open {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .edits-btn .chev {
+  .chev {
     transition: transform 120ms ease;
     opacity: 0.7;
   }
-  .edits-btn .chev.open {
+  .chev.open {
     transform: rotate(180deg);
   }
   /* 删除入口:danger 族(墨/边/悬停底全用 danger token),一眼分清这是破坏性动作
      的入口——虽然实际非破坏,但语义上是"删" */
-  .edits-btn.edits-del {
+  .edits-row :global(.edits-btn.edits-del) {
     color: var(--danger);
     border-color: var(--danger-line);
   }
-  .edits-btn.edits-del:hover {
+  .edits-row :global(.edits-btn.edits-del:hover) {
     background: var(--danger-tint);
     color: var(--danger-ink);
   }
   .edits-err {
     color: var(--danger);
     font-size: 0.78rem;
-  }
-  /* 管理浮层:track-pop 同语言(surface-press 底、hairline 边、popover 阴影),
-     在按钮下方展开 */
-  .edits-menu {
-    position: relative;
-  }
-  .edits-pop {
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 0;
-    z-index: 20;
-    min-width: 15rem;
-    background: var(--surface-press);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-    padding: 0.5rem;
   }
   .edits-pop-hint {
     margin: 0 0 0.45rem;
@@ -3562,97 +3544,17 @@
     color: var(--ink);
     font-variant-numeric: tabular-nums;
   }
-  /* 浮层内恢复按钮:小号 secondary(有边有形,不是裸链接) */
-  .edits-restore {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink-secondary);
-    border-radius: var(--radius-full);
-    padding: 0.12em 0.65em;
-    font-size: 0.75rem;
-    cursor: pointer;
-    transition:
-      background 120ms ease,
-      color 120ms ease;
-  }
-  .edits-restore:hover {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .edits-restore:active {
-    transform: translateY(0.5px);
-  }
-  .edits-restore-all {
-    margin-top: 0.35rem;
-    width: 100%;
-  }
-  /* 圈定范围提示:游标圈了真子范围时出现在菜单顶部,交代两个导出项的作用域 */
-  .export-range-note {
-    margin: 0;
-    padding: 0.35em 0.7em 0.45em;
-    font-size: 0.75rem;
-    color: var(--ink-secondary);
-    border-bottom: 1px solid var(--hairline);
-    white-space: nowrap;
-    font-variant-numeric: tabular-nums;
-  }
-  .export-item {
-    border: none;
-    background: none;
-    box-shadow: none;
-    text-align: left;
-    padding: 0.45em 0.7em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    color: var(--ink);
-    border-radius: var(--radius-md);
-    transition: background 120ms ease;
-  }
-  .export-item:hover:not(:disabled) {
-    background: var(--surface-soft);
-  }
-  .export-item:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
   /* 幽灵按钮族:低频动作统一形态——无边框、次级墨色+16px 线性图标,
      hover 浮现 surface-soft 底并提亮(悬停显影原则),按压下沉 0.5px。 */
   /* 运行态图标旋转(重新推断/重转写进行中):按钮已 disabled,旋转是唯一进行中信号。 */
-  .ghost svg.spin {
+  .row svg.spin {
     animation: ghost-spin 1.2s linear infinite;
   }
   @keyframes ghost-spin {
     to { transform: rotate(360deg); }
   }
   @media (prefers-reduced-motion: reduce) {
-    .ghost svg.spin { animation: none; }
-  }
-  .ghost {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4em;
-    border: none;
-    background: transparent;
-    padding: 0.4em 0.55em; /* 纯图标形态:横向收紧,点击区仍 ≥28px */
-    font-size: 0.85rem;
-    font-weight: 500;
-    letter-spacing: 0.2px;
-    color: var(--ink-secondary);
-    border-radius: var(--radius-md);
-    transition:
-      background 120ms ease,
-      color 120ms ease,
-      transform 120ms ease;
-  }
-  .ghost:hover:not(:disabled) {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .ghost:active:not(:disabled) {
-    transform: translateY(0.5px);
-  }
-  .ghost svg {
-    flex: none;
+    .row svg.spin { animation: none; }
   }
   /* 控制行:录音 + 播放器整合一行(录音机式) */
   /* 正文 + 备注栏:收起时第二列只剩竖条按钮(auto),展开 260px */
@@ -3675,13 +3577,6 @@
     align-items: center;
     height: 3.1rem; /* 与 .mix-switch 同:锚定播放器第一行高度 */
     flex: none;
-  }
-  .memo-add {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35em;
-    padding: 0.4em 0.9em;
-    font-size: 0.85rem;
   }
   /* 删除撤销/失败提示:右下角浮条(本页此前没有 toast 机制,只给备注用) */
   .memo-toast {
@@ -3969,20 +3864,6 @@
     justify-content: center;
     align-items: flex-end;
   }
-  .jump {
-    border: none;
-    border-radius: var(--radius-full);
-    background: var(--primary);
-    color: var(--on-primary);
-    font-size: 0.85rem;
-    font-weight: 500;
-    padding: 0.4em 1em;
-    cursor: pointer;
-    box-shadow: var(--shadow-popover);
-  }
-  .jump:hover {
-    background: var(--primary-pressed);
-  }
   /* :global——原始稿(.md-seg)与修订稿 NodeView(.md-para)共用同一套 .badge/.ts 徽章
      class,两者都是 PM 命令式创建的 DOM,没有 Svelte scope hash,见上方 .entity-mention
      同款注释。 */
@@ -4017,29 +3898,6 @@
   .badge-menu.floating {
     z-index: 30;
   }
-  /* button-link：无底无边，accent 字，悬停加下划线 */
-  .link {
-    background: none;
-    border: none;
-    color: var(--accent);
-    cursor: pointer;
-    padding: 0.1em 0.25em;
-    font-size: 0.8em;
-  }
-  .link:hover {
-    text-decoration: underline;
-  }
-  .link.danger {
-    color: var(--danger);
-    font-weight: 500;
-  }
-  .link:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-  .link:disabled:hover {
-    text-decoration: none;
-  }
   /* 视图切换条:Segmented(修订稿/原始逐字稿) + 右侧内容级动作(AI 魔杖 / 重转写幽灵钮) */
   /* 同款窄窗纪律:二段确认警示胶囊展开时宽于窗口即换行,不挤压 segmented */
   .view-switch {
@@ -4055,30 +3913,6 @@
   /* 重新 Aing 二段确认的警示语:warning 色小字,和确认/取消链接排一行 */
   /* 破坏性二段确认的警示胶囊:warning 三件套 token 包裹整组(文案+确认+取消),
      120ms 淡入下移 2px,行内占位不换行不跳版。 */
-  /* 重新分析:按钮 + 锚定浮层。wrap 只负责给浮层一个定位原点,不参与布局尺寸,
-     所以开合不会顶动吸顶操作栏(2026-09-20 用户实报的「布局被改变」正是旧胶囊
-     把按钮整个换成一条横条造成的)。 */
-  .retrans-wrap {
-    position: relative;
-    display: inline-flex;
-  }
-  /* 形态与导出菜单同源(同底、同圆角、同投影、同边框):本页已有一套浮层语言,
-     再造第二套只会让界面更碎。右对齐——按钮在操作栏右侧,左展开会顶出视口。 */
-  .retrans-menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    right: 0;
-    z-index: 30;
-    width: 17rem;
-    display: flex;
-    flex-direction: column;
-    padding: 4px;
-    background: var(--surface-press);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-    animation: capsule-in 120ms ease;
-  }
   /* 破坏性说明放在顶部做小字注记,不做成警告色块:它要被读一遍,不该每次打开
      都像报错一样吓人;真正的危险信号交给下面两项的动作文案本身。 */
   .retrans-menu-note {
@@ -4089,26 +3923,17 @@
     color: var(--ink-secondary);
     border-bottom: 1px solid var(--hairline);
   }
-  .retrans-item {
+  /* 浮层菜单项(Button ghost):两行(主文案 + 小字说明)左对齐,高度随内容。 */
+  :global([data-slot="button"].retrans-item) {
     display: flex;
     flex-direction: column;
+    align-items: flex-start;
     gap: 0.1em;
-    border: none;
-    background: none;
-    box-shadow: none;
-    text-align: left;
+    height: auto;
     padding: 0.45em 0.7em;
-    border-radius: var(--radius-md);
+    text-align: left;
+    white-space: normal;
     color: var(--ink);
-    cursor: pointer;
-    transition: background 120ms ease;
-  }
-  .retrans-item:hover:not(:disabled) {
-    background: var(--surface-soft);
-  }
-  .retrans-item:disabled {
-    opacity: 0.5;
-    cursor: default;
   }
   .retrans-item-main {
     font-size: 0.85rem;
@@ -4119,27 +3944,9 @@
     line-height: 1.45;
     color: var(--ink-faint);
   }
-  .retrans-item.quiet .retrans-item-main {
+  :global(.retrans-item.quiet) .retrans-item-main {
     font-weight: 400;
     color: var(--ink-secondary);
-  }
-  .retrans-btn.open {
-    background: var(--surface-soft);
-  }
-  @keyframes capsule-in {
-    from {
-      opacity: 0;
-      transform: translateY(-2px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .retrans-menu {
-      animation: none;
-    }
   }
   /* 重新 Aing = Aing 的「施法键」:22px 彩色魔杖(手柄 currentColor,杖头金色星芒 + 紫/青/粉星火,禁 emoji)。
      idle 已是彩色魔杖;hover 星火向外迸射、金星芒放大旋转带光晕;施法(casting)时魔杖大幅挥动 +
@@ -4154,127 +3961,96 @@
      ② `.retrans-btn` 用了 radius-full,而本仓「药丸仅主按钮与录制点」(DESIGN.md
         §圆角),次级动作用药丸会和录制键抢同一个视觉身份。
      不把两颗合成 segmented:那形态表示「多选一」,而这俩是彼此独立的动作。 */
-  .reaing,
-  .retrans-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
+  /* 两颗都是 Button outline(同高 h-8、radius-md、hairline 边、hover 底、焦点环由组件统一给);
+     这里只补字号/字距与魔杖间距。 */
+  :global([data-slot="button"].reaing),
+  :global([data-slot="button"].retrans-btn) {
     gap: 0.45em;
-    /* 同高写死:并排两颗差 1px 都看得出来,靠各自 padding 凑必然对不齐。
-       魔杖 18px:22px 在这个盒子里只剩 5px 上下留白,且与文字(12.8px)比到 1.7:1,
-       读起来是"一个图标配了行小字"。18px 仍明显比常规图标大、彩色与动效照旧,
-       但不再撑破这一行的节奏(用户「更大/夸张」的诉求由颜色与施法动效承担)。 */
-    height: 2.05rem;
     padding: 0 0.7em;
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--ink);
     font-size: 0.8rem;
-    font-weight: 500;
     line-height: 1;
-    white-space: nowrap;
-    cursor: pointer;
-    transition:
-      background 120ms ease,
-      border-color 120ms ease,
-      color 120ms ease;
   }
-  .reaing:hover:not(:disabled),
-  .retrans-btn:hover:not(:disabled) {
+  :global([data-slot="button"].retrans-btn[aria-expanded="true"]) {
     background: var(--surface-soft);
-    border-color: var(--hairline-strong);
-  }
-  /* 键盘焦点环:accent 在本仓只表达链接/焦点/选中(DESIGN.md §色),这两颗此前
-     完全没有焦点样式——键盘走到哪儿看不见。 */
-  .reaing:focus-visible,
-  .retrans-btn:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
-  .reaing:disabled,
-  .retrans-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
   }
   /* AI 整理按钮的宽度按最宽那个状态钉死:文案会在「AI 整理」⇄「Aing」⇄ 带状态点
      之间切换,不钉的话每次状态一变,它右边的「重新转文字」就跟着横跳一下。 */
-  .reaing {
+  :global(.reaing) {
     min-width: 6.4rem;
     --wand-gold: #f6b02e;
     --wand-violet: #a678ff;
     --wand-cyan: #46bcff;
     --wand-pink: #ff5fae;
   }
-  .reaing .wand {
+  :global(.reaing) .wand {
     flex: none;
     overflow: visible;
   }
-  .reaing .wand-star,
-  .reaing .spark {
+  :global(.reaing) .wand-star,
+  :global(.reaing) .spark {
     transform-box: fill-box;
     transform-origin: center;
   }
-  .reaing .wand-star {
+  :global(.reaing) .wand-star {
     fill: var(--wand-gold);
     transition:
       transform 0.3s cubic-bezier(0.2, 0.9, 0.2, 1),
       filter 0.3s ease;
   }
-  .reaing .spark {
+  :global(.reaing) .spark {
     opacity: 0;
     transform: scale(0.3);
     transition:
       opacity 0.25s ease,
       transform 0.3s cubic-bezier(0.2, 0.9, 0.2, 1);
   }
-  .reaing .spark-a {
+  :global(.reaing) .spark-a {
     fill: var(--wand-violet);
   }
-  .reaing .spark-b {
+  :global(.reaing) .spark-b {
     fill: var(--wand-cyan);
   }
-  .reaing .spark-c {
+  :global(.reaing) .spark-c {
     fill: var(--wand-pink);
   }
   /* hover:星火向外迸射、金星芒放大旋转带光晕 */
-  .reaing:hover:not(:disabled) .wand-star {
+  :global(.reaing:hover:not(:disabled)) .wand-star {
     transform: scale(1.3) rotate(20deg);
     filter: drop-shadow(0 0 3px rgba(246, 176, 46, 0.75));
   }
-  .reaing:hover:not(:disabled) .spark {
+  :global(.reaing:hover:not(:disabled)) .spark {
     opacity: 1;
   }
-  .reaing:hover:not(:disabled) .spark-a {
+  :global(.reaing:hover:not(:disabled)) .spark-a {
     transform: translate(-2px, -2px) scale(1.25);
   }
-  .reaing:hover:not(:disabled) .spark-b {
+  :global(.reaing:hover:not(:disabled)) .spark-b {
     transform: translate(2.5px, 2px) scale(1.25);
     transition-delay: 0.05s;
   }
-  .reaing:hover:not(:disabled) .spark-c {
+  :global(.reaing:hover:not(:disabled)) .spark-c {
     transform: translate(-1.5px, 2.5px) scale(1.25);
     transition-delay: 0.1s;
   }
   /* 施法态:覆盖 disabled 变暗(进行中≠不可用),夸张动效全开 */
-  .reaing.casting {
+  :global(.reaing.casting) {
     opacity: 1;
     color: var(--ink-secondary);
   }
-  .reaing.casting .wand {
+  :global(.reaing.casting) .wand {
     transform-origin: 18% 84%;
     animation: wand-wave-big 1.15s ease-in-out infinite;
   }
-  .reaing.casting .wand-star {
+  :global(.reaing.casting) .wand-star {
     animation: star-spin 1.6s ease-in-out infinite;
   }
-  .reaing.casting .spark-a {
+  :global(.reaing.casting) .spark-a {
     animation: spark-fly-a 1.1s ease-in-out infinite;
   }
-  .reaing.casting .spark-b {
+  :global(.reaing.casting) .spark-b {
     animation: spark-fly-b 1.1s ease-in-out infinite 0.35s;
   }
-  .reaing.casting .spark-c {
+  :global(.reaing.casting) .spark-c {
     animation: spark-fly-c 1.1s ease-in-out infinite 0.7s;
   }
   @keyframes wand-wave-big {
@@ -4334,16 +4110,16 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .reaing.casting .wand,
-    .reaing.casting .wand-star,
-    .reaing.casting .spark {
+    :global(.reaing.casting) .wand,
+    :global(.reaing.casting) .wand-star,
+    :global(.reaing.casting) .spark {
       animation: none;
     }
-    .reaing.casting .spark {
+    :global(.reaing.casting) .spark {
       opacity: 0.7;
       transform: scale(1);
     }
-    .reaing:hover:not(:disabled) .wand-star {
+    :global(.reaing:hover:not(:disabled)) .wand-star {
       transform: none;
     }
   }
@@ -4373,18 +4149,6 @@
     box-shadow: var(--shadow-popover);
     padding: 0.2em 0.4em;
     margin-right: 0.4em;
-  }
-  .menu-item {
-    background: none;
-    border: none;
-    color: var(--accent);
-    cursor: pointer;
-    font-size: 0.8em;
-    padding: 0.15em 0.4em;
-  }
-  /* 破坏性菜单项(段删除确认)与 .link.danger 同一色钩:红字提示不可撤销。 */
-  .menu-item.danger {
-    color: var(--danger);
   }
   /* speaker-badge：soft 底 + 内联配对文字色、rounded-sm、micro 字级
      （底色与文字色均由内联 style 按说话人取，此处不设默认 color——设了也恒被覆盖）。
@@ -4531,47 +4295,20 @@
   .att-tag.cal {
     border-style: dashed; /* 来自日历:只读,虚线区分 */
   }
-  .att-x {
-    border: none;
-    background: none;
+  .att-tag :global(.att-x) {
     color: var(--ink-faint);
-    cursor: pointer;
-    padding: 0 0 0 0.15em;
-    font-size: 0.85em;
-    line-height: 1;
   }
-  .att-x:hover {
+  .att-tag :global(.att-x:hover) {
     color: var(--danger);
   }
-  .att-input {
-    border: none;
-    background: transparent;
-    color: var(--ink);
-    font-size: 0.78rem;
-    /* 占满本行余宽:浏览器默认 size=20 太短,连打几个名字就看不全(2026-09-22 实报)。
-       余宽不足 14em 时整体折到下一行,仍然有一整行可写。 */
-    flex: 1 1 14em;
-    min-width: 14em;
-    max-width: 100%;
-    padding: 0.1em 0.3em;
-    border-radius: var(--radius-sm);
-  }
-  .att-input:hover,
-  .att-input:focus {
-    background: var(--surface-soft);
-    outline: none;
-  }
-  .att-restore {
-    border: none;
-    background: none;
+  .att-row :global(.att-restore) {
     color: var(--ink-faint);
     font-size: 0.75rem;
-    cursor: pointer;
+    font-weight: 400;
     text-decoration: underline;
     text-underline-offset: 2px;
-    padding: 0;
   }
-  .att-restore:hover {
+  .att-row :global(.att-restore:hover) {
     color: var(--ink);
   }
   .att-err {
@@ -4584,17 +4321,9 @@
     gap: 8px;
     flex-wrap: wrap;
   }
-  .cal-row .mini {
-    border: none;
-    background: none;
-    color: var(--accent, #4a7dff);
-    cursor: pointer;
+  .cal-row :global(.mini) {
     font-size: 12px;
-    padding: 0 2px;
-  }
-  .cal-row .mini:disabled {
-    opacity: 0.5;
-    cursor: default;
+    font-weight: 400;
   }
   .cal-hint {
     opacity: 0.6;
@@ -4603,8 +4332,8 @@
   .cal-menu {
     margin: 4px 0 0;
     padding: 6px;
-    border: 1px solid var(--border, #3333);
-    border-radius: 8px;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-md);
     max-width: 420px;
     max-height: 220px;
     overflow-y: auto;
@@ -4612,22 +4341,7 @@
     flex-direction: column;
     gap: 2px;
   }
-  .cal-item {
-    display: flex;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 5px 8px;
-    border: none;
-    background: none;
-    border-radius: 6px;
-    cursor: pointer;
-    text-align: left;
-    font-size: 13px;
-  }
-  .cal-item:hover {
-    background: var(--hover, #8881);
-  }
-  .cal-item .cal-time {
+  .cal-time {
     opacity: 0.6;
     white-space: nowrap;
   }
@@ -4642,15 +4356,15 @@
     left: 50%;
     transform: translateX(-50%);
     bottom: 18px;
-    z-index: 55;
+    z-index: 45; /* 低于模态层(z-50):多人处理面板打开时浮条必须被遮罩盖住、点不到(Codex P2) */
     display: flex;
     gap: 14px;
     align-items: center;
-    background: var(--pop-bg, #1c1e22);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 10px;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
     padding: 8px 14px;
     font-size: 13px;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-popover);
   }
 </style>

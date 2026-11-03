@@ -4,6 +4,13 @@
   // 乙模式(勾选)从这里入口。视觉与胸牌菜单同一套语言。
   import { speakerColor, speakerInk, speakerLabel } from "$lib/notes";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import { Label } from "$lib/ui/components/label";
+  import * as RadioGroup from "$lib/ui/components/radio-group";
+
+  // 列表行:全宽、左对齐、常规字重(覆盖 Button 默认的居中/加粗/定高)。
+  const rowCls = "h-auto w-full justify-start gap-2 px-2 py-[5px] text-left text-[13px] font-normal";
 
   let {
     speakers,
@@ -59,26 +66,30 @@
   });
 </script>
 
+<!-- 定位仍由宿主给的 rect 决定(fixed 贴在触发点下方),外点/Esc 关闭也仍由本组件自管:
+     宿主两处调用都按「rect + onClose」约定接线,改成 Popover 需要宿主一起换触发器。
+     这里只把外观与控件换到组件库:面板用 popover 令牌,单选用 RadioGroup,行用 Button。 -->
 <div
   bind:this={el}
-  class="pop"
+  class="pop bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10"
   style="position: fixed; left: {Math.min(rect.left, window.innerWidth - 300)}px; top: {Math.min(rect.bottom + 4, window.innerHeight - 320)}px;"
 >
   {#if scopes}
-    <div class="scopes">
+    <RadioGroup.Root bind:value={scope} class="scopes gap-1">
       {#each scopes as sc (sc.key)}
-        <label class="scope" class:off={sc.n === 0}>
-          <input type="radio" name="segpick-scope" value={sc.key} bind:group={scope} disabled={sc.n === 0} />
+        <Label class="scope text-[12.5px] font-normal leading-normal" data-off={sc.n === 0 || undefined}>
+          <RadioGroup.Item value={sc.key} disabled={sc.n === 0} />
           {sc.label}
-        </label>
+        </Label>
       {/each}
-    </div>
+    </RadioGroup.Root>
   {/if}
-  <input class="q" placeholder={t("notes.segpick.searchPh")} bind:value={query} />
+  <Input class="h-7 text-[13px] md:text-[13px]" placeholder={t("notes.segpick.searchPh")} bind:value={query} />
   <div class="list">
     {#each ids as sid (sid)}
-      <button
-        class="row"
+      <Button
+        variant="ghost"
+        class={rowCls}
         disabled={sid === currentSid}
         onclick={() => onPick(sid, scope || "one")}
       >
@@ -86,14 +97,15 @@
         {speakerLabel(sid, "mic", speakers)}
         {#if counts[sid]}<span class="sub">{counts[sid]}</span>{/if}
         {#if sid === currentSid}<span class="sub">{t("notes.menu.current")}</span>{/if}
-      </button>
+      </Button>
     {/each}
   </div>
-  <button class="row new" onclick={() => onPick("new", scope || "one")}>{t("notes.menu.newSpeaker")}</button>
+  <div class="divider"></div>
+  <Button variant="ghost" class={rowCls} onclick={() => onPick("new", scope || "one")}>{t("notes.menu.newSpeaker")}</Button>
   {#if showMultiEntry && onEnterMulti}
-    <button class="row" onclick={onEnterMulti}>{t("notes.segpick.multiEntry")}</button>
+    <Button variant="ghost" class={rowCls} onclick={onEnterMulti}>{t("notes.segpick.multiEntry")}</Button>
   {/if}
-  <button class="row quiet" onclick={onClose}>{t("notes.cancel")}</button>
+  <Button variant="ghost" class="{rowCls} text-muted-foreground" onclick={onClose}>{t("notes.cancel")}</Button>
 </div>
 
 <style>
@@ -102,70 +114,29 @@
     width: 280px;
     max-height: 340px;
     overflow: auto;
-    background: var(--pop-bg, #1c1e22);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 10px;
+    border-radius: var(--radius-lg);
     padding: 8px;
     display: flex;
     flex-direction: column;
     gap: 4px;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
   }
-  .scopes {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+  /* 作用范围单选组与列表之间的发丝线 */
+  .pop :global(.scopes) {
     padding: 2px 4px 6px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    font-size: 12.5px;
+    border-bottom: 1px solid var(--hairline);
   }
-  .scope {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-    cursor: pointer;
-  }
-  .scope.off {
+  .pop :global(.scope[data-off]) {
     opacity: 0.4;
-  }
-  .q {
-    background: rgba(255, 255, 255, 0.06);
-    border: none;
-    border-radius: 6px;
-    padding: 5px 8px;
-    color: inherit;
-    font-size: 13px;
   }
   .list {
     display: flex;
     flex-direction: column;
     overflow: auto;
   }
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 5px 8px;
-    border: none;
-    background: none;
-    color: inherit;
-    text-align: left;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 13px;
-  }
-  .row:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.07);
-  }
-  .row:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .row.new {
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-  }
-  .row.quiet {
-    opacity: 0.6;
+  .divider {
+    height: 1px;
+    background: var(--hairline);
+    margin: 0 2px;
   }
   .dot {
     width: 9px;
@@ -176,7 +147,7 @@
   }
   .sub {
     margin-left: auto;
-    opacity: 0.5;
+    color: var(--ink-faint);
     font-size: 11.5px;
   }
 </style>

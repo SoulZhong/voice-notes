@@ -53,6 +53,9 @@
     type Memo,
   } from "$lib/memos";
   import { displayShortcut } from "$lib/shortcut";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import * as Popover from "$lib/ui/components/popover";
 
   let models = $state<ModelsStatus | null>(null);
 
@@ -305,6 +308,24 @@
       editError = t("record.edit.failed", { e });
     }
   }
+
+  /** 改派菜单是单例 Popover,锚在被点的那枚徽章上(每行各挂一个 Popover 在长录制里太重)。
+      开合仍只由 speakerMenuSeq 决定;这里只记下锚点元素与对应行。 */
+  let speakerMenuAnchor = $state<HTMLElement | null>(null);
+  const speakerMenuLine = $derived(
+    speakerMenuSeq === null ? null : (recording.finals.find((l) => l.seq === speakerMenuSeq) ?? null),
+  );
+  /** Popover 自己发起的关闭(点外面 / Esc):改名输入中就先按失焦语义提交,再收菜单——
+      此前点外面是靠输入框 blur 提交,弹层直接卸载时 blur 不一定触发。 */
+  function onSpeakerMenuOpenChange(open: boolean) {
+    if (open) return;
+    const line = speakerMenuLine;
+    if (line && renamingSeq === line.seq) void commitRename(line);
+    speakerMenuSeq = null;
+  }
+
+  /** 菜单项:全宽左对齐常规字重(覆盖 Button 默认的居中/加粗)。 */
+  const spkItemCls = "w-full justify-start px-2 text-[length:inherit] font-normal";
 
   function toggleSpeakerMenu(seq: number) {
     editingSeq = null;
@@ -705,6 +726,8 @@
 
   // 备注栏展开/收起:按**容器**宽度默认(左侧栏开合会改主区宽度),用户手动选过就记住。
   let liveBodyEl = $state<HTMLElement | null>(null);
+  /** 吸顶操作栏实际高度:备注栏 sticky 的 top 要让开它,否则滚动后被操作栏盖住(e2e 实测)。 */
+  let topbarH = $state(64);
   let liveBodyWidth = $state(1000);
   let memoColPref = $state<boolean | null>(loadMemoColumnPref("record"));
   const memoColOpen = $derived(memoColumnOpen(liveBodyWidth, memoColPref));
@@ -766,7 +789,7 @@
 <div class="container">
   <!-- 头部整体吸顶(标题/下载卡/控制条/状态行/说话人条):录制中转写自动滚到最新,
        操作与说话人对照都不能跟着滚出视口 -->
-  <div class="topbar">
+  <div class="topbar" bind:offsetHeight={topbarH}>
     <!-- 标题按用户要求不再占视觉位置(侧栏已经交代了在哪一页,面板本身也自解释),
          但保留一个仅读屏可见的 h1:页面不该没有标题层级。 -->
     <h1 class="sr-only">{t("record.title")}</h1>
@@ -796,40 +819,46 @@
             <!-- 立即停止:采集在点下停止的瞬间就已关掉,剩下的只是把最后几句转完、落盘。
                  这几秒按「已停止」呈现(开始钮复位、计时定格),只是暂不可点——开录命令
                  会排在收尾之后,与其让人点了干等,不如明说在收尾。 -->
-            <button class="ctl primary" disabled title={t("record.status.finishing")}>
+            <Button class="ctl-start" disabled title={t("record.status.finishing")}>
               <span class="sym dot on-blue"></span>{t("record.btn.start")}
-            </button>
+            </Button>
           {:else if !recording.isLive}
-            <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
+            <Button class="ctl-start" disabled={recording.pending} onclick={startRecording}>
               <span class="sym dot on-blue"></span>{t("record.btn.start")}
-            </button>
+            </Button>
           {:else}
             {#if recording.paused}
-              <button
+              <Button
+                variant="outline"
+                size="icon"
                 class="iconbtn"
                 disabled={recording.pending}
                 onclick={() => recording.unpause()}
                 aria-label={t("record.btn.resume")}
                 title={t("record.btn.resume")}
-              >{@render icoPlay()}</button>
+              >{@render icoPlay()}</Button>
             {:else}
-              <button
+              <Button
+                variant="outline"
+                size="icon"
                 class="iconbtn"
                 disabled={recording.pending}
                 onclick={() => recording.pause()}
                 aria-label={t("record.btn.pause")}
                 title={t("record.btn.pause")}
-              >{@render icoPause()}</button>
+              >{@render icoPause()}</Button>
             {/if}
             <!-- 停止即停,不再二段确认(用户裁定):误点的代价有限——本场已转写的内容照常
                  落盘成笔记,想接着录可以对同一篇「续录」;而每次停止都要点两下的摩擦是常态成本。 -->
-            <button
+            <Button
+              variant="outline"
+              size="icon"
               class="iconbtn rec"
               disabled={recording.pending}
               onclick={() => recording.stop().catch((err) => console.error("停止录制失败", err))}
               aria-label={t("record.btn.stop")}
               title={t("record.btn.stop")}
-            >{@render icoStop()}</button>
+            >{@render icoStop()}</Button>
           {/if}
         </div>
 
@@ -888,11 +917,13 @@
             <span class="ico">{@render icoSearch()}</span>
             <!-- aria-label 必须显式给:放大镜是 aria-hidden 的,只靠 placeholder
                  命名不可靠(读屏实现不一)。 -->
-            <input
+            <Input
+              class="search-input"
               aria-label={t("record.search.placeholder")}
               placeholder={t("record.search.placeholder")}
               bind:value={searchQuery}
               onkeydown={(e) => {
+                if (e.isComposing) return;
                 if (e.key === "Enter") gotoHit(e.shiftKey ? -1 : 1);
                 if (e.key === "Escape") clearReview();
               }}
@@ -902,15 +933,15 @@
                 <span class="hit">
                   {hits.length ? `${activeHitClamped + 1}/${hits.length}` : t("record.search.none")}
                 </span>
-                <button class="ib" onclick={() => gotoHit(-1)} aria-label={t("record.search.prev")} title={t("record.search.prev")}>
+                <Button variant="ghost" size="icon-xs" class="ib" onclick={() => gotoHit(-1)} aria-label={t("record.search.prev")} title={t("record.search.prev")}>
                   {@render icoUp()}
-                </button>
-                <button class="ib" onclick={() => gotoHit(1)} aria-label={t("record.search.next")} title={t("record.search.next")}>
+                </Button>
+                <Button variant="ghost" size="icon-xs" class="ib" onclick={() => gotoHit(1)} aria-label={t("record.search.next")} title={t("record.search.next")}>
                   {@render icoDown()}
-                </button>
-                <button class="ib" onclick={clearReview} aria-label={t("record.search.clear")} title={t("record.search.clear")}>
+                </Button>
+                <Button variant="ghost" size="icon-xs" class="ib" onclick={clearReview} aria-label={t("record.search.clear")} title={t("record.search.clear")}>
                   {@render icoClose()}
-                </button>
+                </Button>
               </span>
             {/if}
           </div>
@@ -922,14 +953,16 @@
           <div class="filter-bar">
             <span class="lbl">{t("record.filter.only")}</span>
             {#each speakerIds as sid (sid)}
-              <button
-                class="chip"
-                class:on={selectedSpeakers.has(sid)}
+              <Button
+                variant="outline"
+                size="xs"
+                class="chip{selectedSpeakers.has(sid) ? ' on' : ''}"
+                aria-pressed={selectedSpeakers.has(sid)}
                 onclick={() => toggleSpeaker(sid)}
-              >{speakerLabel(sid, "mic", recording.speakers)}</button>
+              >{speakerLabel(sid, "mic", recording.speakers)}</Button>
             {/each}
             {#if selectedSpeakers.size > 0}
-              <button class="ghosty" onclick={() => (selectedSpeakers = new Set())}>{t("record.search.clear")}</button>
+              <Button variant="ghost" size="xs" class="ghosty" onclick={() => (selectedSpeakers = new Set())}>{t("record.search.clear")}</Button>
             {/if}
           </div>
         {/if}
@@ -966,12 +999,12 @@
         <div class="banner">
           <strong>{t("record.systemDenied.title")}</strong>
           {t("record.systemDenied.desc")}
-          <button class="link" onclick={openSystemAudioPrivacySettings}>
+          <Button variant="link" size="xs" class="link" onclick={openSystemAudioPrivacySettings}>
             {t("record.banner.openSettings")}
-          </button>
+          </Button>
           <div class="fixline">
             {t("record.banner.permFix")}
-            <button class="link" onclick={fixScreenPerm}>{t("record.banner.permFixBtn")}</button>
+            <Button variant="link" size="xs" class="link" onclick={fixScreenPerm}>{t("record.banner.permFixBtn")}</Button>
             <span class="hint">{t("record.banner.permFixHint")}</span>
           </div>
         </div>
@@ -982,7 +1015,7 @@
           {#if isMacPlatform}
             <div class="fixline">
               {t("record.banner.permFix")}
-              <button class="link" onclick={fixScreenPerm}>{t("record.banner.permFixBtn")}</button>
+              <Button variant="link" size="xs" class="link" onclick={fixScreenPerm}>{t("record.banner.permFixBtn")}</Button>
               <span class="hint">{t("record.banner.permFixHint")}</span>
             </div>
           {/if}
@@ -1007,8 +1040,8 @@
     {#if showMcpHint}
       <div class="banner">
         {t("record.banner.mcpHint")}
-        <button class="link" onclick={() => dismissMcpHint(true)}>{t("record.banner.mcpGo")}</button>
-        <button class="link" onclick={() => dismissMcpHint(false)}>{t("record.banner.mcpDismiss")}</button>
+        <Button variant="link" size="xs" class="link" onclick={() => dismissMcpHint(true)}>{t("record.banner.mcpGo")}</Button>
+        <Button variant="link" size="xs" class="link" onclick={() => dismissMcpHint(false)}>{t("record.banner.mcpDismiss")}</Button>
       </div>
     {/if}
 
@@ -1063,7 +1096,7 @@
     {#if lowInputVol && !isSystemDenied && !isSystemUnavailable}
       <div class="banner">
         {t("record.banner.lowInput", { vol: lowInputVol.vol })}
-        <button class="link" onclick={fixInputVol}>{t("record.banner.setVolume", { target: INPUT_TARGET })}</button>
+        <Button variant="link" size="xs" class="link" onclick={fixInputVol}>{t("record.banner.setVolume", { target: INPUT_TARGET })}</Button>
       </div>
     {/if}
 
@@ -1072,12 +1105,12 @@
     {#if !screenPerm && !recording.isLive && !isSystemDenied}
       <div class="banner">
         {t("record.banner.screenPerm")}
-        <button class="link" onclick={requestScreenPerm}>{t("record.banner.authorizeNow")}</button>
+        <Button variant="link" size="xs" class="link" onclick={requestScreenPerm}>{t("record.banner.authorizeNow")}</Button>
         <span class="hint">{t("record.banner.screenPermHint")}</span>
         {#if showPermFix}
           <div class="fixline">
             {t("record.banner.permFix")}
-            <button class="link" onclick={fixScreenPerm}>{t("record.banner.permFixBtn")}</button>
+            <Button variant="link" size="xs" class="link" onclick={fixScreenPerm}>{t("record.banner.permFixBtn")}</Button>
             <span class="hint">{t("record.banner.permFixHint")}</span>
           </div>
         {/if}
@@ -1097,7 +1130,7 @@
     {#if editError}
       <div class="banner banner-danger">
         {editError}
-        <button class="link" onclick={() => (editError = "")}>{t("record.edit.dismiss")}</button>
+        <Button variant="link" size="xs" class="link" onclick={() => (editError = "")}>{t("record.edit.dismiss")}</Button>
       </div>
     {/if}
 
@@ -1109,11 +1142,11 @@
     {#if memoError}
       <div class="banner banner-danger">
         {memoError}
-        <button class="link" onclick={() => (memoError = "")}>{t("record.edit.dismiss")}</button>
+        <Button variant="link" size="xs" class="link" onclick={() => (memoError = "")}>{t("record.edit.dismiss")}</Button>
       </div>
     {/if}
 
-    <div class="live-body" class:with-memos={recording.isLive || recording.memos.length > 0} class:memo-col-closed={!memoColOpen} bind:this={liveBodyEl}>
+    <div class="live-body" class:with-memos={recording.isLive || recording.memos.length > 0} class:memo-col-closed={!memoColOpen} bind:this={liveBodyEl} style:--memo-col-top="{topbarH + 8}px">
     <div class="transcript-wrap">
       <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
       {#each memosAfter.get(-1) ?? [] as m (m.id)}
@@ -1129,51 +1162,28 @@
           class:hit-active={hits[activeHitClamped] === i}
         >
           <span class="spk-anchor">
+            <!-- 徽章保持原生按钮(说话人 tint 配色内联);点开的改派菜单是页面级单例 Popover(见文末)。 -->
             <button
               class="badge as-btn"
               style="background: {speakerColor(line.speaker, line.source, recording.speakers)}; color: {speakerInk(line.speaker, line.source, recording.speakers)}"
               disabled={!recording.isLive || recording.stopping}
               title={t("record.edit.speaker")}
-              onclick={() => toggleSpeakerMenu(line.seq)}
+              aria-haspopup="menu"
+              aria-expanded={speakerMenuSeq === line.seq}
+              onclick={(e) => {
+                speakerMenuAnchor = e.currentTarget;
+                toggleSpeakerMenu(line.seq);
+              }}
             >{speakerLabel(line.speaker, line.source, recording.speakers)}</button>
-            {#if speakerMenuSeq === line.seq}
-              <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_interactive_supports_focus -->
-              <span class="spk-menu" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()}>
-                {#each speakerIds as sid (sid)}
-                  <button class="spk-item" role="menuitem" onclick={() => pickSpeaker(line, sid)}>
-                    {speakerLabel(sid, "mic", recording.speakers)}
-                  </button>
-                {/each}
-                {#if line.speaker}
-                  <span class="spk-sep"></span>
-                  {#if renamingSeq === line.seq}
-                    <!-- svelte-ignore a11y_autofocus -->
-                    <input
-                      class="spk-rename-input"
-                      autofocus
-                      bind:value={renameText}
-                      onkeydown={(e) => {
-                        if (e.key === "Enter") commitRename(line);
-                        if (e.key === "Escape") renamingSeq = null;
-                      }}
-                      onblur={() => commitRename(line)}
-                    />
-                  {:else}
-                    <button class="spk-item" role="menuitem" onclick={() => beginRename(line)}>
-                      {t("record.edit.rename")}
-                    </button>
-                  {/if}
-                {/if}
-              </span>
-            {/if}
           </span>
           {#if editingSeq === line.seq}
             <!-- svelte-ignore a11y_autofocus -->
-            <input
+            <Input
               class="edit-inline"
               autofocus
               bind:value={editingText}
               onkeydown={(e) => {
+                if (e.isComposing) return;
                 if (e.key === "Enter") commitEdit(line);
                 if (e.key === "Escape") editingSeq = null;
               }}
@@ -1182,11 +1192,11 @@
           {:else}
             {line.text}
             {#if recording.isLive && !recording.stopping}
-              <button class="row-act" title={t("record.edit.text")} onclick={() => beginEdit(line)}>
+              <Button variant="ghost" size="icon-xs" class="row-act" title={t("record.edit.text")} aria-label={t("record.edit.text")} onclick={() => beginEdit(line)}>
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M11.3 2.4l2.3 2.3L5.3 13l-3 .7.7-3z" />
                 </svg>
-              </button>
+              </Button>
             {/if}
           {/if}
         </p>
@@ -1234,7 +1244,7 @@
     {#if undoMemo}
       <div class="memo-undo">
         {t("memo.deleted")}
-        <button class="link" onclick={() => void undoDelete()}>{t("memo.undo")}</button>
+        <Button variant="link" size="xs" class="link" onclick={() => void undoDelete()}>{t("memo.undo")}</Button>
       </div>
     {/if}
 
@@ -1242,13 +1252,63 @@
          录制中底部有备注输入框,药丸抬到它上方(.above-composer)。 -->
     <div class="jump-anchor" class:above-composer={recording.isLive} aria-hidden={follow || !recording.isLive}>
       {#if !follow && recording.isLive}
-        <button class="jump" onclick={jumpToLatest}>{t("record.jumpLatest")}</button>
+        <Button size="sm" class="jump" onclick={jumpToLatest}>{t("record.jumpLatest")}</Button>
       {/if}
     </div>
     {#if recording.isLive && recording.noteId}
       <RecordMemoComposer noteId={recording.noteId} onSaved={(m) => flashMemo(m.id)} />
     {/if}
   {/if}
+
+  <!-- 改派说话人菜单(单例):锚在被点的徽章上(customAnchor),点同一枚徽章由徽章自己的
+       onclick 收起(bits 对锚点内的点击不当作「点外面」)。里面有改名输入框,所以用 Popover
+       而非 DropdownMenu——菜单的按字母跳转会把输入框里的键吃掉。
+       改名框 Esc 只退出改名、不收菜单(与原手写菜单一致),故在 onEscapeKeydown 里拦下。 -->
+  <Popover.Root bind:open={() => speakerMenuLine !== null, onSpeakerMenuOpenChange}>
+    {#if speakerMenuLine}
+      {@const line = speakerMenuLine}
+      <Popover.Content
+        customAnchor={speakerMenuAnchor}
+        side="bottom"
+        align="start"
+        sideOffset={4}
+        role="menu"
+        class="w-auto min-w-32 gap-0 p-1 text-[0.85rem]"
+      >
+        {#each speakerIds as sid (sid)}
+          <Button variant="ghost" size="sm" class={spkItemCls} role="menuitem" onclick={() => pickSpeaker(line, sid)}>
+            {speakerLabel(sid, "mic", recording.speakers)}
+          </Button>
+        {/each}
+        {#if line.speaker}
+          <span class="spk-sep"></span>
+          {#if renamingSeq === line.seq}
+            <!-- svelte-ignore a11y_autofocus -->
+            <Input
+              data-spk-rename
+              class="h-7 rounded-md border-0 bg-transparent px-2 text-[length:inherit] shadow-none focus-visible:ring-0 md:text-[length:inherit] dark:bg-transparent"
+              autofocus
+              bind:value={renameText}
+              onkeydown={(e) => {
+                if (e.isComposing) return;
+                if (e.key === "Enter") commitRename(line);
+                if (e.key === "Escape") {
+                  // 只退出改名、不关菜单:在输入框上截住冒泡,菜单的 Esc 层(document 冒泡阶段)收不到。
+                  e.stopPropagation();
+                  renamingSeq = null;
+                }
+              }}
+              onblur={() => commitRename(line)}
+            />
+          {:else}
+            <Button variant="ghost" size="sm" class={spkItemCls} role="menuitem" onclick={() => beginRename(line)}>
+              {t("record.edit.rename")}
+            </Button>
+          {/if}
+        {/if}
+      </Popover.Content>
+    {/if}
+  </Popover.Root>
 </div>
 
 <style>
@@ -1321,39 +1381,28 @@
   }
   /* 圆形图标钮:34px 命中区(≥Apple HIG 的紧凑下限),1px 描边立形状,悬停上一级表面。
      停止钮走 record 红描边+红图标:它是破坏性动作,但仍属"录制语义"而非 danger 确认。 */
-  .iconbtn {
+  /* 图标钮是 Button(outline/icon),这里只钉形状与录制语义色;聚焦环/禁用态走组件。
+     底色透明:暂停时面板转 warning 底,outline 的 canvas 底会在上面抠出一个圆。 */
+  .ctl-group :global(.iconbtn) {
     width: 34px;
     height: 34px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
     flex: none;
     border-radius: var(--radius-full);
-    border: 1px solid var(--hairline-strong);
+    border-color: var(--hairline-strong);
     background: transparent;
     color: var(--ink);
-    cursor: pointer;
-    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
   }
-  .iconbtn:hover:not(:disabled) {
+  .ctl-group :global(.iconbtn:hover:not(:disabled)) {
     background: var(--surface-soft);
   }
-  .iconbtn:active:not(:disabled) {
+  .ctl-group :global(.iconbtn:active:not(:disabled)) {
     background: var(--surface-press);
   }
-  .iconbtn:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .iconbtn:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  .iconbtn.rec {
+  .ctl-group :global(.iconbtn.rec) {
     color: var(--record);
     border-color: color-mix(in srgb, var(--record) 40%, transparent);
   }
-  .iconbtn.rec:hover:not(:disabled) {
+  .ctl-group :global(.iconbtn.rec:hover:not(:disabled)) {
     background: color-mix(in srgb, var(--record) 12%, transparent);
   }
   /* 计时英雄位:一场录音最该一眼看到的是"录了多久"。等宽数字 + 紧字距,
@@ -1460,24 +1509,17 @@
   /* button-secondary 形态：暗色第一公民下 canvas 底=页面底(#07080a 同色)，
      无边+shadow-btn 会让按钮完全隐形；shadow-btn 是主按钮药丸专用高光，这里
      改用 transparent + hairline-strong 描边，靠轮廓立住形状 */
-  .ctl {
-    display: inline-flex;
-    align-items: center;
+  /* 「开始录制」是 Button(default=primary 底),这里只钉药丸形状与字号。 */
+  .ctl-group :global(.ctl-start) {
+    height: auto;
     gap: 0.45em;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-full);
     padding: 0.45em 1.1em;
-    font-weight: 500;
     font-size: 0.9rem;
-    cursor: pointer;
-    background: transparent;
-    color: var(--ink);
   }
-  .ctl:hover { background: var(--surface-soft); }
-  .ctl:disabled { opacity: 0.6; cursor: default; }
-  /* 主停止按钮走 primary 药丸，不需要 secondary 的 hairline 描边 */
-  .ctl.primary { background: var(--primary); color: var(--on-primary); border-radius: var(--radius-full); border-color: transparent; }
-  .ctl.primary:hover { background: var(--primary-pressed); }
+  .ctl-group :global(.ctl-start:hover:not(:disabled)) {
+    background: var(--primary-pressed);
+  }
   /* 录制符号用 CSS 图形而非 Unicode 字符(●■▶ 各平台字形/基线不一,显糙) */
   .sym {
     width: 9px;
@@ -1582,15 +1624,22 @@
     display: inline-flex;
     flex: none;
   }
-  .review-bar .search input {
-    all: unset;
+  /* 输入框是 Input 组件:药丸本身已是输入外观(底色 + 聚焦描边),组件的边框/底/聚焦环全收掉。 */
+  .review-bar .search :global(.search-input) {
     flex: 1 1 auto;
     min-width: 0;
+    width: auto;
+    height: auto;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
     font: inherit;
     font-size: 0.86rem;
     color: var(--ink);
   }
-  .review-bar .search input::placeholder {
+  .review-bar .search :global(.search-input::placeholder) {
     color: var(--ink-faint);
   }
   .review-bar .search:focus-within {
@@ -1612,25 +1661,15 @@
     white-space: nowrap;
     color: var(--ink-faint);
   }
-  .review-bar .tools .ib {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
+  .review-bar .tools :global(.ib) {
     width: 22px;
     height: 22px;
-    border: 0;
-    background: none;
     color: var(--ink-secondary);
     border-radius: var(--radius-full);
-    cursor: pointer;
   }
-  .review-bar .tools .ib:hover {
+  .review-bar .tools :global(.ib:hover) {
     background: var(--surface-press);
     color: var(--ink);
-  }
-  .review-bar .tools .ib:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
   }
   /* 说话人过滤行:搜索占满整行后,chips 单独一行。 */
   .filter-bar {
@@ -1658,29 +1697,32 @@
     border: 0;
   }
   /* 幽灵按钮:无边透明底，弱化成次级操作(上一个/下一个/清除)，不与说话人 chip 抢视觉。 */
-  .filter-bar .ghosty {
-    border: none;
-    background: none;
+  .filter-bar :global(.ghosty) {
+    height: auto;
     color: var(--ink-secondary);
-    border-radius: var(--radius-md);
     padding: 0.25em 0.5em;
     font-size: 0.85rem;
-    cursor: pointer;
+    font-weight: 400;
   }
-  .filter-bar .ghosty:hover {
+  .filter-bar :global(.ghosty:hover) {
     background: var(--surface-soft);
     color: var(--ink);
   }
-  .filter-bar .chip {
+  /* 过滤 chip:Button(outline xs)压成药丸;选中态 accent 点亮(aria-pressed 同步给读屏)。 */
+  .filter-bar :global(.chip) {
+    height: auto;
     border-radius: var(--radius-full);
     padding: 0.1em 0.6em;
-    border: 1px solid var(--hairline);
+    border-color: var(--hairline);
     background: transparent;
     color: var(--ink-secondary);
     font-size: 0.85rem;
-    cursor: pointer;
+    font-weight: 400;
   }
-  .filter-bar .chip.on {
+  .filter-bar :global(.chip:hover) {
+    background: var(--surface-soft);
+  }
+  .filter-bar :global(.chip.on) {
     background: var(--accent-tint);
     border-color: var(--accent);
     color: var(--ink);
@@ -1836,45 +1878,10 @@
   .badge.as-btn:disabled {
     cursor: default;
   }
-  /* 徽章 + 改派菜单的定位锚点:inline-block 让 .spk-menu 精确贴着徽章下缘展开,
-     不受同行后续文字影响。 */
+  /* 徽章容器:inline-block 让徽章整体不被同行文字折断(改派菜单锚在徽章上,经 portal 弹出)。 */
   .spk-anchor {
     position: relative;
     display: inline-block;
-  }
-  /* menu/popover（改派说话人）：DESIGN.md 浮层规范——surface-press 底、hairline 边、
-     radius-lg、shadow-popover，与 SpeakerChips .panel / 详情页 .export-menu 同规格。 */
-  .spk-menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    left: 0;
-    z-index: 20;
-    display: flex;
-    flex-direction: column;
-    min-width: 8rem;
-    padding: 0.25rem;
-    background: var(--surface-press);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-    font-size: 0.85rem;
-    font-weight: 400;
-    cursor: default;
-  }
-  .spk-item {
-    display: block;
-    width: 100%;
-    background: none;
-    border: none;
-    color: var(--ink);
-    text-align: left;
-    padding: 0.35rem 0.55rem;
-    border-radius: var(--radius-md);
-    font: inherit;
-    cursor: pointer;
-  }
-  .spk-item:hover {
-    background: var(--surface-soft);
   }
   .spk-sep {
     display: block;
@@ -1882,51 +1889,35 @@
     background: var(--hairline);
     margin: 0.2rem 0.1rem;
   }
-  .spk-rename-input {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 0.35rem 0.55rem;
-    background: transparent;
-    border: none;
-    outline: none;
-    font: inherit;
-    color: var(--ink);
-  }
-
   /* 段落文本行内编辑:与徽章齐平，覆盖当前段文字的量 */
-  .edit-inline {
+  .transcript :global(.edit-inline) {
+    display: inline-block;
     width: min(100%, 32rem);
+    height: auto;
     font: inherit;
     color: var(--ink);
     background: var(--surface);
-    border: 1px solid var(--hairline-strong);
+    border-color: var(--hairline-strong);
     border-radius: var(--radius-sm);
     padding: 0.1em 0.4em;
   }
 
   /* 行级操作(编辑铅笔):悬停显影惯例(DESIGN.md #6)——默认隐身，行 hover 或
      自身 focus-visible 时浮现，保持转写区安静。 */
-  .row-act {
+  .final :global(.row-act) {
     visibility: hidden;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
     vertical-align: middle;
     width: 1.5rem;
     height: 1.5rem;
     margin-left: 0.2em;
-    padding: 0;
-    border: none;
-    background: none;
     color: var(--ink-faint);
     border-radius: var(--radius-sm);
-    cursor: pointer;
   }
-  .final:hover .row-act,
-  .row-act:focus-visible {
+  .final:hover :global(.row-act),
+  .final :global(.row-act:focus-visible) {
     visibility: visible;
   }
-  .row-act:hover {
+  .final :global(.row-act:hover) {
     color: var(--accent);
     background: var(--surface-soft);
   }
@@ -1962,12 +1953,13 @@
     padding: 0.3rem 0.9rem;
     font-size: 0.85rem;
   }
-  .memo-undo .link {
-    background: none;
-    border: none;
+  .memo-undo :global(.link) {
+    height: auto;
+    padding: 0 0.3em;
     color: var(--accent);
-    cursor: pointer;
     font-size: inherit;
+    font-weight: 400;
+    text-decoration: none;
   }
   .jump-anchor.above-composer {
     bottom: 5rem;
@@ -1980,18 +1972,15 @@
     justify-content: center;
     align-items: flex-end;
   }
-  .jump {
-    border: none;
+  /* 「回到最新」:Button(default=primary 底)压成浮起的药丸。 */
+  .jump-anchor :global(.jump) {
+    height: auto;
     border-radius: var(--radius-full);
-    background: var(--primary);
-    color: var(--on-primary);
     font-size: 0.85rem;
-    font-weight: 500;
     padding: 0.4em 1em;
-    cursor: pointer;
     box-shadow: var(--shadow-popover);
   }
-  .jump:hover {
+  .jump-anchor :global(.jump:hover) {
     background: var(--primary-pressed);
   }
 
@@ -2004,14 +1993,15 @@
     margin: 0.5rem 0 1rem;
     font-size: 0.95rem;
   }
-  .banner .link {
-    background: none;
-    border: none;
+  /* 横幅里的链接式动作:Button(link),随正文字号、accent 色、常显下划线。 */
+  .banner :global(.link) {
+    height: auto;
+    vertical-align: baseline;
     color: var(--accent);
     text-decoration: underline;
-    cursor: pointer;
     padding: 0 0.2em;
     font-size: inherit;
+    font-weight: 400;
   }
   .banner .hint { color: var(--warning-ink); }
   .banner .fixline {

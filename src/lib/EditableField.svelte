@@ -4,6 +4,16 @@
   // 失焦不做任何事——点「确认」按钮时 blur 先于 click 触发,任何 blur 语义
   // 都会吃掉这次点击,这是显式两按钮设计的前提。
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
+  import { Input } from "$lib/ui/components/input";
+  import { cn } from "$lib/ui/utils";
+
+  // 控件外观(UI 改版):小号描边钮;「确认」用 accent 描边字区分主次。
+  const btn = (primary = false) =>
+    cn(
+      "h-6 px-3 text-[0.8rem] text-muted-foreground hover:text-foreground",
+      primary && "border-ring text-ring hover:text-ring dark:border-ring",
+    );
 
   let {
     value = "",
@@ -53,7 +63,8 @@
     editing = false; // 丢弃草稿,值以确认态(外部真值)为准
   }
   function onKey(e: KeyboardEvent) {
-    if (e.key === "Enter") {
+    // 中文输入法选词的 Enter 不是提交。
+    if (e.key === "Enter" && !e.isComposing) {
       e.preventDefault();
       void confirm();
     } else if (e.key === "Escape") {
@@ -65,24 +76,24 @@
 
 {#if editing}
   <div class="ef editing" class:wide>
-    <input
-      bind:this={inputEl}
-      class="ef-input"
+    <Input
+      bind:ref={inputEl}
+      class="h-7 min-w-36 flex-1 border-transparent bg-accent px-2.5 text-[0.85rem] md:text-[0.85rem] dark:bg-accent"
       type={masked ? "password" : "text"}
       {placeholder}
       bind:value={draft}
       onkeydown={onKey}
       disabled={saving}
     />
-    <button class="ef-btn primary" onclick={confirm} disabled={saving}>{t("common.confirm")}</button>
-    <button class="ef-btn" onclick={cancel} disabled={saving}>{t("settings.cancel")}</button>
+    <Button variant="outline" size="xs" class={btn(true)} onclick={confirm} disabled={saving}>{t("common.confirm")}</Button>
+    <Button variant="outline" size="xs" class={btn()} onclick={cancel} disabled={saving}>{t("settings.cancel")}</Button>
   </div>
 {:else}
   <div class="ef" class:wide>
     <span class="ef-value" class:faint={!value} title={masked || !value ? undefined : value}>
       {#if !value}{placeholder || t("common.notSet")}{:else if masked}••••••••••{:else}{value}{/if}
     </span>
-    <button class="ef-btn" onclick={beginEdit} {disabled}>{t("common.edit")}</button>
+    <Button variant="outline" size="xs" class={btn()} onclick={beginEdit} {disabled}>{t("common.edit")}</Button>
   </div>
 {/if}
 
@@ -108,43 +119,5 @@
   }
   .ef-value.faint {
     color: var(--ink-faint, var(--ink-secondary));
-  }
-  .ef-input {
-    flex: 1;
-    min-width: 9rem;
-    box-sizing: border-box;
-    padding: 0.32em 0.6em;
-    border: none;
-    border-radius: var(--radius-md);
-    background: var(--surface-press);
-    color: var(--ink);
-    font-size: 0.85rem;
-  }
-  .ef-input:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
-  .ef-btn {
-    flex: none;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    padding: 0.28em 0.8em;
-    font-size: 0.8rem;
-    font-weight: 500;
-    cursor: pointer;
-    background: transparent;
-    color: var(--ink-secondary);
-  }
-  .ef-btn:hover:not(:disabled) {
-    background: var(--surface-soft);
-    color: var(--ink);
-  }
-  .ef-btn.primary {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  .ef-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
   }
 </style>

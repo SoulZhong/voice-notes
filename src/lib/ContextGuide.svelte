@@ -3,6 +3,7 @@
   import { getSettings, setSettings } from "$lib/models";
   import { PRODUCT_GUIDES, type ProductGuide, type ProductGuideStep } from "$lib/onboarding";
   import { t } from "$lib/i18n/index.svelte";
+  import { Button } from "$lib/ui/components/button";
 
   let guide = $state<ProductGuide | null>(null);
   let steps = $state<ProductGuideStep[]>([]);
@@ -114,8 +115,8 @@
     <strong>{t(current.title)}</strong>
     <p>{t(current.body)}</p>
     <div class="actions">
-      <button class="skip" onclick={complete}>{t("shell.guide.skip")}</button>
-      <button class="next" onclick={next}>{step === steps.length - 1 ? t("shell.guide.done") : t("shell.guide.next")}</button>
+      <Button variant="ghost" size="sm" class="h-7 px-2 text-[0.8rem] font-normal text-muted-foreground" onclick={complete}>{t("shell.guide.skip")}</Button>
+      <Button size="sm" class="h-7 rounded-full px-4 text-[0.8rem] shadow-(--shadow-btn) hover:bg-(color:--primary-pressed)" onclick={next}>{step === steps.length - 1 ? t("shell.guide.done") : t("shell.guide.next")}</Button>
     </div>
   </aside>
 {/if}
@@ -150,12 +151,5 @@
   span { color: var(--accent); font-size: 0.72rem; }
   strong { display: block; margin-top: 0.12rem; font-size: 0.92rem; }
   p { margin: 0.25rem 0 0; color: var(--ink-secondary); font-size: 0.8rem; line-height: 1.5; }
-  .actions { display: flex; justify-content: flex-end; align-items: center; gap: 0.65rem; margin-top: 0.75rem; }
-  button { cursor: pointer; font-size: 0.8rem; }
-  .skip { border: none; background: none; color: var(--ink-secondary); }
-  .next {
-    border: 1px solid transparent; border-radius: var(--radius-full);
-    background: var(--primary); color: var(--on-primary);
-    padding: 0.48em 1.15em; box-shadow: var(--shadow-btn);
-  }
+  .actions { display: flex; justify-content: flex-end; align-items: center; gap: 0.4rem; margin-top: 0.75rem; }
 </style>

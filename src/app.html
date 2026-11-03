@@ -5,6 +5,22 @@
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Tauri + SvelteKit + Typescript App</title>
+    <script>
+      // 首帧外观(UI 改版 #730):在第一次绘制前按上次的皮肤/明暗设好根元素,免得启动先闪默认色。
+      // 只认白名单值;读不到/坏值就什么都不做(等 layout 读后端设置后对账)。键与 src/lib/theme.ts 一致。
+      try {
+        var a = JSON.parse(localStorage.getItem("vn.appearance") || "null");
+        var fam = a && ["classic", "paper", "nord"].indexOf(a.family) >= 0 ? a.family : "classic";
+        var mode = a && ["system", "light", "dark"].indexOf(a.mode) >= 0 ? a.mode : "system";
+        var dark = mode === "dark" || (mode === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+        var r = document.documentElement;
+        // shadcn Blocks 风格层(#730 二期,src/lib/ui/shadcn.css):默认打开;localStorage "vn.style"="legacy" 可回旧外观对照。
+        r.dataset.vnStyle = localStorage.getItem("vn.style") === "legacy" ? "legacy" : "shadcn";
+        r.dataset.vnTheme = fam;
+        r.dataset.vnMode = dark ? "dark" : "light";
+        if (mode !== "system") r.style.colorScheme = mode;
+      } catch (e) {}
+    </script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">

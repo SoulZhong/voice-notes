@@ -7,6 +7,9 @@
   import { t } from "$lib/i18n/index.svelte";
   import Segmented from "$lib/Segmented.svelte";
   import type { SegmentedItem } from "$lib/segmented";
+  import { Button } from "$lib/ui/components/button";
+  import { Switch } from "$lib/ui/components/switch";
+  import * as Dialog from "$lib/ui/components/dialog";
   import { downloadModels, modelsStatus, onModelDownload, type Settings } from "$lib/models";
   import {
     deviceConnect,
@@ -239,15 +242,15 @@
         </div>
         <div class="actions">
           {#if !status.device_name}
-            <button class="btn" disabled={busy} onclick={openPicker}>{t("device.connect")}</button>
+            <Button variant="outline" size="sm" disabled={busy} onclick={openPicker}>{t("device.connect")}</Button>
           {:else}
             {#if help?.action === "repair"}
-              <button class="btn" disabled={busy} onclick={() => run(deviceRepair)}>{t("device.repair")}</button>
+              <Button variant="outline" size="sm" disabled={busy} onclick={() => run(deviceRepair)}>{t("device.repair")}</Button>
             {:else if help || !status.running}
-              <button class="btn" disabled={busy} onclick={() => run(deviceReconnect)}>{t("device.reconnect")}</button>
+              <Button variant="outline" size="sm" disabled={busy} onclick={() => run(deviceReconnect)}>{t("device.reconnect")}</Button>
             {/if}
-            <button class="btn" disabled={busy} onclick={openPicker}>{t("device.connect")}</button>
-            <button class="btn quiet" disabled={busy} onclick={forget}>{t("device.forget")}</button>
+            <Button variant="outline" size="sm" disabled={busy} onclick={openPicker}>{t("device.connect")}</Button>
+            <Button variant="ghost" size="sm" class="text-muted-foreground" disabled={busy} onclick={forget}>{t("device.forget")}</Button>
           {/if}
         </div>
       </div>
@@ -263,13 +266,13 @@
       {#if status.device_name && isMac && !status.accessibility}
         <div class="notice notice-action">
           <span>{axWaiting ? t("device.perm.waiting") : t("device.perm.accessibility")}</span>
-          <button class="btn" onclick={grantAccessibility}>{t("device.perm.grant")}</button>
+          <Button variant="outline" size="sm" onclick={grantAccessibility}>{t("device.perm.grant")}</Button>
         </div>
       {/if}
       {#if status.device_name && isMac && status.speech_permission !== "authorized"}
         <div class="notice notice-action">
           <span>{status.speech_permission === "not determined" ? t("device.perm.speechAsk") : t("device.perm.speech")}</span>
-          <button class="btn" onclick={grantSpeech}>{t("device.perm.grant")}</button>
+          <Button variant="outline" size="sm" onclick={grantSpeech}>{t("device.perm.grant")}</Button>
         </div>
       {/if}
       {#if status.device_name && status.missing_models.length > 0}
@@ -285,7 +288,7 @@
             {#if downloadError}<span class="row-desc err">{downloadError}</span>{/if}
           </div>
           {#if Object.keys(downloading).length === 0}
-            <button class="btn" onclick={startDownload}>{t("device.models.download")}</button>
+            <Button variant="outline" size="sm" onclick={startDownload}>{t("device.models.download")}</Button>
           {/if}
         </div>
       {/if}
@@ -319,12 +322,11 @@
           <span class="row-label">{t("device.saveText.label")}</span>
           <span class="row-desc">{t("device.saveText.desc")}</span>
         </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="flex-none"
           checked={settings?.dictation_save_text ?? true}
           disabled={!settings}
-          onchange={(e) => save((s) => (s.dictation_save_text = (e.target as HTMLInputElement).checked))}
+          onCheckedChange={(on) => save((s) => (s.dictation_save_text = on))}
         />
       </label>
       <label class="row">
@@ -332,12 +334,11 @@
           <span class="row-label">{t("device.saveAudio.label")}</span>
           <span class="row-desc">{t("device.saveAudio.desc")}</span>
         </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="flex-none"
           checked={settings?.dictation_save_audio ?? false}
           disabled={!settings || settings.dictation_save_text === false}
-          onchange={(e) => save((s) => (s.dictation_save_audio = (e.target as HTMLInputElement).checked))}
+          onCheckedChange={(on) => save((s) => (s.dictation_save_audio = on))}
         />
       </label>
       <label class="row">
@@ -345,12 +346,11 @@
           <span class="row-label">{t("device.aiAccess.label")}</span>
           <span class="row-desc">{t("device.aiAccess.desc")}</span>
         </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
+        <Switch
+          class="flex-none"
           checked={settings?.dictation_ai_access ?? false}
           disabled={!settings}
-          onchange={(e) => save((s) => (s.dictation_ai_access = (e.target as HTMLInputElement).checked))}
+          onCheckedChange={(on) => save((s) => (s.dictation_ai_access = on))}
         />
       </label>
     {/if}
@@ -358,12 +358,14 @@
   {#if error}<p class="err">{error}</p>{/if}
 </section>
 
-{#if picking}
-  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-  <div class="scrim" onclick={() => (picking = false)}></div>
-  <div class="picker" role="dialog" aria-labelledby="device-scan-title">
-    <h3 id="device-scan-title">{t("device.scan.title")}</h3>
-    <p class="hint">{t("device.scan.hint")}</p>
+<Dialog.Root bind:open={picking}>
+  <Dialog.Content
+    showCloseButton={false}
+    aria-labelledby="device-scan-title"
+    class="max-h-[min(32rem,calc(100vh_-_2rem))] gap-0 overflow-auto p-5 sm:max-w-[26rem]"
+  >
+    <Dialog.Title id="device-scan-title" class="text-[1.05rem] font-[550]">{t("device.scan.title")}</Dialog.Title>
+    <Dialog.Description class="mt-1.5 text-[0.84rem] leading-[1.6]">{t("device.scan.hint")}</Dialog.Description>
     {#if scanning}
       <p class="hint">{t("device.scan.scanning")}</p>
     {:else if scanError}
@@ -371,7 +373,7 @@
     {:else if found.length === 0}
       <p class="hint">{t("device.scan.empty")}</p>
     {/if}
-    <ul>
+    <ul class="picker-list">
       <!-- 连着的设备不再广播,搜索里永远找不到它:单列一行,免得以为它不见了 -->
       {#if connectedName}
         <li>
@@ -390,22 +392,16 @@
               {#if d.paired}· {t("device.scan.paired")}{/if}
             </span>
           </div>
-          <button class="btn primary" onclick={() => choose(d)}>{t("device.scan.choose")}</button>
+          <Button size="sm" onclick={() => choose(d)}>{t("device.scan.choose")}</Button>
         </li>
       {/each}
     </ul>
     <div class="picker-actions">
-      <button class="btn" disabled={scanning} onclick={scan}>{t("device.scan.rescan")}</button>
-      <button class="btn" onclick={() => (picking = false)}>{t("device.pin.cancel")}</button>
+      <Button variant="outline" size="sm" disabled={scanning} onclick={scan}>{t("device.scan.rescan")}</Button>
+      <Button variant="outline" size="sm" onclick={() => (picking = false)}>{t("device.pin.cancel")}</Button>
     </div>
-  </div>
-{/if}
-
-<svelte:window
-  onkeydown={(e) => {
-    if (e.key === "Escape" && picking) picking = false;
-  }}
-/>
+  </Dialog.Content>
+</Dialog.Root>
 
 <style>
   section { margin-top: 1.3rem; }
@@ -442,7 +438,6 @@
   .row-info { flex: 1; min-width: min(16rem, 100%); display: flex; flex-direction: column; gap: 0.1rem; }
   .row-label { font-size: 0.92rem; color: var(--ink); }
   .row-desc { font-size: 0.8rem; color: var(--ink-secondary); line-height: 1.4; }
-  .ctl { flex: none; margin: 0; }
   .device-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .device-line .name { color: var(--ink); font-variant-numeric: tabular-nums; }
   .fw { color: var(--ink-faint); }
@@ -464,43 +459,9 @@
     gap: 1rem;
   }
   .err { color: var(--danger); font-size: 0.8rem; }
-  .btn {
-    flex: none;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    padding: 0.35em 0.9em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    cursor: pointer;
-    background: transparent;
-    color: var(--ink);
-  }
-  .btn:hover { background: var(--surface-soft); }
-  .btn:disabled { opacity: 0.5; cursor: default; background: transparent; }
-  .btn.quiet { border-color: transparent; color: var(--ink-secondary); }
-  .btn.primary { border-color: transparent; background: var(--primary); color: var(--on-primary); box-shadow: var(--shadow-btn); }
-  .btn.primary:hover { background: var(--primary-pressed); }
-  .scrim { position: fixed; inset: 0; background: light-dark(rgba(20, 21, 22, 0.28), rgba(0, 0, 0, 0.64)); z-index: 50; }
-  .picker {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: min(26rem, calc(100vw - 2rem));
-    max-height: min(32rem, calc(100vh - 2rem));
-    overflow: auto;
-    padding: 20px;
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-xl);
-    background: var(--surface);
-    color: var(--ink);
-    box-shadow: var(--shadow-popover);
-    z-index: 51;
-  }
-  .picker h3 { margin: 0; font-size: 1.05rem; font-weight: 550; }
   .hint { margin: 6px 0 0; color: var(--ink-secondary); font-size: 0.84rem; line-height: 1.6; }
-  .picker ul { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 8px; }
-  .picker li {
+  .picker-list { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 8px; }
+  .picker-list li {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -509,8 +470,7 @@
     border: 1px solid var(--hairline);
     border-radius: var(--radius-md);
   }
-  .picker li .name { display: block; font-size: 0.92rem; }
-  .picker li .meta { font-size: 0.76rem; color: var(--ink-faint); }
+  .picker-list li .name { display: block; font-size: 0.92rem; }
+  .picker-list li .meta { font-size: 0.76rem; color: var(--ink-faint); }
   .picker-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-  @media (pointer: coarse) { .btn { min-height: 44px; } }
 </style>
