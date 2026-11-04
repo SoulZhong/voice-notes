@@ -58,6 +58,13 @@
   // baseSer = 会话基线(盘上内容)经本编辑器序列化后的样子:「有没有改动」与三方合并都拿它比,
   // 行格式与 serialize() 一致,不会因格式差异冒出假改动。
   let baseSer = "";
+  /** 编辑器上次与盘对齐时的盘面原文(随保存一起交给会话,作为这份改动的基线)。 */
+  let baseRaw = "";
+  /** 保存在途时到达的事件:等回执后再判定是不是自己这次保存。 */
+  let deferred: Doc | null = null;
+  /** 本编辑器一次只有一份保存在途(之后的改动等它回来再存,基线才对得上);在途那份的文本。 */
+  let inflight: string | null = null;
+  let again = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let destroyed = false;
   // 插件闭包里读的「此刻」、回调与可编辑:用普通变量转一手,不在 effect 外读 prop。
@@ -103,6 +110,7 @@
 
   function adopt(doc: Doc) {
     session.base = doc;
+    baseRaw = doc.text;
     baseSer = normalize(doc.text);
   }
 
@@ -113,18 +121,28 @@
 
   async function save() {
     if (!editor || !loaded) return;
+    if (inflight !== null) {
+      again = true;
+      return;
+    }
     const text = serialize();
     if (text === baseSer) return;
     if (text.length > MEMO_DOC_MAX_CHARS) {
       error = t("memo.doc.tooLong", { n: MEMO_DOC_MAX_CHARS });
       return;
     }
+    inflight = text;
     try {
-      const out = await saveSerial(session, text);
+      const out = await saveSerial(session, text, baseRaw);
       if (destroyed || !editor) return;
       error = "";
       const typedSince = serialize() !== text;
+      baseRaw = out.doc.text;
       baseSer = normalize(out.doc.text);
+      // 在途期间暂存的事件:就是这次保存落盘的那份(含后端钳过时间的)→ 只当确认
+      const ev = deferred;
+      deferred = null;
+      if (ev && ev.rev !== out.doc.rev && session.pending === 0) queueMicrotask(() => absorbRemote(ev));
       if (out.merged) {
         // 落盘内容不是本次提交的原样(与别处改动合并过,或后端钳过时间点)
         if (!typedSince) setContent(out.doc.text);
@@ -139,16 +157,26 @@
       }
     } catch (e) {
       if (!destroyed) error = t("memo.failed", { e: String(e) });
+    } finally {
+      inflight = null;
+      if (again && !destroyed) {
+        again = false;
+        void save();
+      }
     }
   }
 
   /** 盘上变了:自己保存引起的就当确认;别处改的 → 没改动直接换成盘上的,有改动三方合并并重存。 */
   function absorbRemote(doc: Doc) {
     if (!editor || !loaded) return;
+    if (session.pending > 0) {
+      // 保存在途:等回执再判定(后端可能钳过时间点,文本对不上 recent)
+      deferred = doc;
+      return;
+    }
     if (session.recent.has(doc.text)) {
-      // 自己的保存(事件可能先于回执到达):更新基线即可,不合并
-      session.base = doc;
-      baseSer = normalize(doc.text);
+      // 自己的保存(事件晚于回执到达):更新基线即可,不合并
+      adopt(doc);
       return;
     }
     if (doc.rev === session.base.rev) return;
@@ -240,7 +268,9 @@
     // 离开页面/切笔记:最后一份改动交给会话的串行队列(排在在途保存之后,冲突会合并重试)
     if (editor) {
       const text = loaded ? serialize() : baseSer;
-      if (loaded && text !== baseSer && text.length <= MEMO_DOC_MAX_CHARS) void saveSerial(session, text).catch(() => {});
+      // 基线:有保存在途时是在途那份(最后一份是在它之上继续打的),否则是上次对齐的盘面
+      if (loaded && text !== baseSer && text !== inflight && text.length <= MEMO_DOC_MAX_CHARS)
+        void saveSerial(session, text, inflight ?? baseRaw).catch(() => {});
       void editor.destroy();
       editor = null;
     }

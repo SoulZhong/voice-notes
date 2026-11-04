@@ -267,7 +267,8 @@ fn memo_section(lines: &[Memo], cuts: &[CutRange], md: bool) -> String {
         let prefix = rest.strip_suffix(text).unwrap_or("").trim_end();
         let shown = if text == super::memos::MARKER { "🔖 时间标记" } else { text };
         let line = if !l.stamped {
-            if md { l.md.clone() } else { format!("    {}", l.md.trim()) }
+            // 纯文本:原样保留行首空白(代码缩进有语义,Codex 审出),整体再缩进四格
+            if md { l.md.clone() } else { format!("    {}", l.md.trim_end()) }
         } else if md {
             let clock = format!("`{}`", super::memos::fmt_clock(l.at_ms));
             if prefix.starts_with('#') {
@@ -606,6 +607,8 @@ mod tests {
         assert!(md.contains(want), "{md}");
         assert!(md.find("## 备注").unwrap() < md.find("] 00:00:00** 一").unwrap(), "{md}");
         let txt = render_text(&note, &memos, &cuts);
+        let py = render_text(&note, &crate::store::memos::export_lines("代码 <!-- 00:01 -->\n```\nif ok:\n    run()\n```\n"), &[]);
+        assert!(py.contains("    if ok:\n        run()\n"), "{py}");
         assert!(txt.contains("备注:\n[00:00:16] 决议\n\n[00:00:16] 周二上线\n[00:00:31] 回滚\n\n    ```\n    kubectl rollout\n    ```\n\n[00:00:10] 时间标记(该时段已删减)\n\n[00:00:05] 定了 周一封版\n\n"), "{txt}");
         // 无备注时与旧输出逐字节一致
         assert_eq!(render_markdown(&note, &[], &[]), render_note(&note, "md").unwrap());
