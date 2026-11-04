@@ -73,6 +73,9 @@ export const zh = {
   "notes.dir.openFailed": "打开目录失败: {e}",
   "notes.record.busy": "已有录制进行中",
   "notes.record.resume": "继续录制",
+  "notes.record.resumeShort": "续录",
+  "notes.more": "更多",
+  "notes.mix.menuLabel": "回放音轨",
   "notes.resume.blocked": "无法继续录制:请确认没有正在进行的录制",
 
   // 详情页:横幅与提示
@@ -282,6 +285,9 @@ export const en = {
   "notes.dir.openFailed": "Failed to open the folder: {e}",
   "notes.record.busy": "A recording is already in progress",
   "notes.record.resume": "Resume recording",
+  "notes.record.resumeShort": "Resume",
+  "notes.more": "More",
+  "notes.mix.menuLabel": "Playback track",
   "notes.resume.blocked": "Cannot resume recording: make sure no other recording is in progress",
 
   "notes.banner.interrupted":

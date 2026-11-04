@@ -99,7 +99,6 @@
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { RefinedSync } from "$lib/editor/refinedSync.svelte";
   import { watchJob } from "$lib/jobWatch";
-  import Segmented from "$lib/Segmented.svelte";
   import type { SegmentedItem } from "$lib/segmented";
   import MemoDoc from "$lib/MemoDoc.svelte";
   import { Button } from "$lib/ui/components/button";
@@ -277,6 +276,18 @@
   /** 实际渲染的视图：viewMode 是用户意图，refinedAvailable=false 时无条件降级为 raw。 */
   const effectiveView = $derived(refinedAvailable ? viewMode : "raw");
   /** 视图切换 segmented:无修订稿时该段置灰 + tooltip 原因(行为与旧 .link 版完全一致) */
+  /** 标签页键盘:←/→ 在可用项间切换并移焦点(Tab 只停在当前项,同原分段控件)。 */
+  function onTabKey(e: KeyboardEvent) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    const enabled = viewItems.filter((x) => !x.disabled);
+    const i = enabled.findIndex((x) => x.id === effectiveView);
+    const next = enabled[(i + (e.key === "ArrowRight" ? 1 : -1) + enabled.length) % enabled.length];
+    if (!next || next.id === effectiveView) return;
+    e.preventDefault();
+    viewMode = next.id as "refined" | "raw";
+    const host = (e.currentTarget as HTMLElement).parentElement;
+    queueMicrotask(() => host?.querySelector<HTMLElement>('[aria-selected="true"]')?.focus());
+  }
   const viewItems = $derived<SegmentedItem[]>([
     {
       id: "refined",
@@ -2482,6 +2493,9 @@
   {#if note}
     <!-- 操作栏吸顶:标题/播放器/视图切换钉在滚动视口顶端,长转写滚动或播放跟随时操作不失联 -->
     <div class="topbar" bind:offsetHeight={topbarH}>
+      <!-- 头部(方案 C,2026-11-05 用户拍板):第一行标题 + 内容级动作(重新转文字 / AI 整理 / 更多);
+           第二行元信息与属性小胶囊(时间、状态、日程、与会人员);第三行走带条(播放 + 音轨 + 备注 + 续录);
+           第四行标签页(修订稿 / 原始逐字稿)+ 进度状态。 -->
       <div class="header">
         <div class="header-main">
           {#if editing}
@@ -2506,8 +2520,168 @@
               >
             </h1>
           {/if}
-
-          <p class="meta">
+        </div>
+        <div class="row">
+        <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
+             自动备份为 segments.orig.jsonl),二段确认走 retransConfirm 胶囊。
+             来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
+             判定可用性并置灰+tooltip 给原因)。 -->
+        <!-- 带文字的「重新分析」入口(2026-09-07 用户点名):此前是纯图标幽灵钮,
+             和当年"拆分按钮在但没人找到"同病——重切段/重认人的算法升级后,
+             这个入口是存量笔记受益的唯一通道,必须一眼可见。
+             二段确认是**锚定浮层**(2026-09-20 用户实报「设计粗糙、布局被改变」):浮层挂在
+             按钮下方、开合不占版面。开合交给 Popover(bind 到 retransConfirm);触发钮与浮层
+             都 stopPropagation(同原 .retrans-wrap),否则 window onclick 会把它刚开就关掉。 -->
+        <Popover.Root bind:open={retransConfirm}>
+          <Popover.Trigger>
+            {#snippet child({ props })}
+              <Button
+                {...props}
+                variant="ghost"
+                class="retrans-btn h-8 gap-1.5 text-muted-foreground"
+                aria-haspopup="menu"
+                disabled={retranscribing || refining || recording.isLive || note?.meta.state !== "complete"}
+                title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
+                onclick={(e: MouseEvent) => {
+                  // 先关同工具条里的其它浮层:本按钮会 stopPropagation(不然点自己
+                  // 就被 window 的关闭处理吞掉),于是"点开这个顺带关掉那个"的默认
+                  // 行为也一起没了,两层浮层会在吸顶栏里叠着。
+                  exportMenuOpen = false;
+                  editsManage = false;
+                  entityChipsEl?.closeAll();
+                  (props.onclick as ((e: MouseEvent) => void) | undefined)?.(e);
+                  e.stopPropagation();
+                }}
+              >
+                <svg class:spin={retranscribing} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
+                  <path d="M13.4 1.8v2.8h-2.8" />
+                </svg>
+                {retranscribing ? t("notes.retrans.runningShort") : t("notes.retrans.run")}
+              </Button>
+            {/snippet}
+          </Popover.Trigger>
+          <!-- 右对齐——按钮在操作栏右侧,左展开会顶出视口。 -->
+          <Popover.Content align="end" class="w-68 gap-0 p-1" onclick={(e: MouseEvent) => e.stopPropagation()}>
+            <p class="retrans-menu-note">{t("notes.retrans.warn")}</p>
+            <Button variant="ghost" class="retrans-item" onclick={() => startRetranscribe("dual")}>
+              <span class="retrans-item-main">{t("notes.retrans.confirmDual")}</span>
+              <span class="retrans-item-sub">{t("notes.retrans.dualSub")}</span>
+            </Button>
+            <Button
+              variant="ghost"
+              class="retrans-item"
+              disabled={mixedReason !== null}
+              onclick={() => startRetranscribe("mixed")}
+            >
+              <span class="retrans-item-main">{t("notes.retrans.confirmMixed")}</span>
+              <span class="retrans-item-sub">{mixedReason ?? t("notes.retrans.mixedSub")}</span>
+            </Button>
+            <Button variant="ghost" class="retrans-item quiet" onclick={() => (retransConfirm = false)}>
+              <span class="retrans-item-main">{t("notes.cancel")}</span>
+            </Button>
+          </Popover.Content>
+        </Popover.Root>
+        <!-- 魔杖(重新 Aing)恒渲染:PR#141 重构误把上面的 {/if} 挪到按钮之后,魔杖被
+             吞进 refining && aingProg——普通完成笔记从此没有这个按钮,整理中还会
+             整个消失。按钮自身的 disabled/casting 已按 refining 处理,无需条件包裹。 -->
+        <Button
+            class={["reaing h-8 gap-1.5", refining && "casting"]}
+            disabled={refining || note.meta.state !== "complete"}
+            onclick={rerunRefine}
+            title={aiState === "running" ? t("notes.refine.running") : aiState === "complete" ? t("notes.refine.completeHint") : aiState === "failed" ? t("notes.refine.failedHint") : t("notes.refine.run")}
+          >
+            <svg class="wand" viewBox="0 0 22 22" width="18" height="18" aria-hidden="true">
+              <path
+                class="wand-stick"
+                d="M3.5 18.5 11.5 10.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.7"
+                stroke-linecap="round"
+              />
+              <path class="wand-star" d="M15 2.8 16 6 19.2 7 16 8 15 11.2 14 8 10.8 7 14 6Z" />
+              <path
+                class="spark spark-a"
+                d="M6.5 3.6 6.9 4.6 7.9 5 6.9 5.4 6.5 6.4 6.1 5.4 5.1 5 6.1 4.6Z"
+              />
+              <path
+                class="spark spark-b"
+                d="M18.5 12.7 18.85 13.65 19.8 14 18.85 14.35 18.5 15.3 18.15 14.35 17.2 14 18.15 13.65Z"
+              />
+              <path
+                class="spark spark-c"
+                d="M10 15.4 10.3 16.2 11.1 16.5 10.3 16.8 10 17.6 9.7 16.8 8.9 16.5 9.7 16.2Z"
+              />
+            </svg>
+            <AiStateLabel state={aiState} label={t("notes.refine.label")} />
+          </Button>
+          <!-- 「更多」菜单:低频动作收拢(方案 C,2026-11-05 用户拍板):重新推断身份 / 导出 / 打开目录。
+               开合仍 bind 到 exportMenuOpen(window 的 click/Esc 关闭处理照旧生效);触发钮 stopPropagation。 -->
+          <DropdownMenu.Root bind:open={exportMenuOpen}>
+            <DropdownMenu.Trigger>
+              {#snippet child({ props })}
+                <Button
+                  {...props}
+                  variant="ghost"
+                  size="icon"
+                  class="ghost size-8 text-muted-foreground"
+                  title={t("notes.more")}
+                  aria-label={t("notes.more")}
+                  onclick={(e: MouseEvent) => {
+                    (props.onclick as ((e: MouseEvent) => void) | undefined)?.(e);
+                    e.stopPropagation();
+                  }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="3.5" cy="8" r="1.2" fill="currentColor" /><circle cx="8" cy="8" r="1.2" fill="currentColor" /><circle cx="12.5" cy="8" r="1.2" fill="currentColor" /></svg>
+                </Button>
+              {/snippet}
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Content align="end" class="min-w-48" onclick={(e: MouseEvent) => e.stopPropagation()}>
+              <DropdownMenu.Item
+                disabled={identifying}
+                title={t("notes.identify.rerunHint")}
+                onSelect={() => {
+                  exportMenuOpen = false;
+                  void rerunIdentify();
+                }}>{identifying ? t("notes.identify.running") : t("notes.identify.rerun")}</DropdownMenu.Item
+              >
+              <DropdownMenu.Separator />
+              {#if exportRange()}
+                {@const r = exportRange()!}
+                <DropdownMenu.Label class="text-xs font-normal whitespace-nowrap text-muted-foreground tabular-nums">{t("notes.export.rangeNote", { start: formatTs(r.start), end: formatTs(r.end) })}</DropdownMenu.Label>
+                <DropdownMenu.Separator />
+              {/if}
+              <DropdownMenu.Item
+                onSelect={() => {
+                  exportMenuOpen = false;
+                  void doExport("md");
+                }}>{t("notes.export.md")}</DropdownMenu.Item
+              >
+              <DropdownMenu.Item
+                class="data-disabled:pointer-events-auto"
+                disabled={!mixedInfo?.track}
+                title={mixedInfo?.track ? "" : t("notes.export.audioNone")}
+                onSelect={() => {
+                  exportMenuOpen = false;
+                  void doExportAudio();
+                }}>{t("notes.export.audio")}</DropdownMenu.Item
+              >
+              <DropdownMenu.Separator />
+              <DropdownMenu.Item
+                title={t("notes.dir.openHint")}
+                onSelect={() => {
+                  exportMenuOpen = false;
+                  void doOpenDir();
+                }}>{t("notes.dir.open")}</DropdownMenu.Item
+              >
+            </DropdownMenu.Content>
+          </DropdownMenu.Root>
+        </div>
+      </div>
+      <div class="pills">
+          <p class="pill meta-pill">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="6" /><path d="M8 4.8V8l2.2 1.4" /></svg>
             {formatDate(note.meta.started_at)} · {formatDuration(durationSecs(note))}
             {#if note.meta.state === "recording"}
               <span class="state interrupted">{t("notes.state.interrupted")}</span>
@@ -2521,10 +2695,11 @@
             {/if}
           </p>
           {#if calPerm !== "unavailable"}
-            <p class="meta cal-row">
+            <p class="pill cal-row" class:empty={!note.meta.calendar}>
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true"><rect x="2.2" y="3.2" width="11.6" height="10.6" rx="1.6" /><path d="M2.2 6.6h11.6M5.4 1.8v2.6M10.6 1.8v2.6" /></svg>
               {#if note.meta.calendar}
                 <span title={note.meta.calendar.attendees.map((a) => (a.is_me ? t("notes.calendar.me", { name: a.name }) : a.name)).join("、")}>
-                  📅 {note.meta.calendar.title}
+                  {note.meta.calendar.title}
                   {#if note.meta.calendar.attendees.length > 0}
                     · {t("notes.calendar.attendeeN", { n: note.meta.calendar.attendees.length })}
                   {/if}
@@ -2542,8 +2717,9 @@
                整份名单(日历+手动)喂 identify,并在说话人浮层一键指认。日历侧只读,
                手动侧可删;输入回车添加。 -->
           {#if canEdit}
-            <p class="meta att-row">
-              <span class="att-label">{t("notes.attendees.label")}</span>
+            <p class="pill att-row" title={t("notes.attendees.label")}>
+              <svg class="att-ico" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true"><circle cx="6" cy="5.2" r="2.4" /><path d="M1.8 13.6c0-2.3 1.9-4.1 4.2-4.1s4.2 1.8 4.2 4.1" /><path d="M10.6 3.2a2.3 2.3 0 0 1 0 4.4M12.2 9.8c1.2.5 2 1.8 2 3.4" /></svg>
+              <span class="sr-only">{t("notes.attendees.label")}</span>
               {#each note.meta.calendar?.attendees ?? [] as a (a.name + a.email)}
                 {#if !a.is_me && (a.name || a.email) && !attendeeRemoved(a)}
                   <span class="att-tag cal" title={t("notes.attendees.fromCalendar")}>
@@ -2605,91 +2781,6 @@
               </div>
             {/if}
           {/if}
-        </div>
-
-        <!-- 头部动作组:重新推断身份 / 导出(MD、成品轨音频)浮层菜单 / 打开目录,
-             均为幽灵族(.ghost)纯图标按钮(冒烟反馈:文字太占行,图标+tooltip 交代
-             名称与说明;aria-label 保读屏可达)。运行态图标加 .spin 旋转反馈。
-             txt 渲染能力在导出层与 CLI(notes get --format txt)保留,GUI 不再暴露。 -->
-        <div class="row">
-          <Button
-            variant="ghost"
-            size="icon"
-            class="ghost text-muted-foreground"
-            disabled={identifying}
-            title={identifying ? t("notes.identify.running") : `${t("notes.identify.rerun")}——${t("notes.identify.rerunHint")}`}
-            aria-label={t("notes.identify.rerun")}
-            onclick={() => void rerunIdentify()}
-          >
-            <svg class:spin={identifying} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="6" cy="5" r="2.5" />
-              <path d="M2.2 13.8c0-2.2 1.7-4 3.8-4 1 0 1.9.4 2.6 1" />
-              <path d="M13.8 11.2a2.9 2.9 0 1 1-.9-2.1" />
-              <path d="M13.9 6.9v2.4h-2.4" />
-            </svg>
-          </Button>
-          <!-- 导出菜单:开合交给 DropdownMenu(bind 到 exportMenuOpen,window 的 click/Esc
-               关闭处理照旧生效);触发钮 stopPropagation,免得刚打开就被 window onclick 关掉。 -->
-          <DropdownMenu.Root bind:open={exportMenuOpen}>
-            <DropdownMenu.Trigger>
-              {#snippet child({ props })}
-            <Button
-              {...props}
-              variant="ghost"
-              class="ghost gap-1 px-2 text-muted-foreground"
-              title={t("notes.export.button")}
-              aria-label={t("notes.export.button")}
-              onclick={(e: MouseEvent) => {
-                (props.onclick as ((e: MouseEvent) => void) | undefined)?.(e);
-                e.stopPropagation();
-              }}
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
-                <path d="M9.5 1.8V5h3.2" />
-                <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
-              </svg>
-              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M2.5 4 5 6.5 7.5 4" />
-              </svg>
-            </Button>
-              {/snippet}
-            </DropdownMenu.Trigger>
-            <DropdownMenu.Content align="end" class="min-w-36" onclick={(e: MouseEvent) => e.stopPropagation()}>
-              {#if exportRange()}
-                {@const r = exportRange()!}
-                <DropdownMenu.Label class="text-xs font-normal whitespace-nowrap text-muted-foreground tabular-nums">{t("notes.export.rangeNote", { start: formatTs(r.start), end: formatTs(r.end) })}</DropdownMenu.Label>
-                <DropdownMenu.Separator />
-              {/if}
-              <DropdownMenu.Item
-                onSelect={() => {
-                  exportMenuOpen = false;
-                  void doExport("md");
-                }}>{t("notes.export.md")}</DropdownMenu.Item
-              >
-              <DropdownMenu.Item
-                disabled={!mixedInfo?.track}
-                title={mixedInfo?.track ? "" : t("notes.export.audioNone")}
-                onSelect={() => {
-                  exportMenuOpen = false;
-                  void doExportAudio();
-                }}>{t("notes.export.audio")}</DropdownMenu.Item
-              >
-            </DropdownMenu.Content>
-          </DropdownMenu.Root>
-          <Button
-            variant="ghost"
-            size="icon"
-            class="ghost text-muted-foreground"
-            title={`${t("notes.dir.open")}——${t("notes.dir.openHint")}`}
-            aria-label={t("notes.dir.open")}
-            onclick={() => void doOpenDir()}
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M1.8 4.2c0-.5.4-.9.9-.9h3.1l1.5 1.6h5.9c.5 0 .9.4.9.9v6.9c0 .5-.4.9-.9.9H2.7a.9.9 0 0 1-.9-.9z" />
-            </svg>
-          </Button>
-        </div>
       </div>
 
       <!-- 提示系统(2026-08-22 方案甲):本页常驻提示统一收敛到这一条通知条,
@@ -2794,39 +2885,93 @@
               </div>
             {/if}
           </div>
+          <span class="vsep"></span>
+          <!-- 回放音轨(二期 A/B 方案):下拉承载,可选项由该笔记实际产物决定——无成品轨给「生成」动作;
+               有但不可信(mixed_untrusted)置灰并 title 给原因。 -->
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger>
+              {#snippet child({ props })}
+                <Button {...props} variant="ghost" size="sm" class="h-8 flex-none gap-1.5 px-2 text-muted-foreground" title={t("notes.mix.title")}>
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true"><path d="M2 6v4M5 4v8M8 2.5v11M11 4.5v7M14 6.5v3" /></svg>
+                  <span class="text-[0.8rem]">{playbackScheme === "mixed" ? t("notes.mix.mixed") : t("notes.mix.dual")}</span>
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true"><path d="M2.5 4 5 6.5 7.5 4" /></svg>
+                </Button>
+              {/snippet}
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Content align="end" class="min-w-44">
+              <DropdownMenu.Label class="text-xs font-normal text-muted-foreground">{t("notes.mix.menuLabel")}</DropdownMenu.Label>
+              {#each mixItems as it (it.id)}
+                <!-- 禁用项保留指针命中,悬停才看得到原因(title),同原分段控件 -->
+                <DropdownMenu.Item
+                  class="data-disabled:pointer-events-auto"
+                  disabled={it.disabled}
+                  title={it.title}
+                  onSelect={() => (it.id === "gen" ? startRegen() : switchScheme(it.id as "dual" | "mixed"))}
+                >
+                  <span class="w-3.5 text-center">{playbackScheme === it.id ? "✓" : ""}</span>{it.label}
+                </DropdownMenu.Item>
+              {/each}
+            </DropdownMenu.Content>
+          </DropdownMenu.Root>
           <!-- 加备注:在右侧备注文末开一行写(同 M 键);录制中本篇备注归录制页编辑 -->
-          <div class="memo-add-wrap">
-            <Button variant="outline" class="memo-add" title={`${t("memo.note.add")} (M)`} disabled={noteIsRecording} onclick={() => memoDocEl?.focusNewLine()}>
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M3.5 14.5V2" />
-                <path d="M3.5 2.5h8.2l-1.9 2.9 1.9 2.9H3.5" />
-              </svg>
-              {t("memo.note.add")}
-            </Button>
-          </div>
-          <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
-               动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
-          <div class="mix-switch" title={t("notes.mix.title")}>
-            <Segmented
-              size="sm"
-              items={mixItems}
-              value={playbackScheme}
-              onSelect={(id) => switchScheme(id as "dual" | "mixed")}
-              onAction={() => startRegen()}
-            />
-          </div>
+          <Button variant="ghost" size="sm" class="h-8 flex-none gap-1.5 px-2 text-muted-foreground" title={`${t("memo.note.add")} (M)`} disabled={noteIsRecording} onclick={() => memoDocEl?.focusNewLine()}>
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3.5 14.5V2" />
+              <path d="M3.5 2.5h8.2l-1.9 2.9 1.9 2.9H3.5" />
+            </svg>
+            <span class="text-[0.8rem]">{t("memo.column.title")}</span>
+          </Button>
         {/if}
-        <button
-          class="rec-btn"
+        <!-- 继续录制:红点 + 文字(方案 C:不再是孤立的圆形录音键,与走带条其它控件同一语言) -->
+        <Button
+          variant="ghost"
+          size="sm"
+          class="rec-btn h-8 flex-none gap-1.5 px-2 text-muted-foreground"
           disabled={recording.isLive}
           title={recording.isLive ? t("notes.record.busy") : t("notes.record.resume")}
           aria-label={t("notes.record.resume")}
           onclick={doResume}
         >
-          <span class="rec-dot"></span>
-        </button>
+          <span class="rec-dot"></span><span class="text-[0.8rem]">{t("notes.record.resumeShort")}</span>
+        </Button>
       </div>
 
+
+      <div class="view-switch">
+        <div class="tabs" role="tablist">
+          {#each viewItems as it (it.id)}
+            <button
+              role="tab"
+              class:on={effectiveView === it.id}
+              aria-selected={effectiveView === it.id}
+              aria-disabled={it.disabled}
+              tabindex={effectiveView === it.id ? 0 : -1}
+              title={it.title}
+              onclick={() => {
+                if (!it.disabled) viewMode = it.id as "refined" | "raw";
+              }}
+              onkeydown={onTabKey}>{it.label}</button
+            >
+          {/each}
+        </div>
+        <span class="spacer"></span>
+        {#if refining}
+          <span class="aing-inline">
+            {#if aingProg}
+              {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
+                done: aingProg.done,
+                total: aingProg.total,
+              })}
+              {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
+            {:else}
+              {t("notes.progress.llmWarmup")}
+            {/if}
+          </span>
+        {/if}
+        {#if retranscribing}
+          <span class="aing-inline">{t("notes.retrans.running", { stage: retransStage })}</span>
+        {/if}
+      </div>
 
       <!-- 说话人条:修订稿与原始逐字稿同一份 speakers.json、同一套交互,不随视图切换变化
            (2026-08-28 用户实报:修订稿上不可点、逐字稿上可点)。改名/选人/取消关联
@@ -2903,123 +3048,6 @@
         </div>
       {/if}
 
-      <div class="view-switch">
-        <Segmented items={viewItems} value={effectiveView} onSelect={(id) => (viewMode = id as "refined" | "raw")} />
-        <span class="spacer"></span>
-        <!-- 行内进度只需 refining:aingProg 来自分块事件,页面重载后要等下一个分块
-             才有——这期间(以及长块/重试中)也必须有可见指示,否则整理中的页面只剩
-             一排灰按钮,读起来像"Aing 丢了"(2026-08-26 用户实报,3h 会议整理 70 分钟
-             无任何指示)。无分块数据时显示通用"整理中",有再升级为 n/m + ETA。 -->
-        {#if refining}
-          <span class="aing-inline">
-            {#if aingProg}
-              {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
-                done: aingProg.done,
-                total: aingProg.total,
-              })}
-              {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
-            {:else}
-              {t("notes.progress.llmWarmup")}
-            {/if}
-          </span>
-        {/if}
-        <!-- 魔杖(重新 Aing)恒渲染:PR#141 重构误把上面的 {/if} 挪到按钮之后,魔杖被
-             吞进 refining && aingProg——普通完成笔记从此没有这个按钮,整理中还会
-             整个消失。按钮自身的 disabled/casting 已按 refining 处理,无需条件包裹。 -->
-        <Button
-            variant="outline"
-            class={["reaing", refining && "casting"]}
-            disabled={refining || note.meta.state !== "complete"}
-            onclick={rerunRefine}
-            title={aiState === "running" ? t("notes.refine.running") : aiState === "complete" ? t("notes.refine.completeHint") : aiState === "failed" ? t("notes.refine.failedHint") : t("notes.refine.run")}
-          >
-            <svg class="wand" viewBox="0 0 22 22" width="18" height="18" aria-hidden="true">
-              <path
-                class="wand-stick"
-                d="M3.5 18.5 11.5 10.5"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.7"
-                stroke-linecap="round"
-              />
-              <path class="wand-star" d="M15 2.8 16 6 19.2 7 16 8 15 11.2 14 8 10.8 7 14 6Z" />
-              <path
-                class="spark spark-a"
-                d="M6.5 3.6 6.9 4.6 7.9 5 6.9 5.4 6.5 6.4 6.1 5.4 5.1 5 6.1 4.6Z"
-              />
-              <path
-                class="spark spark-b"
-                d="M18.5 12.7 18.85 13.65 19.8 14 18.85 14.35 18.5 15.3 18.15 14.35 17.2 14 18.15 13.65Z"
-              />
-              <path
-                class="spark spark-c"
-                d="M10 15.4 10.3 16.2 11.1 16.5 10.3 16.8 10 17.6 9.7 16.8 8.9 16.5 9.7 16.2Z"
-              />
-            </svg>
-            <AiStateLabel state={aiState} label={t("notes.refine.label")} />
-          </Button>
-
-        <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
-             自动备份为 segments.orig.jsonl),二段确认走 retransConfirm 胶囊。
-             来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
-             判定可用性并置灰+tooltip 给原因)。 -->
-        <!-- 带文字的「重新分析」入口(2026-09-07 用户点名):此前是纯图标幽灵钮,
-             和当年"拆分按钮在但没人找到"同病——重切段/重认人的算法升级后,
-             这个入口是存量笔记受益的唯一通道,必须一眼可见。
-             二段确认是**锚定浮层**(2026-09-20 用户实报「设计粗糙、布局被改变」):浮层挂在
-             按钮下方、开合不占版面。开合交给 Popover(bind 到 retransConfirm);触发钮与浮层
-             都 stopPropagation(同原 .retrans-wrap),否则 window onclick 会把它刚开就关掉。 -->
-        <Popover.Root bind:open={retransConfirm}>
-          <Popover.Trigger>
-            {#snippet child({ props })}
-              <Button
-                {...props}
-                variant="outline"
-                class="retrans-btn"
-                aria-haspopup="menu"
-                disabled={retranscribing || refining || recording.isLive || note?.meta.state !== "complete"}
-                title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
-                onclick={(e: MouseEvent) => {
-                  // 先关同工具条里的其它浮层:本按钮会 stopPropagation(不然点自己
-                  // 就被 window 的关闭处理吞掉),于是"点开这个顺带关掉那个"的默认
-                  // 行为也一起没了,两层浮层会在吸顶栏里叠着。
-                  exportMenuOpen = false;
-                  editsManage = false;
-                  entityChipsEl?.closeAll();
-                  (props.onclick as ((e: MouseEvent) => void) | undefined)?.(e);
-                  e.stopPropagation();
-                }}
-              >
-                <svg class:spin={retranscribing} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
-                  <path d="M13.4 1.8v2.8h-2.8" />
-                </svg>
-                {retranscribing ? t("notes.retrans.runningShort") : t("notes.retrans.run")}
-              </Button>
-            {/snippet}
-          </Popover.Trigger>
-          <!-- 右对齐——按钮在操作栏右侧,左展开会顶出视口。 -->
-          <Popover.Content align="end" class="w-68 gap-0 p-1" onclick={(e: MouseEvent) => e.stopPropagation()}>
-            <p class="retrans-menu-note">{t("notes.retrans.warn")}</p>
-            <Button variant="ghost" class="retrans-item" onclick={() => startRetranscribe("dual")}>
-              <span class="retrans-item-main">{t("notes.retrans.confirmDual")}</span>
-              <span class="retrans-item-sub">{t("notes.retrans.dualSub")}</span>
-            </Button>
-            <Button
-              variant="ghost"
-              class="retrans-item"
-              disabled={mixedReason !== null}
-              onclick={() => startRetranscribe("mixed")}
-            >
-              <span class="retrans-item-main">{t("notes.retrans.confirmMixed")}</span>
-              <span class="retrans-item-sub">{mixedReason ?? t("notes.retrans.mixedSub")}</span>
-            </Button>
-            <Button variant="ghost" class="retrans-item quiet" onclick={() => (retransConfirm = false)}>
-              <span class="retrans-item-main">{t("notes.cancel")}</span>
-            </Button>
-          </Popover.Content>
-        </Popover.Root>
-      </div>
     </div>
 
 
@@ -3263,10 +3291,12 @@
 
 <style>
   .aing-inline {
-    font-size: 12.5px;
-    opacity: 0.8;
-    margin-right: 8px;
+    font-size: 0.76rem;
+    color: var(--ink-secondary);
     white-space: nowrap;
+    padding: 0.15rem 0.6rem;
+    border-radius: var(--radius-full);
+    background: var(--surface-soft);
   }
 
   .container {
@@ -3275,7 +3305,11 @@
   }
   .title {
     cursor: text;
-    margin: 0 0 0.25rem;
+    margin: 0;
+    font-size: 1.3rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.3;
   }
   /* editable-text(标题,Button ghost 外壳):静态无边,hover accent-tint 底 + rounded-sm,
      字号/字重/行高全部沿用 h1;焦点环由组件给。 */
@@ -3293,9 +3327,33 @@
     background: var(--accent-tint);
     color: inherit;
   }
-  .meta {
+  /* 第二行:元信息与属性小胶囊(方案 C)——时间、状态、日程、与会人员各一颗,同高同圆角 */
+  .pills {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    margin: 0.35rem 0 0.75rem;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-height: 1.65rem;
+    margin: 0;
+    padding: 0.1rem 0.6rem;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-full);
+    font-size: 0.78rem;
     color: var(--ink-secondary);
-    margin: 0 0 1rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .pill svg {
+    flex: none;
+    color: var(--ink-faint);
+  }
+  .pill.empty {
+    border-style: dashed;
   }
   /* 操作栏吸顶:canvas 不透明底钉在滚动视口顶端,转写从底下滚过;
      底缘用渐隐代替分隔线,未滚动时不显突兀,滚动时文字平滑没入。 */
@@ -3322,7 +3380,7 @@
      空间不足时整组动作换到标题下一行右对齐——否则标题被挤成一列多行(冒烟实锤)。 */
   .header {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     justify-content: space-between;
     gap: 0.25rem 1rem;
     flex-wrap: wrap;
@@ -3337,7 +3395,6 @@
     align-items: center;
     flex: none;
     justify-content: flex-end;
-    padding-top: 0.2rem;
     margin-left: auto;
   }
   /* 音频剪辑行:播放器卡片的第二行——同底色、hairline 分隔、下缘补回卡片圆角 */
@@ -3431,20 +3488,33 @@
   .note-body.memo-open {
     grid-template-columns: minmax(0, 1fr) 300px;
   }
-  .memo-add-wrap {
-    display: inline-flex;
-    align-items: center;
-    height: 3.1rem; /* 与 .mix-switch 同:锚定播放器第一行高度 */
-    flex: none;
-  }
+  /* 第三行:走带条(方案 C)——一张卡片里放播放器、回放音轨、加备注、续录。播放器自身的卡片
+     底色去掉,由走带条统一给边框与底色;剪辑行(有删减/圈选时)仍是播放器的第二行。 */
   .transport {
     display: flex;
-    /* flex-start + 右侧控件按第一行高度(3.1rem=播放键 2.1rem+上下 0.5rem 内边距)
-       自行垂直居中:播放器卡片长出剪辑第二行时,右侧簇不再被整块高度拽下去 */
-    align-items: flex-start;
-    gap: 0.5rem 0.75rem;
-    margin: 0 0 1rem;
+    align-items: center;
+    gap: 0.25rem 0.4rem;
+    margin: 0 0 0.6rem;
+    padding: 0.2rem 0.45rem 0.2rem 0.2rem;
     flex-wrap: wrap;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+  }
+  /* 叠写类名抬高优先级:压过 shadcn.css 给 .player 的卡片样式——那条规则未分层,
+     :root + [data-vn-style] + :is(含 .panel.card,取最高 0,2,0)+ :not 合计 (0,5,0)。 */
+  .transport :global(.player.player.player.player) {
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    padding: 0.3rem 0.5rem;
+  }
+  .vsep {
+    width: 1px;
+    height: 1.2rem;
+    background: var(--hairline);
+    flex: none;
+    margin: 0 0.2rem;
   }
   /* 播放器槽的 min-width 下限 ≈ AudioPlayer 的 min-content(播放键+双时间+波形下限
      +音轨选择器+内边距):低于它内容会从槽里溢出垫到右侧控件底下(冒烟实锤,
@@ -3458,44 +3528,20 @@
     border-bottom-left-radius: 0;
     border-bottom-right-radius: 0;
   }
-  /* 回放方案 A/B 切换(二期):Segmented(sm)承载,容器只管行内定位。
-     margin-left:auto 让「segmented+录制键」聚成一簇靠右——宽窗时播放器 flex:1
-     已占满空间无感;窄窗换行后这簇整体落在第二行右端,不与录制键分居两端(冒烟反馈)。 */
-  .mix-switch {
-    display: inline-flex;
-    gap: 0.15rem;
-    flex: none;
-    align-items: center;
-    height: 3.1rem; /* 锚定播放器第一行高度,transport flex-start 下保持视觉居中 */
-    margin-left: auto;
-  }
-  /* 继续录制:录音机标志式圆形录音键(圆环 + 居中红点),行尾右置,与播放键同语言。
-     纯图标是用户拍板的特例(2026-07-07:录音红点属录音机通识符号,文字反而挤占
-     音轨宽度),悬停 title/aria-label 兜底可达性。靠右由 .mix-switch 的 auto margin
-     统一负责;无播放器(录制中只剩录制键)时它是首子元素,自己补 auto 仍靠右。 */
-  .rec-btn {
-    width: 2.4rem;
-    height: 2.4rem;
-    margin-top: 0.35rem; /* (3.1rem 第一行高 − 2.4rem)/2:transport flex-start 下对齐播放器行中线 */
-    padding: 0;
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-full);
-  }
-  .rec-btn:first-child {
-    margin-left: auto;
-  }
   .rec-dot {
-    width: 12px;
-    height: 12px;
+    width: 0.55rem;
+    height: 0.55rem;
     border-radius: var(--radius-full);
     background: var(--record);
     flex: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--record) 22%, transparent);
   }
-  .rec-btn:disabled .rec-dot {
+  .transport :global(.rec-btn:first-child) {
+    margin-left: auto;
+  }
+  .transport :global(.rec-btn:disabled .rec-dot) {
     background: var(--ink-faint);
+    box-shadow: none;
   }
   .export-msg {
     margin: 0 0 0.75rem;
@@ -3738,12 +3784,52 @@
   }
   /* 视图切换条:Segmented(修订稿/原始逐字稿) + 右侧内容级动作(AI 魔杖 / 重转写幽灵钮) */
   /* 同款窄窗纪律:二段确认警示胶囊展开时宽于窗口即换行,不挤压 segmented */
+  /* 第四行:标签页(下划线式)+ 右侧进度状态 */
   .view-switch {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     margin: 0 0 0.75rem;
     flex-wrap: wrap;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .tabs {
+    display: inline-flex;
+    gap: 1.1rem;
+  }
+  .tabs button {
+    all: unset;
+    cursor: pointer;
+    position: relative;
+    padding: 0.4rem 0;
+    font-size: 0.88rem;
+    color: var(--ink-faint);
+  }
+  .tabs button:hover:not([aria-disabled="true"]) {
+    color: var(--ink-secondary);
+  }
+  .tabs button[aria-disabled="true"] {
+    cursor: default;
+    opacity: 0.5;
+  }
+  .tabs button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+  .tabs button.on {
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .tabs button.on::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -1px;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--ink);
   }
   .view-switch .spacer {
     flex: 1;
@@ -4021,6 +4107,9 @@
     text-decoration: underline;
   }
   /* 已中断：沿用 warning 色系，与侧栏同款状态徽标一致 */
+  .pill .state {
+    margin-left: 0.15rem;
+  }
   .state.interrupted {
     background: var(--warning-line);
     color: var(--warning-ink);
@@ -4111,14 +4200,9 @@
   /* ── P3 日历行 ── */
   /* 与会人员行:小标签横排;日历侧只读淡显,手动侧带 × 可删;行内输入无边框显影 */
   .att-row {
-    display: flex;
-    align-items: center;
     flex-wrap: wrap;
-    gap: 0.35rem;
-  }
-  .att-label {
-    color: var(--ink-faint);
-    font-size: 0.78rem;
+    gap: 0.3rem;
+    padding-right: 0.25rem;
   }
   .att-tag {
     display: inline-flex;
@@ -4154,10 +4238,8 @@
     font-size: 0.75rem;
   }
   .cal-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
     flex-wrap: wrap;
+    gap: 0.35rem;
   }
   .cal-row :global(.mini) {
     font-size: 12px;
