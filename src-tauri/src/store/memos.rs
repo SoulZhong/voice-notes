@@ -93,16 +93,37 @@ impl MemoDoc {
 
 pub const MEMO_SEQ_FILE: &str = ".memo.seq";
 
-fn read_seq(note_dir: &Path) -> u64 {
-    std::fs::read_to_string(note_dir.join(MEMO_SEQ_FILE)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+/// 当前版本号:`.memo.seq` 记着「序号 + 写入时正文的指纹」。指纹与盘上正文对不上(正文写成、
+/// 序号没写成;或用户在应用外改过文件)就把这份正文算作更新的一版(序号 + 1)——正文与序号
+/// 分两个文件,不能假定总是一起落盘(Codex 审出)。
+fn read_seq(note_dir: &Path, text: &str) -> u64 {
+    let raw = std::fs::read_to_string(note_dir.join(MEMO_SEQ_FILE)).unwrap_or_default();
+    let mut it = raw.split_whitespace();
+    let n: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    match it.next() {
+        Some(h) if h == text_hash(text) => n,
+        Some(_) => n + 1,
+        // 没有指纹(从没写过):空文档 0,有正文(迁移前的旧格式或外部放进来的)算 1
+        None if n == 0 => u64::from(!text.is_empty()),
+        None => n,
+    }
 }
 
-// ── 按行三方合并 ──────────────────────────────────────────────────────────
+fn text_hash(text: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+// ── 按行三方合并(diff3) ───────────────────────────────────────────────────
 
 /// 按逻辑行切分:以 `\` 结尾的行与下一行连成一个单位(硬换行段落整体进出)。
 fn units(s: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for line in s.split('\n') {
+    for line in s.trim_end_matches('\n').split('\n') {
         if let Some(last) = out.last_mut() {
             if last.ends_with('\\') {
                 last.push('\n');
@@ -115,32 +136,105 @@ fn units(s: &str) -> Vec<String> {
     out
 }
 
-fn content_units(s: &str) -> Vec<String> {
-    units(s).into_iter().filter(|l| !l.trim().is_empty()).collect()
-}
-
-/// a 中比 b 多出来的单位(多重集合差,保持 a 的顺序)。
-fn minus(a: &[String], b: &[String]) -> Vec<String> {
-    let mut left: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for l in b {
-        *left.entry(l.as_str()).or_default() += 1;
+/// 最长公共子序列的匹配对 (i, j),i/j 均严格递增。备注篇幅是几十到几百行,O(n·m) 足够。
+fn lcs_pairs(a: &[String], b: &[String]) -> Vec<(usize, usize)> {
+    let (n, m) = (a.len(), b.len());
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] { dp[i + 1][j + 1] + 1 } else { dp[i + 1][j].max(dp[i][j + 1]) };
+        }
     }
-    let mut out = Vec::new();
-    for l in a {
-        match left.get_mut(l.as_str()) {
-            Some(n) if *n > 0 => *n -= 1,
-            _ => out.push(l.clone()),
+    let (mut i, mut j, mut out) = (0, 0, Vec::new());
+    while i < n && j < m {
+        if a[i] == b[j] {
+            out.push((i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
         }
     }
     out
 }
 
-/// 三方合并(按逻辑行):`base` 是 `local` 所依据的版本,`remote` 是盘上现状。
-/// - 一侧没动 → 取另一侧;
-/// - remote 相对 base 改掉的行(按出现顺序与新增的行配对)→ 在 local 里找到同一行原地替换,
-///   找不到(local 也改/删了)→ 新行追加到末尾,不丢字;
-/// - remote 多出的行 → 追加到 local 末尾;remote 删掉的行 → local 里还原样在就删掉。
-/// 与前端 memoDocMerge.ts 同一算法(前端用它把保存期间的新输入接到回执上)。
+/// `o` 是否是 `x` 的子序列(x 只是在 o 上插了行);是则返回 (插在 o 之前的行, 其余插入的行)。
+fn only_inserted(o: &[String], x: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    let mut k = 0;
+    let mut before = Vec::new();
+    let mut rest = Vec::new();
+    for l in x {
+        if k < o.len() && *l == o[k] {
+            k += 1;
+        } else if k == 0 {
+            before.push(l.clone());
+        } else {
+            rest.push(l.clone());
+        }
+    }
+    (k == o.len()).then_some((before, rest))
+}
+
+fn push_extra(out: &mut Vec<String>, extra: impl IntoIterator<Item = String>, have: &[String]) {
+    let extra: Vec<String> = extra.into_iter().filter(|l| !l.trim().is_empty() && !have.contains(l)).collect();
+    if extra.is_empty() {
+        return;
+    }
+    if out.last().is_some_and(|l| !l.trim().is_empty()) {
+        out.push(String::new());
+    }
+    out.extend(extra);
+}
+
+/// 一段三方都不稳定的区间怎么定:
+/// - 一侧没动取另一侧;两侧一样取其一;
+/// - 行数都相同:逐行按位置定(同一位置一侧没动取另一侧,都改了两边都留);
+/// - 一侧只是插了行(base 是它的子序列):取另一侧的改动,再把插入的行放回原位(前/后);
+/// - 其余:两边都留(本地在前,远端里本地没有的行跟在后面),不丢字。
+fn resolve(o: &[String], a: &[String], b: &[String], out: &mut Vec<String>) {
+    if a == o {
+        out.extend_from_slice(b);
+    } else if b == o || a == b {
+        out.extend_from_slice(a);
+    } else if !o.is_empty() && a.len() == o.len() && b.len() == o.len() {
+        for k in 0..o.len() {
+            if a[k] == o[k] {
+                out.push(b[k].clone());
+            } else if b[k] == o[k] || a[k] == b[k] {
+                out.push(a[k].clone());
+            } else {
+                out.push(a[k].clone());
+                out.push(String::new());
+                out.push(b[k].clone());
+            }
+        }
+    } else if o.is_empty() {
+        out.extend_from_slice(a);
+        push_extra(out, b.iter().cloned(), a);
+    } else if let Some((before, rest)) = only_inserted(o, a) {
+        out.extend(before);
+        out.extend_from_slice(b);
+        push_extra(out, rest, b);
+    } else if let Some((before, rest)) = only_inserted(o, b) {
+        let start = out.len();
+        out.extend(before.into_iter().filter(|l| !a.contains(l)));
+        if out.len() > start && a.first().is_some_and(|l| !l.trim().is_empty()) {
+            out.push(String::new());
+        }
+        out.extend_from_slice(a);
+        push_extra(out, rest, a);
+    } else {
+        out.extend_from_slice(a);
+        push_extra(out, b.iter().cloned(), a);
+    }
+}
+
+/// 三方合并:`base` 是 `local` 所依据的版本,`remote` 是盘上现状。按逻辑行做 diff3:三方都
+/// 对得上的行是锚点,锚点之间的区间按 [`resolve`] 定。按位置对齐而不是按内容找行——同一时间点
+/// 的两段文字可以一样,不能拿正文当段落身份(Codex 审出)。冲突时两边都留,不丢字。
+/// 与前端 memoDocMerge.ts 同一算法。
 pub fn merge3(base: &str, local: &str, remote: &str) -> String {
     if local == base {
         return remote.to_string();
@@ -148,40 +242,39 @@ pub fn merge3(base: &str, local: &str, remote: &str) -> String {
     if remote == base || remote == local {
         return local.to_string();
     }
-    let b = content_units(base);
-    let r = content_units(remote);
-    let added = minus(&r, &b);
-    let removed = minus(&b, &r);
-    let mut lines = units(local.trim_end());
-    let mut appended: Vec<String> = Vec::new();
-    let pairs = added.len().min(removed.len());
-    for i in 0..pairs {
-        match lines.iter().position(|l| *l == removed[i]) {
-            Some(at) => lines[at] = added[i].clone(),
-            None => appended.push(added[i].clone()),
+    let (o, a, b) = (units(base), units(local), units(remote));
+    let ma: std::collections::HashMap<usize, usize> = lcs_pairs(&o, &a).into_iter().collect();
+    let mb: std::collections::HashMap<usize, usize> = lcs_pairs(&o, &b).into_iter().collect();
+    let mut out = Vec::new();
+    let (mut oi, mut ai, mut bi) = (0, 0, 0);
+    loop {
+        let anchor = (oi..o.len()).find(|k| {
+            matches!((ma.get(k), mb.get(k)), (Some(&x), Some(&y)) if x >= ai && y >= bi)
+        });
+        match anchor {
+            Some(k) => {
+                let (x, y) = (ma[&k], mb[&k]);
+                resolve(&o[oi..k], &a[ai..x], &b[bi..y], &mut out);
+                out.push(o[k].clone());
+                oi = k + 1;
+                ai = x + 1;
+                bi = y + 1;
+            }
+            None => {
+                resolve(&o[oi..], &a[ai..], &b[bi..], &mut out);
+                break;
+            }
         }
     }
-    appended.extend(added[pairs..].iter().cloned());
-    for gone in &removed[pairs..] {
-        if let Some(at) = lines.iter().position(|l| l == gone) {
-            lines.remove(at);
-        }
+    let mut text = out.join("\n");
+    while text.contains("\n\n\n") {
+        text = text.replace("\n\n\n", "\n\n");
     }
-    let mut out = lines.join("\n");
-    while out.contains("\n\n\n") {
-        out = out.replace("\n\n\n", "\n\n");
-    }
-    let mut out = out.trim_start_matches('\n').to_string();
-    for a in appended {
-        if lines.contains(&a) {
-            continue;
-        }
-        out = if out.trim().is_empty() { a } else { format!("{}\n\n{a}", out.trim_end()) };
-    }
-    if out.trim().is_empty() {
+    let text = text.trim_matches('\n');
+    if text.trim().is_empty() {
         String::new()
     } else {
-        format!("{}\n", out.trim_end())
+        format!("{text}\n")
     }
 }
 
@@ -293,13 +386,27 @@ pub fn escape_plain_line(line: &str) -> String {
     let lead = line.len() - line.trim_start().len();
     let (indent, rest) = line.split_at(lead);
     let rest = rest.replace("<!--", "&lt;!--");
+    let bytes = rest.as_bytes();
+    // 只在真会被当成块结构时才转义:编辑器序列化不会给普通文字加反斜杠,多转义会让盘上原文
+    // 与编辑器写法不一致,合并时冒出假差异(Codex 审出)。
+    let spaced = |i: usize| bytes.get(i).is_none_or(|c| *c == b' ' || *c == b'\t');
+    let same_all = |c: u8| !bytes.is_empty() && bytes.iter().all(|x| *x == c || *x == b' ');
+    let hashes = bytes.iter().take_while(|c| **c == b'#').count();
+    let digits = bytes.iter().take_while(|c| c.is_ascii_digit()).count();
+    let block = match bytes.first() {
+        Some(b'#') => hashes <= 6 && spaced(hashes),
+        Some(b'-' | b'+' | b'*') => spaced(1) || same_all(bytes[0]),
+        Some(b'=') => same_all(b'='),
+        Some(b'>' | b'<') => true,
+        Some(b'`') => rest.starts_with("```"),
+        Some(b'~') => rest.starts_with("~~~"),
+        _ => false,
+    };
     let mut out = String::from(indent);
-    let first = rest.chars().next();
-    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
-    if matches!(first, Some('#' | '>' | '-' | '+' | '*' | '=' | '`' | '~' | '|' | '<')) {
+    if block {
         out.push('\\');
         out.push_str(&rest);
-    } else if digits > 0 && matches!(rest.as_bytes().get(digits), Some(b'.' | b')')) {
+    } else if digits > 0 && digits <= 9 && matches!(bytes.get(digits), Some(b'.' | b')')) && spaced(digits + 1) {
         out.push_str(&rest[..digits]);
         out.push('\\');
         out.push_str(&rest[digits..]);
@@ -464,8 +571,7 @@ fn read_locked(note_dir: &Path) -> anyhow::Result<String> {
         Ok(list) => {
             let doc = legacy_to_doc(&list);
             if !doc.is_empty() {
-                write_atomic(note_dir, MEMO_DOC_FILE, doc.as_bytes())?;
-                bump_seq(note_dir)?;
+                write_doc(note_dir, &doc, 0)?;
             }
             std::fs::rename(&legacy, note_dir.join(format!("{MEMOS_FILE}.bak")))?;
             eprintln!("备注已从 memos.json 转成 memo.md({} 条): {}", list.memos.len(), note_dir.display());
@@ -485,17 +591,29 @@ fn needs_migration(note_dir: &Path) -> bool {
     !note_dir.join(MEMO_DOC_FILE).is_file() && note_dir.join(MEMOS_FILE).is_file()
 }
 
-/// 读整篇备注(锁内读,正文与序号是同一版)。无文件为空文档;有旧 `memos.json` 时先迁移
+/// 锁内读:正文与版本号是同一版(编辑器取盘用)。锁拿不到返回错误,由调用方重试——
+/// 无锁拼出来的「旧正文 + 新序号」会让编辑器把真正的新版本当成旧的丢掉(Codex 审出)。
+pub fn load_doc_strict(note_dir: &Path) -> anyhow::Result<MemoDoc> {
+    locked(note_dir, || {
+        let text = read_locked(note_dir)?;
+        let seq = read_seq(note_dir, &text);
+        Ok(MemoDoc::at(text, seq))
+    })
+}
+
+/// 读整篇备注(导出、Aing、MCP、搜索等只读方)。无文件为空文档;有旧 `memos.json` 时先迁移
 /// (失败按空文档读并打日志——备注是增值层,不阻断笔记打开;旧文件原样留在盘上,下次再试)。
-/// 锁拿不到(极少:另一进程正长时间持锁)时退回无锁读。
+/// 锁拿不到时退回无锁读正文:这些读方只用正文,不用版本号。
 pub fn load_doc(note_dir: &Path) -> MemoDoc {
-    match locked(note_dir, || Ok(MemoDoc::at(read_locked(note_dir)?, read_seq(note_dir)))) {
+    match load_doc_strict(note_dir) {
         Ok(d) => d,
         Err(e) => {
             if note_dir.is_dir() {
                 eprintln!("备注读取走无锁路径({}): {e}", note_dir.display());
             }
-            MemoDoc::at(std::fs::read_to_string(note_dir.join(MEMO_DOC_FILE)).unwrap_or_default(), read_seq(note_dir))
+            let text = std::fs::read_to_string(note_dir.join(MEMO_DOC_FILE)).unwrap_or_default();
+            let seq = read_seq(note_dir, &text);
+            MemoDoc::at(text, seq)
         }
     }
 }
@@ -505,16 +623,16 @@ pub fn load_memos(note_dir: &Path) -> MemoList {
     MemoList { memos: parse_lines(&load_doc(note_dir).text) }
 }
 
-fn bump_seq(note_dir: &Path) -> anyhow::Result<u64> {
-    let next = read_seq(note_dir) + 1;
-    write_atomic(note_dir, MEMO_SEQ_FILE, next.to_string().as_bytes())?;
-    Ok(next)
-}
-
-/// 写正文并把序号加 1(锁内调用)。全空白删掉正文文件(序号照加)。返回新序号。
-fn write_doc(note_dir: &Path, text: &str) -> anyhow::Result<u64> {
+/// 写正文并记下新版本号(锁内调用;`cur_seq` 是写之前的版本号)。全空白删掉正文文件。
+/// 正文写成即算成功:序号文件写失败只打日志——读方会按指纹不符把这份正文算作新版本。
+fn write_doc(note_dir: &Path, text: &str, cur_seq: u64) -> anyhow::Result<u64> {
     write_text(note_dir, text)?;
-    bump_seq(note_dir)
+    let next = cur_seq + 1;
+    let on_disk = if text.trim().is_empty() { "" } else { text };
+    if let Err(e) = write_atomic(note_dir, MEMO_SEQ_FILE, format!("{next} {}", text_hash(on_disk)).as_bytes()) {
+        eprintln!("备注版本号写入失败(正文已写成,读方会按指纹自愈): {e}");
+    }
+    Ok(next)
 }
 
 fn write_text(note_dir: &Path, text: &str) -> anyhow::Result<()> {
@@ -539,15 +657,16 @@ pub fn save_doc(note_dir: &Path, text: &str, base: &str) -> anyhow::Result<MemoD
     }
     locked(note_dir, || {
         let cur = read_locked(note_dir)?;
+        let cur_seq = read_seq(note_dir, &cur);
         let next = if cur == base { text.to_string() } else { merge3(base, text, &cur) };
         let next = if next.trim().is_empty() { String::new() } else { next };
         if next == cur {
-            return Ok(MemoDoc::at(cur, read_seq(note_dir)));
+            return Ok(MemoDoc::at(cur, cur_seq));
         }
         if next.chars().count() > MAX_DOC_CHARS {
             anyhow::bail!("备注太长(上限 {MAX_DOC_CHARS} 字)");
         }
-        let seq = write_doc(note_dir, &next)?;
+        let seq = write_doc(note_dir, &next, cur_seq)?;
         Ok(MemoDoc::at(next, seq))
     })
 }
@@ -556,15 +675,16 @@ pub fn save_doc(note_dir: &Path, text: &str, base: &str) -> anyhow::Result<MemoD
 fn modify(note_dir: &Path, f: impl FnOnce(&str) -> anyhow::Result<Option<String>>) -> anyhow::Result<MemoDoc> {
     locked(note_dir, || {
         let cur = read_locked(note_dir)?;
+        let cur_seq = read_seq(note_dir, &cur);
         match f(&cur)? {
             Some(next) => {
                 if next.chars().count() > MAX_DOC_CHARS {
                     anyhow::bail!("备注太长(上限 {MAX_DOC_CHARS} 字)");
                 }
-                let seq = write_doc(note_dir, &next)?;
+                let seq = write_doc(note_dir, &next, cur_seq)?;
                 Ok(MemoDoc::at(next, seq))
             }
-            None => Ok(MemoDoc::at(cur, read_seq(note_dir))),
+            None => Ok(MemoDoc::at(cur, cur_seq)),
         }
     })
 }
@@ -752,6 +872,30 @@ mod tests {
     }
 
     #[test]
+    fn seq_heals_when_text_changed_without_seq() {
+        let d = tempfile::tempdir().unwrap();
+        let s1 = save_doc(d.path(), "a\n", "").unwrap();
+        assert_eq!(s1.rev, "1");
+        // 正文被改、序号没跟上(写到一半失败 / 应用外编辑):读方算作新一版
+        std::fs::write(d.path().join(MEMO_DOC_FILE), "b\n").unwrap();
+        assert_eq!(load_doc(d.path()).rev, "2");
+        let s3 = save_doc(d.path(), "c\n", "b\n").unwrap();
+        assert_eq!((s3.text.as_str(), s3.rev.as_str()), ("c\n", "3"));
+        // 旧格式没有序号文件但有正文:算 1
+        let e = tempfile::tempdir().unwrap();
+        std::fs::write(e.path().join(MEMO_DOC_FILE), "x\n").unwrap();
+        assert_eq!(load_doc(e.path()).rev, "1");
+    }
+
+    #[test]
+    fn merge3_aligns_by_position_not_content() {
+        // 同一时间点的两段可以文字相同:base=[A,B] local=[B,C] remote=[A,C] → [B,C](Codex 反例)
+        assert_eq!(merge3("A\n\nB\n", "B\n\nC\n", "A\n\nC\n"), "B\n\nC\n");
+        // 两边都改了同一行:都留,不丢字
+        assert_eq!(merge3("a\n", "a1\n", "a2\n"), "a1\n\na2\n");
+    }
+
+    #[test]
     fn merge3_cases() {
         let base = "决议 <!-- 00:16 -->\n\n- 周二上线 <!-- 00:16 -->\n";
         assert_eq!(merge3(base, base, "x\n"), "x\n");
@@ -848,6 +992,10 @@ mod tests {
         assert_eq!(escape_plain_line("结尾反斜杠\\"), "结尾反斜杠\\\\");
         assert_eq!(escape_plain_line("12) 编号"), "12\\) 编号");
         assert_eq!(escape_plain_line("<div>"), "\\<div>");
+        // 不构成块结构的不转义(与编辑器写法一致)
+        assert_eq!(escape_plain_line("-item"), "-item");
+        assert_eq!(escape_plain_line("#话题"), "#话题");
+        assert_eq!(escape_plain_line("2026.11 计划"), "2026.11 计划");
     }
 
     #[test]

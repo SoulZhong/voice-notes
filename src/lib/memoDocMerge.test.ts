@@ -46,4 +46,16 @@ describe("mergeMemoDoc", () => {
     const remote = "a <!-- 00:01 -->\n\n第一行\\\n第二行 <!-- 00:20 -->\n";
     expect(mergeMemoDoc(b, local, remote)).toBe("a 改 <!-- 00:01 -->\n\n第一行\\\n第二行 <!-- 00:20 -->\n");
   });
+
+  it("按位置对齐:同文字的段不互相覆盖(Codex 反例)", () => {
+    expect(mergeMemoDoc("A\n\nB\n", "B\n\nC\n", "A\n\nC\n")).toBe("B\n\nC\n");
+  });
+
+  it("两边都改同一行:都留", () => {
+    expect(mergeMemoDoc("a\n", "a1\n", "a2\n")).toBe("a1\n\na2\n");
+  });
+
+  it("本地改了一行、远端在其后追加:改动保留,追加接在后面", () => {
+    expect(mergeMemoDoc("a\n", "a 改\n", "a\n\n📍\n")).toBe("a 改\n\n📍\n");
+  });
 });

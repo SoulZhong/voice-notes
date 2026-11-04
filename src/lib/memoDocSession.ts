@@ -31,19 +31,34 @@ export function memoDocPending(noteId: string): number {
   return queue(noteId).pending;
 }
 
-export function saveSerial(noteId: string, text: string, basis: { base: string; prev: SaveOp | null }): SaveOp {
+/**
+ * 排队保存。`retry`:离开页面时交的最后一份——编辑器已销毁,没人会再重试,失败(锁超时、
+ * 临时 IO 错误)就在队列里按 1/2/4/8/16 秒退避重试,期间同篇后续保存与重新进页的取盘都排在
+ * 它后面(Codex 审出:离页那份失败后被吞掉,字就丢了)。
+ */
+export function saveSerial(
+  noteId: string,
+  text: string,
+  basis: { base: string; prev: SaveOp | null },
+  retry = false,
+): SaveOp {
   const q = queue(noteId);
   q.pending++;
   const op: SaveOp = { text, ok: null, done: Promise.resolve({ text: "", rev: "0" }) };
   const run = async (): Promise<MemoDoc> => {
     const base = basis.prev && basis.prev.ok ? basis.prev.text : basis.base;
-    try {
-      const doc = await saveMemoDoc(noteId, text, base);
-      op.ok = true;
-      return doc;
-    } catch (e) {
-      op.ok = false;
-      throw e;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const doc = await saveMemoDoc(noteId, text, base);
+        op.ok = true;
+        return doc;
+      } catch (e) {
+        if (!retry || attempt >= 5) {
+          op.ok = false;
+          throw e;
+        }
+        await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+      }
     }
   };
   op.done = q.chain.then(run, run).finally(() => {

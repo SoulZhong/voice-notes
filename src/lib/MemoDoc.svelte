@@ -123,6 +123,7 @@
     setBase(doc);
     if (local === prevSer) {
       if (local !== baseSer) setContent(doc.text);
+      if (baseSer !== doc.text) scheduleSave();
       return;
     }
     const merged = mergeMemoDoc(prevSer, local, baseSer);
@@ -142,7 +143,9 @@
       return;
     }
     const text = serialize();
-    if (text === baseSer) return;
+    // 与盘面原文一致才不存:只差格式(后端写入的转义/列表记号与编辑器写法不同)也存一次,
+    // 让盘面收敛到编辑器的写法,之后三方合并不再冒假差异(Codex 审出)。
+    if (text === base.text) return;
     if (text.length > MEMO_DOC_MAX_CHARS) {
       error = t("memo.doc.tooLong", { n: MEMO_DOC_MAX_CHARS });
       return;
@@ -261,6 +264,9 @@
       }
       loaded = true;
       v.setProps({});
+      // 剩余的「已知更新版本」交给持续同步(不以固定补读次数收尾);盘面写法不同则存一次规整版
+      void sync();
+      if (baseSer !== base.text) scheduleSave();
     } catch (e) {
       error = t("memo.failed", { e: String(e) });
     }
@@ -270,14 +276,15 @@
     destroyed = true;
     clearTimeout(timer);
     clearTimeout(retryTimer);
-    // 离开页面/切笔记:最后一份改动交给保存队列(排在在途那份之后)。有在途:只要和在途那份
-    // 不同就交(含撤销回原样),前驱 = 在途那份;没在途:与盘面不同才交。
+    // 离开页面/切笔记:最后一份改动交给保存队列(排在在途那份之后,失败在队列里重试)。
     if (editor) {
       if (loaded) {
         const text = serialize();
-        const need = inflight ? text !== inflight.text : text !== baseSer;
+        // 有保存在途:总是追加一份(在途那份若失败,这份以原盘面为基线把它的内容一并存下;
+        // 若成功且内容相同,后端判无变化不写)。没在途:与盘面原文不同才交。
+        const need = inflight ? true : text !== base.text;
         if (need && text.length <= MEMO_DOC_MAX_CHARS) {
-          void saveSerial(myId, text, { base: base.text, prev: inflight }).done.catch(() => {});
+          void saveSerial(myId, text, { base: base.text, prev: inflight }, true).done.catch(() => {});
         }
       }
       void editor.destroy();

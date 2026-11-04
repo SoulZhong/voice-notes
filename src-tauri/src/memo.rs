@@ -63,7 +63,8 @@ pub async fn note_memos(app: AppHandle, note_id: String) -> Result<Vec<memos::Me
 pub async fn memo_doc(app: AppHandle, note_id: String) -> Result<memos::MemoDoc, String> {
     crate::off_main(move || {
         let dir = note_dir(&app, &note_id)?;
-        Ok(memos::load_doc(&dir))
+        // 编辑器取盘:必须是锁内一致快照(正文与版本号同一版),拿不到锁报错让前端重试
+        memos::load_doc_strict(&dir).map_err(|e| e.to_string())
     })
     .await
 }
