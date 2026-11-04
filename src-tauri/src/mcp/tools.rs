@@ -264,14 +264,14 @@ pub fn get_note(
             let cuts = store::edits::load_edits(&note_dir).cuts;
             let content = match refined {
                 Some(doc) => {
-                    store::render_refined_with_memos(&note.meta.title, &doc, format == "markdown", &memo_list, &cuts)
+                    store::render_refined_with_memos(&note.meta.title, &doc, format == "markdown", &store::memos::export_lines(&memo_doc), &cuts)
                 }
                 // note 已在函数开头 load 过一次;render_loaded 直接渲染内存里的
                 // Note,避免 render(id, ..) 对同一笔记再触发一次磁盘 load。
                 None => store.render_loaded_with_memos(
                     &note,
                     if format == "markdown" { "md" } else { "txt" },
-                    &memo_list,
+                    &store::memos::export_lines(&memo_doc),
                     &cuts,
                 )?,
             };

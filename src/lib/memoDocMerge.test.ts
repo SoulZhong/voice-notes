@@ -39,4 +39,11 @@ describe("mergeMemoDoc", () => {
   it("两边写了同一行不重复", () => {
     expect(mergeMemoDoc("a\n", "a\n\nz\n", "a\n\nz\n")).toBe("a\n\nz\n");
   });
+
+  it("硬换行连起来的多行段落整体追加,不拆开", () => {
+    const b = "a <!-- 00:01 -->\n";
+    const local = "a 改 <!-- 00:01 -->\n";
+    const remote = "a <!-- 00:01 -->\n\n第一行\\\n第二行 <!-- 00:20 -->\n";
+    expect(mergeMemoDoc(b, local, remote)).toBe("a 改 <!-- 00:01 -->\n\n第一行\\\n第二行 <!-- 00:20 -->\n");
+  });
 });

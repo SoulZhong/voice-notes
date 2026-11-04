@@ -5,7 +5,7 @@
   // - 自动保存:停手约 0.8 秒整篇写盘,带版本号;别处同时改过(快捷键追加、浮窗补字)→ 按行三方
   //   合并后重存(memoDocMerge.ts),两边都不丢。
   // - 收起后是 40px 细轨:时间点小点(点了跳原文),录制中再画一条「现在」。
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { Editor, editorViewCtx, parserCtx, remarkStringifyOptionsCtx, rootCtx, serializerCtx } from "@milkdown/kit/core";
   import { commonmark } from "@milkdown/kit/preset/commonmark";
   import { gfm } from "@milkdown/kit/preset/gfm";
@@ -13,15 +13,9 @@
   import { $prose as proseFactory } from "@milkdown/kit/utils";
   import { Selection, TextSelection } from "@milkdown/kit/prose/state";
   import { t } from "$lib/i18n/index.svelte";
-  import {
-    fmtClock,
-    memoDoc,
-    MEMO_DOC_MAX_CHARS,
-    onMemosChanged,
-    saveMemoDoc,
-    type MemoDoc as Doc,
-  } from "$lib/memos";
+  import { fmtClock, memoDoc, MEMO_DOC_MAX_CHARS, onMemosChanged, type MemoDoc as Doc } from "$lib/memos";
   import { mergeMemoDoc } from "$lib/memoDocMerge";
+  import { memoDocSession, saveSerial } from "$lib/memoDocSession";
   import { memoDocPlugin, SKIP_STAMP, stampSchemaConfig } from "$lib/editor/memoDocSchema";
 
   let {
@@ -34,6 +28,7 @@
     durationMs = 0,
     editable = true,
   }: {
+    /** 只在创建时读一次:组件属于这一篇,宿主切笔记要用 {#key} 重建(见下方 myId)。 */
     noteId: string;
     open: boolean;
     onToggle: () => void;
@@ -47,26 +42,32 @@
     editable?: boolean;
   } = $props();
 
+  // 组件所属笔记:创建时定死。prop 是响应式 getter,切笔记时旧组件卸载那一刻读到的已是新笔记
+  // ——不定死的话,旧笔记没存的字会写进新笔记(Codex 审出 P1)。
+  const myId = untrack(() => noteId);
+  const session = memoDocSession(myId);
+
   let host = $state<HTMLElement | null>(null);
   let editor: Editor | null = null;
   let stamps = $state<number[]>([]);
   let error = $state("");
+  /** 首次取盘完成前不许编辑:否则取盘回来整篇替换会盖掉已经打的字(Codex 审出)。 */
+  let loaded = false;
   const span = $derived(Math.max(elapsedMs ?? 0, durationMs, 60_000, ...stamps.map((s) => s + 1)));
 
-  // 与盘对齐的基线:base.rev = 盘上版本;baseSer = 盘上内容经本编辑器序列化后的样子
-  // (行格式与 serialize() 一致,三方合并与「有没有改动」都拿它比)。
-  let base: Doc = { text: "", rev: "0" };
+  // baseSer = 会话基线(盘上内容)经本编辑器序列化后的样子:「有没有改动」与三方合并都拿它比,
+  // 行格式与 serialize() 一致,不会因格式差异冒出假改动。
   let baseSer = "";
-  let saving = false;
-  let again = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let destroyed = false;
-  // 插件闭包里读的「此刻」与回调:用普通变量转一手,不在 effect 外读 prop。
+  // 插件闭包里读的「此刻」、回调与可编辑:用普通变量转一手,不在 effect 外读 prop。
   let nowFn: () => number | null = () => null;
   let pickFn: (ms: number) => void = () => {};
+  let editableNow = true;
   $effect(() => {
     nowFn = now;
     pickFn = onPickMs;
+    editableNow = editable;
   });
 
   function view() {
@@ -101,7 +102,7 @@
   }
 
   function adopt(doc: Doc) {
-    base = doc;
+    session.base = doc;
     baseSer = normalize(doc.text);
   }
 
@@ -111,45 +112,46 @@
   }
 
   async function save() {
-    if (!editor) return;
-    if (saving) {
-      again = true;
-      return;
-    }
+    if (!editor || !loaded) return;
     const text = serialize();
     if (text === baseSer) return;
     if (text.length > MEMO_DOC_MAX_CHARS) {
       error = t("memo.doc.tooLong", { n: MEMO_DOC_MAX_CHARS });
       return;
     }
-    saving = true;
-    const forId = noteId;
     try {
-      const r = await saveMemoDoc(forId, text, base.rev);
-      if (forId !== noteId) return;
+      const out = await saveSerial(session, text);
+      if (destroyed || !editor) return;
       error = "";
-      if (r.kind === "saved") {
-        const typedSince = serialize() !== text;
-        adopt(r.doc);
-        // 后端钳过时间点(录制中前端走表略快)且这期间没再打字:把钳过的版本放回编辑器
-        if (!typedSince && baseSer !== text) setContent(r.doc.text);
-      } else {
-        absorbRemote(r.doc);
+      const typedSince = serialize() !== text;
+      baseSer = normalize(out.doc.text);
+      if (out.merged) {
+        // 落盘内容不是本次提交的原样(与别处改动合并过,或后端钳过时间点)
+        if (!typedSince) setContent(out.doc.text);
+        else {
+          // 这期间又打了字:把它合进落盘内容,稍后再存
+          const merged = mergeMemoDoc(text, serialize(), baseSer);
+          setContent(merged);
+          scheduleSave();
+        }
+      } else if (typedSince) {
+        scheduleSave();
       }
     } catch (e) {
-      error = t("memo.failed", { e: String(e) });
-    } finally {
-      saving = false;
-      if (again) {
-        again = false;
-        void save();
-      }
+      if (!destroyed) error = t("memo.failed", { e: String(e) });
     }
   }
 
-  /** 盘上被别处改了:没改动就直接换成盘上的;有改动就三方合并并重存。 */
+  /** 盘上变了:自己保存引起的就当确认;别处改的 → 没改动直接换成盘上的,有改动三方合并并重存。 */
   function absorbRemote(doc: Doc) {
-    if (!editor || doc.rev === base.rev) return;
+    if (!editor || !loaded) return;
+    if (session.recent.has(doc.text)) {
+      // 自己的保存(事件可能先于回执到达):更新基线即可,不合并
+      session.base = doc;
+      baseSer = normalize(doc.text);
+      return;
+    }
+    if (doc.rev === session.base.rev) return;
     const local = serialize();
     const dirty = local !== baseSer;
     const prevBaseSer = baseSer;
@@ -166,7 +168,6 @@
   let unlisten: Promise<() => void> | null = null;
 
   onMount(async () => {
-    const forId = noteId;
     editor = await Editor.make()
       .config((ctx) => {
         ctx.set(rootCtx, host!);
@@ -196,7 +197,7 @@
     }
     const v = view()!;
     v.setProps({
-      editable: () => editable,
+      editable: () => loaded && editableNow,
       dispatchTransaction(tr) {
         const next = v.state.apply(tr);
         v.updateState(next);
@@ -210,19 +211,24 @@
         return false;
       },
     });
-    // 先挂事件、再取盘:取盘在途时到达的事件以事件为准(更新)。
-    let gotEvent = false;
+    // 先挂事件;再等这一篇在途的保存(上一个编辑器实例卸载时交的最后一份)落定,然后取盘。
+    let latest: Doc | null = null;
     unlisten = onMemosChanged((e) => {
-      if (e.note_id !== forId || destroyed) return;
-      gotEvent = true;
-      absorbRemote(e.doc);
+      if (e.note_id !== myId || destroyed) return;
+      if (!loaded) latest = e.doc;
+      else absorbRemote(e.doc);
     });
     await unlisten;
+    await session.chain;
     try {
-      const doc = await memoDoc(forId);
-      if (destroyed || gotEvent) return;
+      const fetched = await memoDoc(myId);
+      if (destroyed) return;
+      // 取盘在途时到达的事件比快照新
+      const doc = latest ?? fetched;
       adopt(doc);
       setContent(doc.text);
+      loaded = true;
+      v.setProps({});
     } catch (e) {
       error = t("memo.failed", { e: String(e) });
     }
@@ -231,10 +237,10 @@
   onDestroy(() => {
     destroyed = true;
     clearTimeout(timer);
-    // 离开页面/切笔记:有没存的改动立刻存(不等防抖)
+    // 离开页面/切笔记:最后一份改动交给会话的串行队列(排在在途保存之后,冲突会合并重试)
     if (editor) {
-      const text = serialize();
-      if (text !== baseSer && text.length <= MEMO_DOC_MAX_CHARS) void saveMemoDoc(noteId, text, base.rev).catch(() => {});
+      const text = loaded ? serialize() : baseSer;
+      if (loaded && text !== baseSer && text.length <= MEMO_DOC_MAX_CHARS) void saveSerial(session, text).catch(() => {});
       void editor.destroy();
       editor = null;
     }

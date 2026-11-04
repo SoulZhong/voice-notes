@@ -8,7 +8,8 @@
 //   local 里已没有这行(用户也改/删了)→ 新行追加到末尾,不丢字;
 // - remote 多出来的行 → 追加到 local 末尾(快捷键追加的就是这种);
 // - remote 删掉的行 → local 里还原样在就删掉。
-// 空行不参与比对;结果用空行分隔追加的块。
+// 比对单位是「逻辑行」:行尾 `\` 的硬换行把下一行连进来算同一个单位,多行段落整体进出,
+// 不会被拆开、时间注释也不会和前半段分家(Codex 审出)。空行不参与比对;追加的块用空行分隔。
 
 function bag(lines: readonly string[]): Map<string, number> {
   const m = new Map<string, number>();
@@ -28,7 +29,17 @@ function minus(a: readonly string[], b: readonly string[]): string[] {
   return out;
 }
 
-const content = (s: string) => s.split("\n").filter((l) => l.trim() !== "");
+/** 按逻辑行切分:以 `\` 结尾的行与下一行连成一个单位(保留中间的换行)。 */
+function units(s: string): string[] {
+  const out: string[] = [];
+  for (const line of s.split("\n")) {
+    const last = out.length - 1;
+    if (last >= 0 && out[last].endsWith("\\")) out[last] += `\n${line}`;
+    else out.push(line);
+  }
+  return out;
+}
+const content = (s: string) => units(s).filter((l) => l.trim() !== "");
 
 export function mergeMemoDoc(base: string, local: string, remote: string): string {
   if (local === base) return remote;
@@ -37,7 +48,7 @@ export function mergeMemoDoc(base: string, local: string, remote: string): strin
   const r = content(remote);
   const added = minus(r, b);
   const removed = minus(b, r);
-  const lines = local.replace(/\s+$/, "").split("\n");
+  const lines = units(local.replace(/\s+$/, ""));
   const appended: string[] = [];
   const pairs = Math.min(added.length, removed.length);
   for (let i = 0; i < pairs; i++) {

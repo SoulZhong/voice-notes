@@ -207,7 +207,7 @@ pub fn parse_lines(doc: &str) -> Vec<Memo> {
                     md.push(' ');
                 }
                 md.push_str(body);
-                let first = strip_md_prefix(&md).to_string();
+                let first = unescape_md(strip_md_prefix(&md));
                 let text = if first == MARKER { String::new() } else { first };
                 out.push(Memo { id: format!("L{}", i + 1), at_ms, text, md: md.trim_end().to_string(), line: i + 1 });
             }
@@ -224,15 +224,84 @@ pub fn parse_lines(doc: &str) -> Vec<Memo> {
     out
 }
 
-/// 一段可能多行的纯文字 → 一个 Markdown 段落(多行用硬换行 `\` 连接),行尾挂时间点。
+/// 纯文字的一行 → 不会被当成 Markdown 结构的一行:行首的块记号(`#` `>` `-` `+` `*` `1.`)
+/// 前加反斜杠、行尾反斜杠(会变成硬换行)也转义;`<!--` 换成实体,免得被当成时间注释。
+/// 旧数据迁移与快捷键浮窗写入的都是用户的纯文字,不转义的话「第一行\n- 第二行」会被拆成
+/// 段落 + 列表,时间点只挂到后一半,前一半下次编辑时被重新打上当前时间(Codex 审出)。
+pub fn escape_plain_line(line: &str) -> String {
+    let lead = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(lead);
+    let rest = rest.replace("<!--", "&lt;!--");
+    let mut out = String::from(indent);
+    let first = rest.chars().next();
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if matches!(first, Some('#' | '>' | '-' | '+' | '*' | '=' | '`' | '~' | '|')) {
+        out.push('\\');
+        out.push_str(&rest);
+    } else if digits > 0 && matches!(rest.as_bytes().get(digits), Some(b'.' | b')')) {
+        out.push_str(&rest[..digits]);
+        out.push('\\');
+        out.push_str(&rest[digits..]);
+    } else {
+        out.push_str(&rest);
+    }
+    if out.ends_with('\\') {
+        out.push('\\');
+    }
+    out
+}
+
+/// [`escape_plain_line`] 的逆(只为视图文字:去掉标点前的转义反斜杠)。
+pub fn unescape_md(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            if let Some(&n) = it.peek() {
+                if n.is_ascii_punctuation() {
+                    out.push(n);
+                    it.next();
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out.replace("&lt;!--", "<!--")
+}
+
+/// 一段可能多行的纯文字 → 一个 Markdown 段落(逐行转义,多行用硬换行 `\` 连接),行尾挂时间点。
 fn paragraph(text: &str, at_ms: u64) -> String {
     let t = text.trim();
     let body = if t.is_empty() {
         MARKER.to_string()
     } else {
-        t.lines().map(str::trim_end).collect::<Vec<_>>().join("\\\n")
+        t.lines().map(|l| escape_plain_line(l.trim_end())).collect::<Vec<_>>().join("\\\n")
     };
     format!("{body} {}", stamp(at_ms))
+}
+
+/// 导出用的一行:整篇文档按物理行,带时间注释的行 `at_ms` 是自己的时间点,其余行(代码块、
+/// 表格、续行、空行……)继承上一个时间点(文档开头没有时为 0)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportLine {
+    /// 去掉时间注释后的原文(保留缩进)。
+    pub md: String,
+    pub at_ms: u64,
+    pub stamped: bool,
+}
+
+pub fn export_lines(doc: &str) -> Vec<ExportLine> {
+    let mut last = 0u64;
+    doc.lines()
+        .map(|raw| {
+            let (body, at) = split_stamp(raw);
+            if let Some(a) = at {
+                last = a;
+            }
+            ExportLine { md: body.trim_end().to_string(), at_ms: at.unwrap_or(last), stamped: at.is_some() }
+        })
+        .collect()
 }
 
 fn append_block(doc: &mut String, block: &str) {
@@ -643,6 +712,27 @@ mod tests {
         let cuts = [super::super::edits::CutRange { start_ms: 1_000, end_ms: 2_000 }];
         assert!(in_cut(1_000, &cuts));
         assert!(!in_cut(2_000, &cuts));
+    }
+
+    #[test]
+    fn plain_text_is_escaped_and_round_trips_in_view() {
+        let d = tempfile::tempdir().unwrap();
+        let (_, doc) = append(d.path(), 5_000, "第一行\n- 第二行\n1. 三\n# 四 <!-- x -->").unwrap();
+        assert_eq!(doc.text, "第一行\\\n\\- 第二行\\\n1\\. 三\\\n\\# 四 &lt;!-- x --> <!-- 00:05 -->\n");
+        let v = load_memos(d.path()).memos;
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].text, "第一行 - 第二行 1. 三 # 四 <!-- x -->");
+        assert_eq!(escape_plain_line("结尾反斜杠\\"), "结尾反斜杠\\\\");
+        assert_eq!(escape_plain_line("12) 编号"), "12\\) 编号");
+    }
+
+    #[test]
+    fn export_lines_inherit_last_stamp() {
+        let doc = "  - 子项 <!-- 00:03 -->\n```\ncode\n```\n\n后 <!-- 00:09 -->\n";
+        let v = export_lines(doc);
+        assert_eq!(v[0], ExportLine { md: "  - 子项".into(), at_ms: 3_000, stamped: true });
+        assert_eq!((v[2].md.as_str(), v[2].at_ms, v[2].stamped), ("code", 3_000, false));
+        assert_eq!((v[5].at_ms, v[5].stamped), (9_000, true));
     }
 
     #[test]

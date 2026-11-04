@@ -205,6 +205,17 @@ try {
     const saved = await waitFor(async () => (await calls(page, "save_memo_doc")).find((c) => c.args.text.includes("现场记一句 <!--")), 4000);
     assert(saved, `没有保存带时间点的新行:${JSON.stringify(await page.evaluate(() => [document.querySelector(".memo-doc .ProseMirror")?.innerText, window.__e2e.calls.filter((c) => c.cmd.includes("memo")).map((c) => c.cmd)]))}`);
     assert(/^定了:周二上线 <!-- 00:06 -->\n\n现场记一句 <!-- 00:1\d -->\n$/.test(saved.args.text), `新行应带录音时间(约 15 秒):${saved.args.text}`);
+    // 改成标题(内置快捷键只传 level):时间点要沿用,不能被重打成「现在」
+    const stampBefore = /现场记一句 <!-- (\d\d:\d\d) -->/.exec(saved.args.text)[1];
+    await sleep(2200);
+    await page.keyboard.down("Meta");
+    await page.keyboard.down("Alt");
+    await page.keyboard.press("Digit2");
+    await page.keyboard.up("Alt");
+    await page.keyboard.up("Meta");
+    const asHeading = await waitFor(async () => (await calls(page, "save_memo_doc")).find((c) => c.args.text.includes("## 现场记一句")), 4000);
+    assert(asHeading, "改成标题后没保存");
+    assert(asHeading.args.text.includes(`## 现场记一句 <!-- ${stampBefore} -->`), `改成标题后时间点变了:${asHeading.args.text}`);
     // 模拟快捷键在别处追加了一行(盘上变了),此时本地又改了一处 → 合并后两边都在
     await page.keyboard.type("再补");
     await page.evaluate(async () => {

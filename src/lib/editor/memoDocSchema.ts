@@ -13,6 +13,7 @@ import type { Ctx } from "@milkdown/kit/ctx";
 import type { Node as PMNode } from "@milkdown/kit/prose/model";
 import { Fragment } from "@milkdown/kit/prose/model";
 import { Plugin, PluginKey, type EditorState, type Transaction } from "@milkdown/kit/prose/state";
+import { Mapping } from "@milkdown/kit/prose/transform";
 import { Decoration, DecorationSet } from "@milkdown/kit/prose/view";
 import { fmtClock, parseClock } from "../memos";
 
@@ -149,8 +150,17 @@ export function collectStamps(doc: PMNode): number[] {
   return out;
 }
 
-/** 给该打时间点的块打上、给变空的块清掉;不需要改动返回 null。纯函数(配单测)。 */
-export function stampTransaction(state: EditorState, now: () => number | null): Transaction | null {
+/**
+ * 给该打时间点的块打上、给变空的块清掉;不需要改动返回 null。
+ * `inherit(pos, node)`:这个块在改动前是不是同一段文字(只是换了块类型,如段落 → 标题、
+ * 套进列表/引用)——是就沿用原来的时间点,不当新写的打上当前时间(Codex 审出:内置的
+ * 标题快捷键只传 level,`at` 会被重置成 null)。
+ */
+export function stampTransaction(
+  state: EditorState,
+  now: () => number | null,
+  inherit: (pos: number, node: PMNode) => number | null = () => null,
+): Transaction | null {
   let tr: Transaction | null = null;
   let prevAt: number | null = null;
   let cached: number | null | undefined;
@@ -162,7 +172,8 @@ export function stampTransaction(state: EditorState, now: () => number | null): 
     if (empty && at !== null) {
       tr = (tr ?? state.tr).setNodeMarkup(pos, undefined, { ...node.attrs, at: null });
     } else if (!empty && at === null) {
-      const v = Math.max(0, Math.round(nowOnce() ?? prevAt ?? 0));
+      const kept = inherit(pos, node);
+      const v = kept ?? Math.max(0, Math.round(nowOnce() ?? prevAt ?? 0));
       tr = (tr ?? state.tr).setNodeMarkup(pos, undefined, { ...node.attrs, at: v });
       prevAt = v;
     } else if (at !== null) {
@@ -187,9 +198,23 @@ export type MemoDocPluginOpts = {
 export function memoDocPlugin(o: MemoDocPluginOpts): Plugin {
   return new Plugin({
     key: memoDocKey,
-    appendTransaction(trs, _old, state) {
+    appendTransaction(trs, old, state) {
       if (!trs.some((t) => t.docChanged) || trs.some((t) => t.getMeta(SKIP_STAMP))) return null;
-      return stampTransaction(state, o.now);
+      const mapping = new Mapping();
+      for (const t of trs) mapping.appendMapping(t.mapping);
+      const back = mapping.invert();
+      const inherit = (pos: number, node: PMNode): number | null => {
+        // 块起点映射回改动前:同一位置附近若是文字相同、带时间点的块,就是「换了块类型」
+        for (const p of [back.map(pos, -1), back.map(pos, 1), back.map(pos + 1, -1) - 1]) {
+          if (p < 0 || p > old.doc.content.size) continue;
+          const prev = old.doc.nodeAt(p);
+          if (prev && isStampable(prev) && prev.attrs.at !== null && prev.textContent === node.textContent) {
+            return prev.attrs.at as number;
+          }
+        }
+        return null;
+      };
+      return stampTransaction(state, o.now, inherit);
     },
     props: {
       decorations(state) {

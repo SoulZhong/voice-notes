@@ -1,5 +1,5 @@
 use super::edits::CutRange;
-use super::memos::Memo;
+use super::memos::ExportLine as Memo;
 use super::{Note, NoteStore, RefinedDoc, SegmentRecord, SpeakerMeta};
 use std::collections::BTreeMap;
 
@@ -37,7 +37,7 @@ impl NoteStore {
         let fully_cut = |s: u64, e: u64| cuts.iter().any(|c| s >= c.start_ms && e <= c.end_ms);
         // 备注整篇作为一个小节放在正文前;圈选范围只带范围内的行(点判定 start ≤ t < end)。
         // 落在删减时段里的照样导出并标注(与界面一致)——备注永远属于用户,删减不动它。
-        let mut memos = super::memos::load_memos(&self.note_dir(id)?).memos;
+        let mut memos = super::memos::export_lines(&super::memos::load_doc(&self.note_dir(id)?).text);
         if let Some((s, e)) = range {
             memos.retain(|m| s <= m.at_ms && m.at_ms < e);
         }
@@ -241,53 +241,56 @@ impl MemoCursor {
     }
 }
 
-/// 「备注」小节。Markdown:每行保留用户写的结构(列表/引用/勾选框),行首记号之后插入
-/// `` `mm:ss` ``;用户写的标题降为三级,免得与导出自己的标题层级打架。纯文本:`[hh:mm:ss] 文字`。
-/// 落在删减时段里的行照样导出并标注(备注永远属于用户,删减不动它)。
-fn memo_section(memos: &[Memo], cuts: &[CutRange], md: bool) -> String {
-    if memos.is_empty() {
+/// 「备注」小节:整篇备注按文档原样(保留缩进、列表层级、代码块、表格等),带时间点的行在
+/// 行首记号之后插入 `` `mm:ss` ``;用户写的标题降两级,免得与导出自己的标题层级打架。
+/// 纯文本:带时间点的行 `[hh:mm:ss] 文字`,其余非空行缩进原样。落在删减时段里的行照样
+/// 导出并标注(备注永远属于用户,删减不动它)。连续空行并成一个。
+fn memo_section(lines: &[Memo], cuts: &[CutRange], md: bool) -> String {
+    if !lines.iter().any(|l| !l.md.trim().is_empty()) {
         return String::new();
     }
-    let mut lines: Vec<&Memo> = memos.iter().collect();
-    lines.sort_by_key(|m| (m.line, m.at_ms));
-    let mut out = String::new();
-    if md {
-        out.push_str("## 备注\n\n");
-        let mut prev: Option<usize> = None;
-        let mut first = true;
-        for m in lines {
-            let cut_tag = if super::memos::in_cut(m.at_ms, cuts) { "(该时段已删减)" } else { "" };
-            let clock = format!("`{}`", super::memos::fmt_clock(m.at_ms));
-            let body = if m.text.is_empty() { "🔖 时间标记".to_string() } else { m.text.clone() };
-            let raw = if m.md.is_empty() { m.text.as_str() } else { m.md.as_str() };
-            let stripped = super::memos::strip_md_prefix(raw);
-            let prefix = raw.trim_start().strip_suffix(stripped).unwrap_or("").trim_end();
-            let is_list = !prefix.is_empty() && !prefix.starts_with('#');
-            let line = if prefix.starts_with('#') {
-                format!("### {clock} {body}{cut_tag}")
-            } else if prefix.is_empty() {
-                format!("{clock} {body}{cut_tag}")
-            } else {
-                format!("{prefix} {clock} {body}{cut_tag}")
-            };
-            if !first {
-                out.push_str(if is_list && prev.is_some_and(|p| p + 1 == m.line) { "\n" } else { "\n\n" });
+    let mut body = String::new();
+    let mut blank = true;
+    for l in lines {
+        if l.md.trim().is_empty() {
+            if !blank {
+                body.push('\n');
             }
-            first = false;
-            out.push_str(&line);
-            prev = if is_list { Some(m.line) } else { None };
+            blank = true;
+            continue;
         }
-        out.push_str("\n\n---\n\n");
-    } else {
-        out.push_str("备注:\n");
-        for m in lines {
-            let cut_tag = if super::memos::in_cut(m.at_ms, cuts) { "(该时段已删减)" } else { "" };
-            let body = if m.text.is_empty() { "时间标记" } else { m.text.as_str() };
-            out.push_str(&format!("[{}] {body}{cut_tag}\n", format_ts(m.at_ms)));
-        }
-        out.push('\n');
+        blank = false;
+        let cut_tag = if l.stamped && super::memos::in_cut(l.at_ms, cuts) { "(该时段已删减)" } else { "" };
+        let indent_len = l.md.len() - l.md.trim_start().len();
+        let (indent, rest) = l.md.split_at(indent_len);
+        let text = super::memos::strip_md_prefix(rest);
+        let prefix = rest.strip_suffix(text).unwrap_or("").trim_end();
+        let shown = if text == super::memos::MARKER { "🔖 时间标记" } else { text };
+        let line = if !l.stamped {
+            if md { l.md.clone() } else { format!("    {}", l.md.trim()) }
+        } else if md {
+            let clock = format!("`{}`", super::memos::fmt_clock(l.at_ms));
+            if prefix.starts_with('#') {
+                let level = (prefix.len() + 2).min(6);
+                format!("{indent}{} {clock} {shown}{cut_tag}", "#".repeat(level))
+            } else if prefix.is_empty() {
+                format!("{indent}{clock} {shown}{cut_tag}")
+            } else {
+                format!("{indent}{prefix} {clock} {shown}{cut_tag}")
+            }
+        } else {
+            let plain = if text == super::memos::MARKER { "时间标记".to_string() } else { super::memos::unescape_md(text) };
+            format!("[{}] {plain}{cut_tag}", format_ts(l.at_ms))
+        };
+        body.push_str(&line);
+        body.push('\n');
     }
-    out
+    let body = body.trim_end();
+    if md {
+        format!("## 备注\n\n{body}\n\n---\n\n")
+    } else {
+        format!("备注:\n{body}\n\n")
+    }
 }
 
 /// 把成品轨轨内若干保留区间(毫秒,有序不重叠)拼接写到 tmp。WAV 直接按字节拼
@@ -574,12 +577,6 @@ mod tests {
     use crate::store::NoteStore;
     use serde_json;
 
-    fn memo(line: usize, at_ms: u64, md: &str) -> Memo {
-        let text = crate::store::memos::strip_md_prefix(md);
-        let text = if text == crate::store::memos::MARKER { String::new() } else { text.to_string() };
-        Memo { id: format!("L{line}"), at_ms, text, md: md.into(), line }
-    }
-
     fn memo_note() -> Note {
         let seg = |seq: u64, s: u64, text: &str| crate::store::SegmentRecord {
             seq, source: "mic".into(), text: text.into(), start_ms: s, end_ms: s + 1000,
@@ -599,23 +596,17 @@ mod tests {
     }
 
     #[test]
-    fn memo_section_goes_before_body_in_document_order() {
+    fn memo_section_goes_before_body_and_keeps_structure() {
         let note = memo_note();
-        let memos = [
-            memo(1, 16_000, "## 决议"),
-            memo(3, 16_000, "- 周二上线"),
-            memo(4, 31_000, "- [ ] 回滚"),
-            memo(6, 10_000, "📍"),
-            memo(8, 5_000, "定了 周一封版"),
-        ];
+        let doc = "## 决议 <!-- 00:16 -->\n\n- 周二上线 <!-- 00:16 -->\n  - [ ] 回滚 <!-- 00:31 -->\n\n```\nkubectl rollout\n```\n\n📍 <!-- 00:10 -->\n\n\n\n定了 周一封版 <!-- 00:05 -->\n";
+        let memos = crate::store::memos::export_lines(doc);
         let cuts = [CutRange { start_ms: 9_000, end_ms: 11_000 }];
         let md = render_markdown(&note, &memos, &cuts);
-        let want = "## 备注\n\n### `00:16` 决议\n\n- `00:16` 周二上线\n- [ ] `00:31` 回滚\n\n`00:10` 🔖 时间标记(该时段已删减)\n\n`00:05` 定了 周一封版\n\n---\n\n";
+        let want = "## 备注\n\n#### `00:16` 决议\n\n- `00:16` 周二上线\n  - [ ] `00:31` 回滚\n\n```\nkubectl rollout\n```\n\n`00:10` 🔖 时间标记(该时段已删减)\n\n`00:05` 定了 周一封版\n\n---\n\n";
         assert!(md.contains(want), "{md}");
         assert!(md.find("## 备注").unwrap() < md.find("] 00:00:00** 一").unwrap(), "{md}");
         let txt = render_text(&note, &memos, &cuts);
-        assert!(txt.contains("备注:\n[00:00:16] 决议\n[00:00:16] 周二上线\n[00:00:31] 回滚\n[00:00:10] 时间标记(该时段已删减)\n[00:00:05] 定了 周一封版\n\n"), "{txt}");
-        assert!(txt.find("备注:").unwrap() < txt.find("一").unwrap());
+        assert!(txt.contains("备注:\n[00:00:16] 决议\n\n[00:00:16] 周二上线\n[00:00:31] 回滚\n\n    ```\n    kubectl rollout\n    ```\n\n[00:00:10] 时间标记(该时段已删减)\n\n[00:00:05] 定了 周一封版\n\n"), "{txt}");
         // 无备注时与旧输出逐字节一致
         assert_eq!(render_markdown(&note, &[], &[]), render_note(&note, "md").unwrap());
     }
@@ -633,7 +624,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let md = render_refined_with_memos("标题", &doc, true, &[memo(1, 6_000, "中间")], &[]);
+        let md = render_refined_with_memos("标题", &doc, true, &crate::store::memos::export_lines("中间 <!-- 00:06 -->\n"), &[]);
         let (h, m, a) = (md.find("## 手写").unwrap(), md.find("`00:06` 中间").unwrap(), md.find("甲").unwrap());
         assert!(h < m && m < a, "{md}");
         assert_eq!(render_refined("标题", &doc, true), render_refined_with_memos("标题", &doc, true, &[], &[]));
