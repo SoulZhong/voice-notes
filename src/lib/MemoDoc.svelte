@@ -13,9 +13,9 @@
   import { $prose as proseFactory } from "@milkdown/kit/utils";
   import { Selection, TextSelection } from "@milkdown/kit/prose/state";
   import { t } from "$lib/i18n/index.svelte";
-  import { fmtClock, memoDoc, MEMO_DOC_MAX_CHARS, onMemosChanged, type MemoDoc as Doc } from "$lib/memos";
+  import { fmtClock, memoDoc, MEMO_DOC_MAX_CHARS, onMemosChanged, seqOf, type MemoDoc as Doc } from "$lib/memos";
   import { mergeMemoDoc } from "$lib/memoDocMerge";
-  import { memoDocSession, noteSeen, saveSerial } from "$lib/memoDocSession";
+  import { memoDocIdle, saveSerial, type SaveOp } from "$lib/memoDocSession";
   import { memoDocPlugin, SKIP_STAMP, stampSchemaConfig } from "$lib/editor/memoDocSchema";
 
   let {
@@ -45,7 +45,6 @@
   // 组件所属笔记:创建时定死。prop 是响应式 getter,切笔记时旧组件卸载那一刻读到的已是新笔记
   // ——不定死的话,旧笔记没存的字会写进新笔记(Codex 审出 P1)。
   const myId = untrack(() => noteId);
-  const session = memoDocSession(myId);
 
   let host = $state<HTMLElement | null>(null);
   let editor: Editor | null = null;
@@ -55,16 +54,20 @@
   let loaded = false;
   const span = $derived(Math.max(elapsedMs ?? 0, durationMs, 60_000, ...stamps.map((s) => s + 1)));
 
-  // baseRaw = 编辑器内容所依据的盘面原文(上次与盘对齐的那一版);baseSer = 它经本编辑器序列化后
-  // 的样子(行格式与 serialize() 一致)——「有没有改动」与三方合并都拿它比,不冒假差异。
+  // ── 与盘同步的状态(本编辑器实例私有) ──
+  // base = 编辑器内容所依据的盘面(已应用到编辑器的最新一版);baseSer = 它经本编辑器序列化后
+  // 的样子(行格式与 serialize() 一致,「有没有改动」与合并都拿它比,不冒假差异)。
+  // 新旧只看版本号(后端写入序号,只增不减):比 base 旧或相等的一律不理。
+  let base: Doc = { text: "", rev: "0" };
   let baseSer = "";
-  let baseRaw = "";
-  /** 本编辑器一次只有一份保存在途;在途那份的文本(离页时排队的最后一份以它为前驱)。 */
-  let inflight: string | null = null;
+  /** 见过的最高版本号(事件带来的):高于 base 说明盘上有还没应用的新内容,空闲时补取。 */
+  let wantSeq = 0;
+  /** 本编辑器一次只有一份保存在途。 */
+  let inflight: SaveOp | null = null;
   let again = false;
-  /** 保存在途时收到了「没见过的版本」的事件:回执后重新取盘再对齐(不回放暂存的快照)。 */
-  let staleCheck = false;
+  let syncing = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let destroyed = false;
   // 插件闭包里读的「此刻」、回调与可编辑:用普通变量转一手,不在 effect 外读 prop。
   let nowFn: () => number | null = () => null;
@@ -107,20 +110,34 @@
     });
   }
 
-  function adopt(doc: Doc) {
-    noteSeen(session, doc);
-    baseRaw = doc.text;
+  function setBase(doc: Doc) {
+    base = doc;
     baseSer = normalize(doc.text);
   }
 
-  function scheduleSave() {
+  /** 应用一版比 base 新的盘面:编辑器没改动就直接换成它;有改动就把改动接到它上面,稍后再存。 */
+  function applyRemote(doc: Doc) {
+    if (!editor || seqOf(doc) <= seqOf(base)) return;
+    const local = serialize();
+    const prevSer = baseSer;
+    setBase(doc);
+    if (local === prevSer) {
+      if (local !== baseSer) setContent(doc.text);
+      return;
+    }
+    const merged = mergeMemoDoc(prevSer, local, baseSer);
+    if (merged !== local) setContent(merged);
+    scheduleSave();
+  }
+
+  function scheduleSave(ms = 800) {
     clearTimeout(timer);
-    timer = setTimeout(() => void save(), 800);
+    timer = setTimeout(() => void save(), ms);
   }
 
   async function save() {
-    if (!editor || !loaded) return;
-    if (inflight !== null) {
+    if (!editor || !loaded || destroyed) return;
+    if (inflight) {
       again = true;
       return;
     }
@@ -130,65 +147,50 @@
       error = t("memo.doc.tooLong", { n: MEMO_DOC_MAX_CHARS });
       return;
     }
-    inflight = text;
+    const op = saveSerial(myId, text, { base: base.text, prev: null });
+    inflight = op;
     try {
-      const out = await saveSerial(session, text, { base: baseRaw, prev: null });
+      const doc = await op.done;
       if (destroyed || !editor) return;
       error = "";
-      const now = serialize();
-      baseRaw = out.doc.text;
-      baseSer = normalize(out.doc.text);
-      if (out.merged) {
-        // 落盘内容合进了别处的改动:把它们带回编辑器;这期间又打的字一并保留
-        setContent(now === text ? out.doc.text : mergeMemoDoc(text, now, baseSer));
+      // 回执是后端锁内合并后的结果(含保存期间别处的改动);这期间新打的字接到它上面
+      if (seqOf(doc) > seqOf(base)) {
+        const now = serialize();
+        setBase(doc);
+        if (baseSer !== now) setContent(now === text ? doc.text : mergeMemoDoc(text, now, baseSer));
       }
     } catch (e) {
-      if (!destroyed) error = t("memo.failed", { e: String(e) });
+      if (destroyed) return;
+      error = t("memo.failed", { e: String(e) });
+      // 失败:改动还在编辑器里,过一会儿重试
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => void save(), 3000);
     } finally {
       inflight = null;
       if (!destroyed && editor) {
-        if (staleCheck && session.pending === 0) {
-          staleCheck = false;
-          void resync();
-        }
-        if (again || serialize() !== baseSer) {
-          again = false;
-          scheduleSave();
-        }
+        void sync();
+        const queued = again;
+        again = false;
+        if (queued || serialize() !== baseSer) scheduleSave(queued ? 0 : 800);
       }
     }
   }
 
-  /** 盘上被别处改了(版本没见过):没改动直接换成盘上的;有改动三方合并并重存。 */
-  function absorbRemote(doc: Doc) {
-    if (!editor || !loaded || session.seen.has(doc.rev)) return;
-    if (session.pending > 0) {
-      // 保存在途:这份事件可能比在途保存读到的盘面旧,也可能更新——回执后重新取盘再判断
-      staleCheck = true;
-      return;
-    }
-    const local = serialize();
-    const dirty = local !== baseSer;
-    const prevBaseSer = baseSer;
-    adopt(doc);
-    if (!dirty) {
-      if (local !== baseSer) setContent(doc.text);
-      return;
-    }
-    const merged = mergeMemoDoc(prevBaseSer, local, baseSer);
-    if (merged !== local) setContent(merged);
-    scheduleSave();
-  }
-
-  /** 重新取盘对齐(在途保存期间有过外部事件时)。 */
-  async function resync() {
+  /** 盘上有还没应用的新版本(wantSeq > base)且没有保存在途:取盘应用。取回来的比 base 旧
+      (取盘期间又有保存/事件推进了 base)就丢掉;仍落后就再取一次。 */
+  async function sync() {
+    if (!editor || destroyed || inflight || syncing || wantSeq <= seqOf(base)) return;
+    syncing = true;
     try {
       const doc = await memoDoc(myId);
-      if (destroyed || session.pending > 0) return;
-      absorbRemote(doc);
+      if (destroyed) return;
+      if (!inflight) applyRemote(doc);
     } catch {
       /* 取不到就等下一次事件 */
+    } finally {
+      syncing = false;
     }
+    if (!destroyed && !inflight && wantSeq > seqOf(base)) setTimeout(() => void sync(), 300);
   }
 
   let unlisten: Promise<() => void> | null = null;
@@ -237,19 +239,26 @@
         return false;
       },
     });
-    // 先挂事件;再等这一篇在途的保存(上一个编辑器实例卸载时交的最后一份)落定,然后取盘。
-    // 取盘期间到达的事件不必单独处理:取盘结果至少和它一样新。
+    // 事件只记「见过的最高版本」并在空闲时应用;保存在途时等回执后由 sync 补取。
     unlisten = onMemosChanged((e) => {
-      if (e.note_id !== myId || destroyed || !loaded) return;
-      absorbRemote(e.doc);
+      if (e.note_id !== myId || destroyed) return;
+      wantSeq = Math.max(wantSeq, seqOf(e.doc));
+      if (!loaded || inflight) return;
+      applyRemote(e.doc);
     });
     await unlisten;
-    await session.chain;
+    // 上一个编辑器实例离开时交的最后一份先落定,再取盘;取盘期间若有更新的事件,再取一次。
+    await memoDocIdle(myId);
     try {
-      const doc = await memoDoc(myId);
-      if (destroyed) return;
-      adopt(doc);
-      setContent(doc.text);
+      for (let i = 0; i < 3; i++) {
+        const doc = await memoDoc(myId);
+        if (destroyed) return;
+        if (seqOf(doc) >= seqOf(base)) {
+          setBase(doc);
+          setContent(doc.text);
+        }
+        if (wantSeq <= seqOf(base)) break;
+      }
       loaded = true;
       v.setProps({});
     } catch (e) {
@@ -260,14 +269,17 @@
   onDestroy(() => {
     destroyed = true;
     clearTimeout(timer);
-    // 离开页面/切笔记:最后一份改动交给会话的串行队列(排在在途保存之后,冲突会合并重试)
+    clearTimeout(retryTimer);
+    // 离开页面/切笔记:最后一份改动交给保存队列(排在在途那份之后)。有在途:只要和在途那份
+    // 不同就交(含撤销回原样),前驱 = 在途那份;没在途:与盘面不同才交。
     if (editor) {
-      const text = loaded ? serialize() : baseSer;
-      // 有保存在途:只要和在途那份不同就交(含撤销回原样的情况),前驱 = 在途那份,在途失败则
-      // 会话自动退回 baseRaw 作基线;没在途:与盘面不同才交。
-      const need = inflight !== null ? text !== inflight : text !== baseSer;
-      if (loaded && need && text.length <= MEMO_DOC_MAX_CHARS)
-        void saveSerial(session, text, { base: baseRaw, prev: inflight }).catch(() => {});
+      if (loaded) {
+        const text = serialize();
+        const need = inflight ? text !== inflight.text : text !== baseSer;
+        if (need && text.length <= MEMO_DOC_MAX_CHARS) {
+          void saveSerial(myId, text, { base: base.text, prev: inflight }).done.catch(() => {});
+        }
+      }
       void editor.destroy();
       editor = null;
     }

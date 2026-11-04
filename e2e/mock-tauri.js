@@ -31,7 +31,8 @@
   ];
   // 备注 = 一篇 Markdown(行尾 <!-- mm:ss --> 是时间点);memos 是行视图(同后端 parse_lines 的简化版)。
   let memoText = "定了:周二上线 <!-- 00:06 -->\n";
-  const revOf = (t) => (t ? `r${t.length}_${[...t].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)}` : "0");
+  // 版本号 = 写入序号(同后端 .memo.seq)。
+  let memoSeq = 1;
   const clock = (ms) => { const s = Math.floor(ms / 1000); return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`; };
   const parseLines = (t) => t.split("\n").flatMap((l, i) => {
     const m = /^(.*?)\s*<!--\s*(\d+):(\d\d)\s*-->\s*$/.exec(l);
@@ -40,7 +41,23 @@
     const text = md.replace(/^(#+\s+|[-*+]\s+(\[[ xX]\]\s+)?|\d+\.\s+|>\s*)/, "").trim();
     return [{ id: `L${i + 1}`, at_ms: (Number(m[2]) * 60 + Number(m[3])) * 1000, text: text === "📍" ? "" : text, md, line: i + 1 }];
   });
-  const memoDocNow = () => ({ text: memoText, rev: revOf(memoText) });
+  const memoDocNow = () => ({ text: memoText, rev: String(memoSeq) });
+  // 同后端 merge3 的简化版:按行,远端多出的追加、删掉的删、改掉的就地换(找不到就追加)。
+  const merge3 = (base, local, remote) => {
+    if (local === base) return remote;
+    if (remote === base || remote === local) return local;
+    const units = (t) => t.split("\n").filter((l) => l.trim() !== "");
+    const minus = (a, b) => { const left = [...b]; return a.filter((l) => { const i = left.indexOf(l); if (i >= 0) { left.splice(i, 1); return false; } return true; }); };
+    const added = minus(units(remote), units(base));
+    const removed = minus(units(base), units(remote));
+    const lines = local.replace(/\s+$/, "").split("\n");
+    const extra = [];
+    added.forEach((a, i) => { const at = i < removed.length ? lines.indexOf(removed[i]) : -1; if (at >= 0) lines[at] = a; else if (!lines.includes(a)) extra.push(a); });
+    removed.slice(added.length).forEach((g) => { const at = lines.indexOf(g); if (at >= 0) lines.splice(at, 1); });
+    let out = lines.join("\n").replace(/\n{3,}/g, "\n\n");
+    for (const a of extra) out = out.trim() ? `${out.replace(/\s+$/, "")}\n\n${a}` : a;
+    return out.trim() ? `${out.replace(/\s+$/, "")}\n` : "";
+  };
   const emitMemos = (noteId) => setTimeout(() => window.__e2e.emit("memos_changed", { note_id: noteId, memos: parseLines(memoText), doc: memoDocNow() }), 0);
   let memos = parseLines(memoText);
   const note = {
@@ -59,11 +76,14 @@
     note_memos: () => parseLines(memoText),
     memo_doc: () => memoDocNow(),
     save_memo_doc: (a) => {
-      if (a.baseRev !== revOf(memoText)) return { kind: "conflict", doc: memoDocNow() };
-      memoText = a.text;
-      memos = parseLines(memoText);
-      emitMemos(a.noteId);
-      return { kind: "saved", doc: memoDocNow() };
+      const next = memoText === a.baseText ? a.text : merge3(a.baseText, a.text, memoText);
+      if (next !== memoText) {
+        memoText = next;
+        memoSeq++;
+        memos = parseLines(memoText);
+        emitMemos(a.noteId);
+      }
+      return memoDocNow();
     },
     edit_memo_line: (a) => {
       const lines = memoText.split("\n");
@@ -72,6 +92,7 @@
       if (hit) lines[hit.line - 1] = block;
       else lines.push("", block);
       memoText = lines.join("\n").replace(/\n*$/, "\n");
+      memoSeq++;
       memos = parseLines(memoText);
       emitMemos(a.noteId);
       return null;

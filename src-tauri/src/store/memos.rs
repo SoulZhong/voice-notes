@@ -76,7 +76,9 @@ pub struct MemoList {
     pub memos: Vec<Memo>,
 }
 
-/// 整篇备注 + 版本号。版本号是内容的 64 位 FNV-1a,空文档为 `"0"`。
+/// 整篇备注 + 版本号。版本号是写入序号(十进制字符串):每写一次加 1,存在 `.memo.seq`,
+/// 与 memo.md 同锁读写。用序号而不是内容哈希:内容相同不代表是同一次写入(撤销回旧内容
+/// 后哈希不变,编辑器会误当成旧事件丢掉,Codex 审出);序号只增不减,新旧一比就知道。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoDoc {
     pub text: String,
@@ -84,44 +86,103 @@ pub struct MemoDoc {
 }
 
 impl MemoDoc {
-    fn of(text: String) -> Self {
-        let rev = rev_of(&text);
-        Self { text, rev }
+    fn at(text: String, seq: u64) -> Self {
+        Self { text, rev: seq.to_string() }
     }
 }
 
-#[derive(Debug)]
-pub enum SaveError {
-    /// 盘上版本与 `base_rev` 不一致:别处(快捷键/浮窗/另一个窗口/MCP)刚改过。附盘上现状。
-    Conflict(MemoDoc),
-    Other(anyhow::Error),
+pub const MEMO_SEQ_FILE: &str = ".memo.seq";
+
+fn read_seq(note_dir: &Path) -> u64 {
+    std::fs::read_to_string(note_dir.join(MEMO_SEQ_FILE)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
-impl std::fmt::Display for SaveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SaveError::Conflict(_) => write!(f, "备注已在别处被修改"),
-            SaveError::Other(e) => write!(f, "{e}"),
+// ── 按行三方合并 ──────────────────────────────────────────────────────────
+
+/// 按逻辑行切分:以 `\` 结尾的行与下一行连成一个单位(硬换行段落整体进出)。
+fn units(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in s.split('\n') {
+        if let Some(last) = out.last_mut() {
+            if last.ends_with('\\') {
+                last.push('\n');
+                last.push_str(line);
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out
+}
+
+fn content_units(s: &str) -> Vec<String> {
+    units(s).into_iter().filter(|l| !l.trim().is_empty()).collect()
+}
+
+/// a 中比 b 多出来的单位(多重集合差,保持 a 的顺序)。
+fn minus(a: &[String], b: &[String]) -> Vec<String> {
+    let mut left: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for l in b {
+        *left.entry(l.as_str()).or_default() += 1;
+    }
+    let mut out = Vec::new();
+    for l in a {
+        match left.get_mut(l.as_str()) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => out.push(l.clone()),
         }
     }
+    out
 }
 
-impl From<anyhow::Error> for SaveError {
-    fn from(e: anyhow::Error) -> Self {
-        SaveError::Other(e)
+/// 三方合并(按逻辑行):`base` 是 `local` 所依据的版本,`remote` 是盘上现状。
+/// - 一侧没动 → 取另一侧;
+/// - remote 相对 base 改掉的行(按出现顺序与新增的行配对)→ 在 local 里找到同一行原地替换,
+///   找不到(local 也改/删了)→ 新行追加到末尾,不丢字;
+/// - remote 多出的行 → 追加到 local 末尾;remote 删掉的行 → local 里还原样在就删掉。
+/// 与前端 memoDocMerge.ts 同一算法(前端用它把保存期间的新输入接到回执上)。
+pub fn merge3(base: &str, local: &str, remote: &str) -> String {
+    if local == base {
+        return remote.to_string();
     }
-}
-
-pub fn rev_of(text: &str) -> String {
-    if text.is_empty() {
-        return "0".into();
+    if remote == base || remote == local {
+        return local.to_string();
     }
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in text.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    let b = content_units(base);
+    let r = content_units(remote);
+    let added = minus(&r, &b);
+    let removed = minus(&b, &r);
+    let mut lines = units(local.trim_end());
+    let mut appended: Vec<String> = Vec::new();
+    let pairs = added.len().min(removed.len());
+    for i in 0..pairs {
+        match lines.iter().position(|l| *l == removed[i]) {
+            Some(at) => lines[at] = added[i].clone(),
+            None => appended.push(added[i].clone()),
+        }
     }
-    format!("{h:016x}")
+    appended.extend(added[pairs..].iter().cloned());
+    for gone in &removed[pairs..] {
+        if let Some(at) = lines.iter().position(|l| l == gone) {
+            lines.remove(at);
+        }
+    }
+    let mut out = lines.join("\n");
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    let mut out = out.trim_start_matches('\n').to_string();
+    for a in appended {
+        if lines.contains(&a) {
+            continue;
+        }
+        out = if out.trim().is_empty() { a } else { format!("{}\n\n{a}", out.trim_end()) };
+    }
+    if out.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", out.trim_end())
+    }
 }
 
 // ── 时间注释 ────────────────────────────────────────────────────────────
@@ -404,6 +465,7 @@ fn read_locked(note_dir: &Path) -> anyhow::Result<String> {
             let doc = legacy_to_doc(&list);
             if !doc.is_empty() {
                 write_atomic(note_dir, MEMO_DOC_FILE, doc.as_bytes())?;
+                bump_seq(note_dir)?;
             }
             std::fs::rename(&legacy, note_dir.join(format!("{MEMOS_FILE}.bak")))?;
             eprintln!("备注已从 memos.json 转成 memo.md({} 条): {}", list.memos.len(), note_dir.display());
@@ -423,19 +485,19 @@ fn needs_migration(note_dir: &Path) -> bool {
     !note_dir.join(MEMO_DOC_FILE).is_file() && note_dir.join(MEMOS_FILE).is_file()
 }
 
-/// 读整篇备注。无文件为空文档;有旧 `memos.json` 时先迁移(迁移失败按空文档读并打日志——
-/// 备注是增值层,不阻断笔记打开;旧文件原样留在盘上,下次再试)。
+/// 读整篇备注(锁内读,正文与序号是同一版)。无文件为空文档;有旧 `memos.json` 时先迁移
+/// (失败按空文档读并打日志——备注是增值层,不阻断笔记打开;旧文件原样留在盘上,下次再试)。
+/// 锁拿不到(极少:另一进程正长时间持锁)时退回无锁读。
 pub fn load_doc(note_dir: &Path) -> MemoDoc {
-    if needs_migration(note_dir) {
-        match locked(note_dir, || read_locked(note_dir)) {
-            Ok(t) => return MemoDoc::of(t),
-            Err(e) => {
-                eprintln!("备注迁移失败({}): {e}", note_dir.display());
-                return MemoDoc::of(String::new());
+    match locked(note_dir, || Ok(MemoDoc::at(read_locked(note_dir)?, read_seq(note_dir)))) {
+        Ok(d) => d,
+        Err(e) => {
+            if note_dir.is_dir() {
+                eprintln!("备注读取走无锁路径({}): {e}", note_dir.display());
             }
+            MemoDoc::at(std::fs::read_to_string(note_dir.join(MEMO_DOC_FILE)).unwrap_or_default(), read_seq(note_dir))
         }
     }
-    MemoDoc::of(std::fs::read_to_string(note_dir.join(MEMO_DOC_FILE)).unwrap_or_default())
 }
 
 /// 行视图(带时间点的行,时间升序)。
@@ -443,7 +505,19 @@ pub fn load_memos(note_dir: &Path) -> MemoList {
     MemoList { memos: parse_lines(&load_doc(note_dir).text) }
 }
 
-fn write_doc(note_dir: &Path, text: &str) -> anyhow::Result<()> {
+fn bump_seq(note_dir: &Path) -> anyhow::Result<u64> {
+    let next = read_seq(note_dir) + 1;
+    write_atomic(note_dir, MEMO_SEQ_FILE, next.to_string().as_bytes())?;
+    Ok(next)
+}
+
+/// 写正文并把序号加 1(锁内调用)。全空白删掉正文文件(序号照加)。返回新序号。
+fn write_doc(note_dir: &Path, text: &str) -> anyhow::Result<u64> {
+    write_text(note_dir, text)?;
+    bump_seq(note_dir)
+}
+
+fn write_text(note_dir: &Path, text: &str) -> anyhow::Result<()> {
     if text.trim().is_empty() {
         match std::fs::remove_file(note_dir.join(MEMO_DOC_FILE)) {
             Ok(()) => Ok(()),
@@ -455,28 +529,27 @@ fn write_doc(note_dir: &Path, text: &str) -> anyhow::Result<()> {
     }
 }
 
-/// 编辑器整篇保存。`base_rev` 必须等于盘上版本,否则返回 [`SaveError::Conflict`] 附现状,
-/// 由调用方合并后重试。全空白的文档删掉文件。
-pub fn save_doc(note_dir: &Path, text: &str, base_rev: &str) -> Result<MemoDoc, SaveError> {
+/// 编辑器整篇保存。`base` = 编辑器这份 `text` 所依据的盘面原文:盘面没变就原样写;变了
+/// (快捷键追加/浮窗补字/编辑器前一份保存合进了别处改动)就在锁内三方合并 `merge3(base, text,
+/// 盘面)` 再写——合并在后端锁内做,前端不用处理冲突与重试,时序问题收敛到一处。
+/// 合并结果与盘面相同则不写(序号不变)。全空白的文档删掉文件。
+pub fn save_doc(note_dir: &Path, text: &str, base: &str) -> anyhow::Result<MemoDoc> {
     if text.chars().count() > MAX_DOC_CHARS {
-        return Err(SaveError::Other(anyhow::anyhow!("备注太长(上限 {MAX_DOC_CHARS} 字)")));
+        anyhow::bail!("备注太长(上限 {MAX_DOC_CHARS} 字)");
     }
-    let mut conflict = None;
-    let out = locked(note_dir, || {
+    locked(note_dir, || {
         let cur = read_locked(note_dir)?;
-        if rev_of(&cur) != base_rev {
-            conflict = Some(MemoDoc::of(cur));
-            return Ok(None);
+        let next = if cur == base { text.to_string() } else { merge3(base, text, &cur) };
+        let next = if next.trim().is_empty() { String::new() } else { next };
+        if next == cur {
+            return Ok(MemoDoc::at(cur, read_seq(note_dir)));
         }
-        let next = if text.trim().is_empty() { String::new() } else { text.to_string() };
-        write_doc(note_dir, &next)?;
-        Ok(Some(MemoDoc::of(next)))
-    })?;
-    match (out, conflict) {
-        (Some(d), _) => Ok(d),
-        (None, Some(c)) => Err(SaveError::Conflict(c)),
-        (None, None) => unreachable!("save_doc 锁内要么写成要么冲突"),
-    }
+        if next.chars().count() > MAX_DOC_CHARS {
+            anyhow::bail!("备注太长(上限 {MAX_DOC_CHARS} 字)");
+        }
+        let seq = write_doc(note_dir, &next)?;
+        Ok(MemoDoc::at(next, seq))
+    })
 }
 
 /// 读改写的通用入口(追加/浮窗改行/续录钳位)。`f` 返回 None 表示不必写盘。
@@ -488,10 +561,10 @@ fn modify(note_dir: &Path, f: impl FnOnce(&str) -> anyhow::Result<Option<String>
                 if next.chars().count() > MAX_DOC_CHARS {
                     anyhow::bail!("备注太长(上限 {MAX_DOC_CHARS} 字)");
                 }
-                write_doc(note_dir, &next)?;
-                Ok(MemoDoc::of(next))
+                let seq = write_doc(note_dir, &next)?;
+                Ok(MemoDoc::at(next, seq))
             }
-            None => Ok(MemoDoc::of(cur)),
+            None => Ok(MemoDoc::at(cur, read_seq(note_dir))),
         }
     })
 }
@@ -655,19 +728,54 @@ mod tests {
     }
 
     #[test]
-    fn save_doc_checks_rev_and_empty_removes_file() {
+    fn save_doc_merges_on_server_and_bumps_seq() {
         let d = tempfile::tempdir().unwrap();
         let empty = load_doc(d.path());
-        assert_eq!(empty.rev, "0");
-        let saved = save_doc(d.path(), "a <!-- 00:01 -->\n", &empty.rev).unwrap();
-        assert_eq!(load_doc(d.path()), saved);
-        match save_doc(d.path(), "b", "stale") {
-            Err(SaveError::Conflict(cur)) => assert_eq!(cur, saved),
-            other => panic!("应冲突: {other:?}"),
-        }
-        save_doc(d.path(), "  \n", &saved.rev).unwrap();
+        assert_eq!((empty.text.as_str(), empty.rev.as_str()), ("", "0"));
+        let s1 = save_doc(d.path(), "a <!-- 00:01 -->\n", "").unwrap();
+        assert_eq!(s1.rev, "1");
+        assert_eq!(load_doc(d.path()), s1);
+        // 快捷键在别处追加 → 盘面变了;编辑器基于旧盘面改了第一行 → 后端合并,两边都在
+        let (_, after_append) = append(d.path(), 40_000, "").unwrap();
+        assert_eq!(after_append.rev, "2");
+        let s2 = save_doc(d.path(), "a 改 <!-- 00:01 -->\n", "a <!-- 00:01 -->\n").unwrap();
+        assert_eq!(s2.text, "a 改 <!-- 00:01 -->\n\n📍 <!-- 00:40 -->\n");
+        assert_eq!(s2.rev, "3");
+        // 合并结果与盘面相同:不写、序号不变
+        assert_eq!(save_doc(d.path(), &s2.text, &s2.text).unwrap().rev, "3");
+        // 撤销回旧内容也是新的一次写入(序号增,不靠内容判新旧)
+        let s4 = save_doc(d.path(), "a <!-- 00:01 -->\n", &s2.text).unwrap();
+        assert_eq!((s4.text.as_str(), s4.rev.as_str()), ("a <!-- 00:01 -->\n", "4"));
+        save_doc(d.path(), "  \n", &s4.text).unwrap();
         assert!(!d.path().join(MEMO_DOC_FILE).exists());
-        assert!(save_doc(d.path(), &"字".repeat(MAX_DOC_CHARS + 1), "0").is_err());
+        assert!(save_doc(d.path(), &"字".repeat(MAX_DOC_CHARS + 1), "").is_err());
+    }
+
+    #[test]
+    fn merge3_cases() {
+        let base = "决议 <!-- 00:16 -->\n\n- 周二上线 <!-- 00:16 -->\n";
+        assert_eq!(merge3(base, base, "x\n"), "x\n");
+        assert_eq!(merge3(base, "y\n", base), "y\n");
+        // 远端追加 + 本地改
+        let local = "决议改了 <!-- 00:16 -->\n\n- 周二上线 <!-- 00:16 -->\n";
+        assert_eq!(
+            merge3(base, local, &format!("{base}\n📍 <!-- 00:40 -->\n")),
+            "决议改了 <!-- 00:16 -->\n\n- 周二上线 <!-- 00:16 -->\n\n📍 <!-- 00:40 -->\n"
+        );
+        // 浮窗补字:本地那一行原地替换
+        assert_eq!(
+            merge3("a\n\n📍 <!-- 00:40 -->\n", "a 改\n\n📍 <!-- 00:40 -->\n", "a\n\n补 <!-- 00:40 -->\n"),
+            "a 改\n\n补 <!-- 00:40 -->\n"
+        );
+        // 本地已删的行被远端改了:新行追加
+        assert_eq!(merge3("a\n\n📍\n", "a\n\nb\n", "a\n\n补\n"), "a\n\nb\n\n补\n");
+        // 远端删掉的行本地还在 → 删
+        assert_eq!(merge3("a\n\nb\n", "a\n\nb\n\nc\n", "a\n"), "a\n\nc\n");
+        // 硬换行段落整体追加
+        assert_eq!(
+            merge3("a\n", "a 改\n", "a\n\n第一\\\n第二 <!-- 00:20 -->\n"),
+            "a 改\n\n第一\\\n第二 <!-- 00:20 -->\n"
+        );
     }
 
     #[test]

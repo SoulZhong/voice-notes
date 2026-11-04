@@ -68,35 +68,25 @@ pub async fn memo_doc(app: AppHandle, note_id: String) -> Result<memos::MemoDoc,
     .await
 }
 
-/// 编辑器保存的结果:成功带新文档;冲突带盘上现状(前端合并后重存),不当错误抛。
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SaveMemoDocResult {
-    Saved { doc: memos::MemoDoc },
-    Conflict { doc: memos::MemoDoc },
-}
-
-/// 编辑器整篇保存。`base_rev` 是编辑器上次取到/存下的版本;与盘上不一致返回 Conflict。
-/// 原样落盘、不改写内容:曾在这里把超前的时间点钳回录音时间,但「落盘的不是提交的那份」会让
-/// 编辑器把时间变化和文字变化当成同一行的冲突、合并出重复段(Codex 审出)。前端走表最多超前
-/// 几百毫秒,不值得为它改写用户的文档。
+/// 编辑器整篇保存。`base_text` = 这份文本所依据的盘面原文;盘面已变时后端锁内三方合并
+/// (见 store::memos::save_doc),永不返回冲突。原样落盘、不改写时间点:曾在这里把超前的时间点
+/// 钳回录音时间,但「落盘的不是提交的那份」会让编辑器合出重复段(Codex 审出);前端走表最多
+/// 超前几百毫秒,不值得为它改写用户的文档。
 #[tauri::command]
 pub async fn save_memo_doc(
     app: AppHandle,
     note_id: String,
     text: String,
-    base_rev: String,
-) -> Result<SaveMemoDocResult, String> {
+    base_text: String,
+) -> Result<memos::MemoDoc, String> {
     crate::off_main(move || {
         let dir = note_dir(&app, &note_id)?;
-        match memos::save_doc(&dir, &text, &base_rev) {
-            Ok(doc) => {
-                emit_changed(&app, &note_id, doc.clone());
-                Ok(SaveMemoDocResult::Saved { doc })
-            }
-            Err(memos::SaveError::Conflict(doc)) => Ok(SaveMemoDocResult::Conflict { doc }),
-            Err(e) => Err(e.to_string()),
+        let before = memos::load_doc(&dir).rev;
+        let doc = memos::save_doc(&dir, &text, &base_text).map_err(|e| e.to_string())?;
+        if doc.rev != before {
+            emit_changed(&app, &note_id, doc.clone());
         }
+        Ok(doc)
     })
     .await
 }

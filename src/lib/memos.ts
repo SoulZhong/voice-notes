@@ -14,9 +14,10 @@ export type Memo = {
   line: number;
 };
 
-/** 整篇备注 + 版本号(内容哈希;空文档 "0")。 */
+/** 整篇备注 + 版本号(后端写入序号,十进制字符串,只增不减;从没写过为 "0")。 */
 export type MemoDoc = { text: string; rev: string };
-export type SaveMemoDocResult = { kind: "saved"; doc: MemoDoc } | { kind: "conflict"; doc: MemoDoc };
+/** 版本号转数字,比新旧用。 */
+export const seqOf = (d: MemoDoc) => Number(d.rev) || 0;
 
 export type MemosChangedEvent = { note_id: string; memos: Memo[]; doc: MemoDoc };
 export type MemoShortcutStatus = { ok: boolean; reason: string; shortcut: string };
@@ -30,8 +31,9 @@ export const MEMO_DOC_MAX_CHARS = 200_000;
 
 export const noteMemos = (noteId: string) => invoke<Memo[]>("note_memos", { noteId });
 export const memoDoc = (noteId: string) => invoke<MemoDoc>("memo_doc", { noteId });
-export const saveMemoDoc = (noteId: string, text: string, baseRev: string) =>
-  invoke<SaveMemoDocResult>("save_memo_doc", { noteId, text, baseRev });
+/** 整篇保存。`baseText` = 这份文本所依据的盘面原文;盘面已变时后端锁内三方合并,不会冲突。 */
+export const saveMemoDoc = (noteId: string, text: string, baseText: string) =>
+  invoke<MemoDoc>("save_memo_doc", { noteId, text, baseText });
 export const memoAnchorNow = (noteId: string) => invoke<number>("memo_anchor_now", { noteId });
 /** 浮窗补字:改「时间点 + 原文字」对得上的那一段;找不到就追加。 */
 export const editMemoLine = (noteId: string, memo: Pick<Memo, "at_ms" | "text">, text: string) =>
