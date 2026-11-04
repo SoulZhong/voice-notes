@@ -276,6 +276,18 @@
   /** 实际渲染的视图：viewMode 是用户意图，refinedAvailable=false 时无条件降级为 raw。 */
   const effectiveView = $derived(refinedAvailable ? viewMode : "raw");
   /** 视图切换 segmented:无修订稿时该段置灰 + tooltip 原因(行为与旧 .link 版完全一致) */
+  /** 标签页键盘:←/→ 在可用项间切换并移焦点(Tab 只停在当前项,同原分段控件)。 */
+  function onTabKey(e: KeyboardEvent) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    const enabled = viewItems.filter((x) => !x.disabled);
+    const i = enabled.findIndex((x) => x.id === effectiveView);
+    const next = enabled[(i + (e.key === "ArrowRight" ? 1 : -1) + enabled.length) % enabled.length];
+    if (!next || next.id === effectiveView) return;
+    e.preventDefault();
+    viewMode = next.id as "refined" | "raw";
+    const host = (e.currentTarget as HTMLElement).parentElement;
+    queueMicrotask(() => host?.querySelector<HTMLElement>('[aria-selected="true"]')?.focus());
+  }
   const viewItems = $derived<SegmentedItem[]>([
     {
       id: "refined",
@@ -2634,7 +2646,7 @@
                   void rerunIdentify();
                 }}>{identifying ? t("notes.identify.running") : t("notes.identify.rerun")}</DropdownMenu.Item
               >
-              <DropdownMenu.Separator /> e.stopPropagation()}>
+              <DropdownMenu.Separator />
               {#if exportRange()}
                 {@const r = exportRange()!}
                 <DropdownMenu.Label class="text-xs font-normal whitespace-nowrap text-muted-foreground tabular-nums">{t("notes.export.rangeNote", { start: formatTs(r.start), end: formatTs(r.end) })}</DropdownMenu.Label>
@@ -2647,6 +2659,7 @@
                 }}>{t("notes.export.md")}</DropdownMenu.Item
               >
               <DropdownMenu.Item
+                class="data-disabled:pointer-events-auto"
                 disabled={!mixedInfo?.track}
                 title={mixedInfo?.track ? "" : t("notes.export.audioNone")}
                 onSelect={() => {
@@ -2888,7 +2901,9 @@
             <DropdownMenu.Content align="end" class="min-w-44">
               <DropdownMenu.Label class="text-xs font-normal text-muted-foreground">{t("notes.mix.menuLabel")}</DropdownMenu.Label>
               {#each mixItems as it (it.id)}
+                <!-- 禁用项保留指针命中,悬停才看得到原因(title),同原分段控件 -->
                 <DropdownMenu.Item
+                  class="data-disabled:pointer-events-auto"
                   disabled={it.disabled}
                   title={it.title}
                   onSelect={() => (it.id === "gen" ? startRegen() : switchScheme(it.id as "dual" | "mixed"))}
@@ -2929,9 +2944,13 @@
               role="tab"
               class:on={effectiveView === it.id}
               aria-selected={effectiveView === it.id}
-              disabled={it.disabled}
+              aria-disabled={it.disabled}
+              tabindex={effectiveView === it.id ? 0 : -1}
               title={it.title}
-              onclick={() => (viewMode = it.id as "refined" | "raw")}>{it.label}</button
+              onclick={() => {
+                if (!it.disabled) viewMode = it.id as "refined" | "raw";
+              }}
+              onkeydown={onTabKey}>{it.label}</button
             >
           {/each}
         </div>
@@ -3786,15 +3805,15 @@
     font-size: 0.88rem;
     color: var(--ink-faint);
   }
-  .tabs button:hover:not(:disabled) {
+  .tabs button:hover:not([aria-disabled="true"]) {
     color: var(--ink-secondary);
   }
-  .tabs button:disabled {
+  .tabs button[aria-disabled="true"] {
     cursor: default;
     opacity: 0.5;
   }
   .tabs button:focus-visible {
-    outline: 2px solid var(--ring);
+    outline: 2px solid var(--accent);
     outline-offset: 2px;
     border-radius: 2px;
   }
