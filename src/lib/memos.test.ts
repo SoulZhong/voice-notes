@@ -1,54 +1,11 @@
 import { describe, expect, it } from "vitest";
-import {
-  anchorIndex,
-  clampAt,
-  fmtClock,
-  inCut,
-  memoColumnOpen,
-  memoKeyAllowed,
-  mergeTimeline,
-  parseClock,
-  type Memo,
-} from "./memos";
+import { clampAt, fmtClock, inCut, memoColumnOpen, memoKeyAllowed, parseClock, sortMemos, type Memo } from "./memos";
 
-const memo = (at_ms: number, text = "x", created_at = "a"): Memo => ({
-  id: `m${at_ms}${created_at}`,
-  at_ms,
-  text,
-  origin: "note",
-  created_at,
-  updated_at: created_at,
-});
+const memo = (at_ms: number, line: number): Memo => ({ id: `L${line}`, at_ms, text: "x", md: "x", line });
 
-describe("mergeTimeline", () => {
-  const blocks = [{ s: 0 }, { s: 10_000 }, { s: 20_000 }];
-  const kinds = (memos: Memo[]) =>
-    mergeTimeline(blocks, memos, (b) => b.s).map((x) => (x.kind === "block" ? `b${x.item.s / 1000}` : `m${x.memo.at_ms / 1000}`));
-
-  it("备注落在最后一个 start<=at 的块之后", () => {
-    expect(kinds([memo(5_000), memo(10_000), memo(25_000)])).toEqual(["b0", "m5", "b10", "m10", "b20", "m25"]);
-  });
-  it("早于第一块的排最前(第一块不从 0 开始时)", () => {
-    const out = mergeTimeline([{ s: 3_000 }], [memo(1_000)], (b) => b.s).map((x) => x.kind);
-    expect(out).toEqual(["memo", "block"]);
-  });
-  it("同一时刻按 created_at 排序", () => {
-    const out = mergeTimeline([], [memo(1, "b", "2"), memo(1, "a", "1")], () => 0);
-    expect(out.map((x) => (x.kind === "memo" ? x.memo.text : ""))).toEqual(["a", "b"]);
-  });
-  it("无时间跨度的块不推进游标", () => {
-    const bs = [{ s: 0 as number | null }, { s: null }, { s: 9_000 }];
-    const out = mergeTimeline(bs, [memo(5_000)], (b) => b.s).map((x) => x.kind);
-    expect(out).toEqual(["block", "block", "memo", "block"]);
-  });
-});
-
-describe("anchorIndex", () => {
-  it("返回最后一个 start<=at 的块下标,早于所有块为 -1", () => {
-    expect(anchorIndex([0, 10, 20], 15)).toBe(1);
-    expect(anchorIndex([5, 10], 1)).toBe(-1);
-    expect(anchorIndex([0, null, 20], 25)).toBe(2);
-    expect(anchorIndex([0, 10], 10)).toBe(1);
+describe("sortMemos", () => {
+  it("按时间,同时间按行号", () => {
+    expect(sortMemos([memo(5_000, 3), memo(1_000, 9), memo(5_000, 1)]).map((m) => m.id)).toEqual(["L9", "L1", "L3"]);
   });
 });
 

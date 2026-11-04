@@ -213,7 +213,7 @@ mod tests {
             include_str!("identify.rs"), include_str!("relations.rs"), include_str!("backfill.rs"),
         ];
         for src in sources {
-            for f in ["memos::add_memo", "memos::edit_memo", "memos::delete_memo", "memos::clamp_after"] {
+            for f in ["memos::append", "memos::edit_line", "memos::save_doc", "memos::clamp_after"] {
                 assert!(!src.contains(f), "refine/ 下出现了备注写函数 {f}");
             }
         }

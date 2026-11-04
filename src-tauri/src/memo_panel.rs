@@ -83,7 +83,7 @@ pub fn memo_panel_state() -> Option<PanelOpen> {
     PENDING.lock().unwrap().clone()
 }
 
-/// 隐藏浮窗,把焦点还给弹出前的前台应用。保存与否由页面先调 `edit_memo` 决定。
+/// 隐藏浮窗,把焦点还给弹出前的前台应用。保存与否由页面先调 `edit_memo_line` 决定。
 #[tauri::command]
 pub fn memo_panel_hide(app: AppHandle) {
     let app2 = app.clone();

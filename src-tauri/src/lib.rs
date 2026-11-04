@@ -9505,9 +9505,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             memo::note_memos,
             memo::memo_anchor_now,
-            memo::add_memo,
-            memo::edit_memo,
-            memo::delete_memo,
+            memo::memo_doc,
+            memo::save_memo_doc,
+            memo::edit_memo_line,
             memo::search_memos,
             memo_panel::memo_panel_state,
             memo_panel::memo_panel_hide,

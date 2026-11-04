@@ -1,59 +1,43 @@
-// 会议备注(memo):命令封装 + 事件 + 纯函数。
-// 设计:docs/superpowers/specs/2026-11-03-meeting-memo-design.md
-// 一律以后端 `memos_changed` 事件(整表)为准,不做乐观更新(与 segment_edited 同纪律)。
+// 会议备注(memo):整场一篇 Markdown 文档(后端 memo.md,行尾 `<!-- mm:ss -->` 是时间点)。
+// 编辑器整篇读写(memoDoc / saveMemoDoc,版本号乐观校验);其余地方读行视图(Memo[])。
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-export type MemoOrigin = "composer" | "hotkey" | "tray" | "note";
-
+/** 行视图:文档里带时间点的一行。`id` 是行号 `L<n>`,文档一改就变,只在一次读取内有意义。 */
 export type Memo = {
   id: string;
   at_ms: number;
-  /** 纯文本,可多行;空串 = 时间标记。 */
+  /** 去掉 Markdown 行首记号后的文字;空串 = 时间标记(📍)。 */
   text: string;
-  origin: MemoOrigin | string;
-  created_at: string;
-  updated_at: string;
+  /** 这一行的 Markdown 原文(不含时间注释)。 */
+  md: string;
+  line: number;
 };
 
-export type MemosChangedEvent = { note_id: string; memos: Memo[] };
+/** 整篇备注 + 版本号(后端写入序号,十进制字符串,只增不减;从没写过为 "0")。 */
+export type MemoDoc = { text: string; rev: string };
+/** 版本号转数字,比新旧用。 */
+export const seqOf = (d: MemoDoc) => Number(d.rev) || 0;
+
+export type MemosChangedEvent = { note_id: string; memos: Memo[]; doc: MemoDoc };
 export type MemoShortcutStatus = { ok: boolean; reason: string; shortcut: string };
 export type MemoHit = { note_id: string; memo_id: string; at_ms: number; text: string };
 export type MemoPanelOpen = { note_id: string; memo: Memo };
 
-/** 单条备注文字上限(与后端 MAX_TEXT_CHARS 一致)。 */
+/** 浮窗一次补字的上限(与后端 MAX_TEXT_CHARS 一致)。 */
 export const MEMO_MAX_CHARS = 2000;
+/** 整篇备注上限(与后端 MAX_DOC_CHARS 一致)。 */
+export const MEMO_DOC_MAX_CHARS = 200_000;
 
 export const noteMemos = (noteId: string) => invoke<Memo[]>("note_memos", { noteId });
+export const memoDoc = (noteId: string) => invoke<MemoDoc>("memo_doc", { noteId });
+/** 整篇保存。`baseText` = 这份文本所依据的盘面原文;盘面已变时后端锁内三方合并,不会冲突。 */
+export const saveMemoDoc = (noteId: string, text: string, baseText: string) =>
+  invoke<MemoDoc>("save_memo_doc", { noteId, text, baseText });
 export const memoAnchorNow = (noteId: string) => invoke<number>("memo_anchor_now", { noteId });
-export const addMemo = (
-  noteId: string,
-  atMs: number,
-  text: string,
-  origin: MemoOrigin,
-  restore?: { id: string; created_at: string },
-) =>
-  invoke<Memo>("add_memo", {
-    noteId,
-    atMs: Math.max(0, Math.round(atMs)),
-    text,
-    origin,
-    restoreId: restore?.id ?? null,
-    restoreCreatedAt: restore?.created_at ?? null,
-  });
-export const editMemo = (
-  noteId: string,
-  memo: Pick<Memo, "id" | "updated_at">,
-  patch: { text?: string; at_ms?: number },
-) =>
-  invoke<Memo>("edit_memo", {
-    noteId,
-    id: memo.id,
-    expectedUpdatedAt: memo.updated_at,
-    text: patch.text ?? null,
-    atMs: patch.at_ms === undefined ? null : Math.max(0, Math.round(patch.at_ms)),
-  });
-export const deleteMemo = (noteId: string, id: string) => invoke<Memo>("delete_memo", { noteId, id });
+/** 浮窗补字:改「时间点 + 原文字」对得上的那一段;找不到就追加。 */
+export const editMemoLine = (noteId: string, memo: Pick<Memo, "at_ms" | "text">, text: string) =>
+  invoke<void>("edit_memo_line", { noteId, atMs: memo.at_ms, oldText: memo.text, text });
 export const searchMemos = (query: string) => invoke<MemoHit[]>("search_memos", { query });
 export const memoPanelState = () => invoke<MemoPanelOpen | null>("memo_panel_state");
 export const memoPanelHide = () => invoke<void>("memo_panel_hide");
@@ -67,51 +51,8 @@ export const onMemoPanelOpen = (cb: (e: MemoPanelOpen) => void) =>
 
 // ───────────────────────── 纯函数(配单测) ─────────────────────────
 
-/** 时间轴上的一项:段落/块(start_ms)或备注。 */
-export type TimelineItem<T> = { kind: "block"; item: T } | { kind: "memo"; memo: Memo };
-
-/**
- * 把备注按时间归并进块列表:备注落在「最后一个 start_ms <= at_ms 的块」之后
- * (即第一个 start_ms > at_ms 的块之前);早于第一块的排最前,晚于所有块的排最后。
- * 与后端导出 `MemoCursor`、笔记页装饰同一条规则。块须已按时间升序;
- * `startOf` 返回 null 的块(无时间跨度的自由块)不推进游标。
- */
-export function mergeTimeline<T>(
-  blocks: readonly T[],
-  memos: readonly Memo[],
-  startOf: (b: T) => number | null,
-): TimelineItem<T>[] {
-  const sorted = sortMemos(memos);
-  const out: TimelineItem<T>[] = [];
-  let i = 0;
-  for (const b of blocks) {
-    const s = startOf(b);
-    if (s !== null) {
-      while (i < sorted.length && sorted[i].at_ms < s) out.push({ kind: "memo", memo: sorted[i++] });
-    }
-    out.push({ kind: "block", item: b });
-  }
-  while (i < sorted.length) out.push({ kind: "memo", memo: sorted[i++] });
-  return out;
-}
-
-/**
- * 备注该挂在哪个块之后:返回块下标(-1 = 排在所有块之前)。笔记页装饰用。
- * 规则同 {@link mergeTimeline}。
- */
-export function anchorIndex(starts: readonly (number | null)[], atMs: number): number {
-  let idx = -1;
-  for (let i = 0; i < starts.length; i++) {
-    const s = starts[i];
-    if (s === null) continue;
-    if (s <= atMs) idx = i;
-    else break;
-  }
-  return idx;
-}
-
 export function sortMemos(memos: readonly Memo[]): Memo[] {
-  return [...memos].sort((a, b) => a.at_ms - b.at_ms || a.created_at.localeCompare(b.created_at));
+  return [...memos].sort((a, b) => a.at_ms - b.at_ms || a.line - b.line);
 }
 
 /** 半开区间:落在任一删减区间 [start, end) 内。 */
@@ -163,7 +104,7 @@ export function memoKeyAllowed(
   return true;
 }
 
-/** 备注栏展开/收起:用户手动选过就听用户的;否则主区宽度 ≥ 900px 默认展开。 */
+/** 备注栏展开/收起:用户手动选过就听用户的;否则主区宽度 ≥ 900px 默认展开(窄窗口默认收起)。 */
 export const MEMO_COLUMN_BREAKPOINT = 900;
 export function memoColumnOpen(containerWidth: number, stored: boolean | null): boolean {
   if (stored !== null) return stored;

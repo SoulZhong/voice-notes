@@ -29,9 +29,37 @@
     { seq: 1, source: "system", text: "我们定在下周二上线,周一封版。", start_ms: 5000, end_ms: 9000, speaker: "S2" },
     { seq: 2, source: "mic", text: "好,那就这么定。", start_ms: 12000, end_ms: 14000, speaker: "S1" },
   ];
-  let memos = [
-    { id: "m_e2e_1", at_ms: 6000, text: "定了:周二上线", origin: "note", created_at: now, updated_at: now },
-  ];
+  // 备注 = 一篇 Markdown(行尾 <!-- mm:ss --> 是时间点);memos 是行视图(同后端 parse_lines 的简化版)。
+  let memoText = "定了:周二上线 <!-- 00:06 -->\n";
+  // 版本号 = 写入序号(同后端 .memo.seq)。
+  let memoSeq = 1;
+  const clock = (ms) => { const s = Math.floor(ms / 1000); return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`; };
+  const parseLines = (t) => t.split("\n").flatMap((l, i) => {
+    const m = /^(.*?)\s*<!--\s*(\d+):(\d\d)\s*-->\s*$/.exec(l);
+    if (!m) return [];
+    const md = m[1];
+    const text = md.replace(/^(#+\s+|[-*+]\s+(\[[ xX]\]\s+)?|\d+\.\s+|>\s*)/, "").trim();
+    return [{ id: `L${i + 1}`, at_ms: (Number(m[2]) * 60 + Number(m[3])) * 1000, text: text === "📍" ? "" : text, md, line: i + 1 }];
+  });
+  const memoDocNow = () => ({ text: memoText, rev: String(memoSeq) });
+  // 同后端 merge3 的简化版:按行,远端多出的追加、删掉的删、改掉的就地换(找不到就追加)。
+  const merge3 = (base, local, remote) => {
+    if (local === base) return remote;
+    if (remote === base || remote === local) return local;
+    const units = (t) => t.split("\n").filter((l) => l.trim() !== "");
+    const minus = (a, b) => { const left = [...b]; return a.filter((l) => { const i = left.indexOf(l); if (i >= 0) { left.splice(i, 1); return false; } return true; }); };
+    const added = minus(units(remote), units(base));
+    const removed = minus(units(base), units(remote));
+    const lines = local.replace(/\s+$/, "").split("\n");
+    const extra = [];
+    added.forEach((a, i) => { const at = i < removed.length ? lines.indexOf(removed[i]) : -1; if (at >= 0) lines[at] = a; else if (!lines.includes(a)) extra.push(a); });
+    removed.slice(added.length).forEach((g) => { const at = lines.indexOf(g); if (at >= 0) lines.splice(at, 1); });
+    let out = lines.join("\n").replace(/\n{3,}/g, "\n\n");
+    for (const a of extra) out = out.trim() ? `${out.replace(/\s+$/, "")}\n\n${a}` : a;
+    return out.trim() ? `${out.replace(/\s+$/, "")}\n` : "";
+  };
+  const emitMemos = (noteId) => setTimeout(() => window.__e2e.emit("memos_changed", { note_id: noteId, memos: parseLines(memoText), doc: memoDocNow() }), 0);
+  let memos = parseLines(memoText);
   const note = {
     meta: { schema_version: 1, id: NOTE_ID, title: "周会", started_at: now, ended_at: "2026-11-04T10:30:00+08:00", state: "complete", attendees: [], attendees_removed: [] },
     segments, suppressed_segments: [], skipped_lines: 0,
@@ -45,27 +73,33 @@
     list_notes: () => [{ id: NOTE_ID, title: "周会", started_at: now, duration_secs: 1800, state: recordingLive ? "active" : "complete" }],
     list_dictation_notes: () => [],
     get_note: () => note,
-    note_memos: () => memos,
+    note_memos: () => parseLines(memoText),
+    memo_doc: () => memoDocNow(),
+    save_memo_doc: (a) => {
+      const next = memoText === a.baseText ? a.text : merge3(a.baseText, a.text, memoText);
+      if (next !== memoText) {
+        memoText = next;
+        memoSeq++;
+        memos = parseLines(memoText);
+        emitMemos(a.noteId);
+      }
+      return memoDocNow();
+    },
+    edit_memo_line: (a) => {
+      const lines = memoText.split("\n");
+      const hit = parseLines(memoText).reverse().find((m) => m.at_ms === a.atMs && m.text === a.oldText);
+      const block = `${a.text} <!-- ${clock(a.atMs)} -->`;
+      if (hit) lines[hit.line - 1] = block;
+      else lines.push("", block);
+      memoText = lines.join("\n").replace(/\n*$/, "\n");
+      memoSeq++;
+      memos = parseLines(memoText);
+      emitMemos(a.noteId);
+      return null;
+    },
     note_edits: () => ({ schema_version: 1, cuts: [] }),
-    search_memos: (a) => memos.filter((m) => m.text.includes(a.query)).map((m) => ({ note_id: NOTE_ID, memo_id: m.id, at_ms: m.at_ms, text: m.text })),
+    search_memos: (a) => parseLines(memoText).filter((m) => m.text.includes(a.query)).map((m) => ({ note_id: NOTE_ID, memo_id: m.id, at_ms: m.at_ms, text: m.text })),
     memo_anchor_now: () => 7000,
-    add_memo: (a) => {
-      const m = { id: a.restoreId || `m_e2e_${memos.length + 1}`, at_ms: a.atMs, text: a.text, origin: a.origin, created_at: now, updated_at: now };
-      memos = [...memos, m].sort((x, y) => x.at_ms - y.at_ms);
-      setTimeout(() => window.__e2e.emit("memos_changed", { note_id: a.noteId, memos }), 0);
-      return m;
-    },
-    edit_memo: (a) => {
-      memos = memos.map((m) => (m.id === a.id ? { ...m, text: a.text ?? m.text, at_ms: a.atMs ?? m.at_ms, updated_at: now + "x" } : m));
-      setTimeout(() => window.__e2e.emit("memos_changed", { note_id: a.noteId, memos }), 0);
-      return memos.find((m) => m.id === a.id);
-    },
-    delete_memo: (a) => {
-      const gone = memos.find((m) => m.id === a.id);
-      memos = memos.filter((m) => m.id !== a.id);
-      setTimeout(() => window.__e2e.emit("memos_changed", { note_id: a.noteId, memos }), 0);
-      return gone;
-    },
     recording_status: () =>
       recordingLive
         ? { state: "recording", system_audio: "on", note_id: NOTE_ID, diarization: "on", elapsed_ms: 15000, input_override: "" }
@@ -134,7 +168,7 @@
     screen_capture_permission: () => true,
     input_volume: () => null,
     precheck_recording: () => [],
-    memo_panel_state: () => ({ note_id: NOTE_ID, memo: memos[0] }),
+    memo_panel_state: () => ({ note_id: NOTE_ID, memo: parseLines(memoText)[0] }),
     memo_panel_hide: () => null,
     "plugin:autostart|is_enabled": () => false,
     "plugin:app|version": () => "0.21.2",
@@ -191,5 +225,5 @@
     metadata: { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } },
   };
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: (_e, id) => callbacks.delete(id) };
-  window.__e2e = { calls, unmocked, emit, NOTE_ID, get memos() { return memos; } };
+  window.__e2e = { calls, unmocked, emit, NOTE_ID, get memos() { return memos; }, get memoText() { return memoText; } };
 })();
