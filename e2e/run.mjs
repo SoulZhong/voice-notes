@@ -48,6 +48,8 @@ async function startVite() {
 const results = [];
 let browser;
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function openPage(path, params = {}, { width = 1100, height = 760 } = {}) {
   const page = await browser.newPage();
   await page.setViewport({ width, height });
@@ -155,45 +157,71 @@ try {
     await page.close();
   });
 
-  // 4. 笔记页:书签显示、备注栏列出、按 M 加备注
-  await scenario("笔记页备注:书签+备注栏+按 M 加一条", async () => {
+  // 4. 笔记页:备注是一篇 Markdown;按 M 在文末开一行写,自动保存整篇
+  await scenario("笔记页备注:Markdown 文档+按 M 写一行+自动保存", async () => {
     const { page, errors } = await openPage(`/notes/${NOTE}`, { family: "classic", mode: "dark" });
-    assert(await waitFor(() => hasText(page, "定了:周二上线")), "备注文字没出现在页面上");
-    const bookmark = await page.$(".ProseMirror .memo-bookmark, .ProseMirror [class*='memo']");
-    assert(bookmark, "编辑器里没有书签装饰");
+    assert(await waitFor(() => page.evaluate(() => document.querySelector(".memo-doc .ProseMirror")?.textContent.includes("定了:周二上线"))), "备注文档没载入");
+    assert(await waitFor(() => page.evaluate(() => document.querySelector(".memo-doc .memo-stamp")?.textContent === "00:06")), "时间点没显示在左侧槽");
+    assert(!(await page.$(".transcript .memo-bm")), "原文里不该再有备注书签");
     await page.mouse.click(5, 700);
     await page.keyboard.press("m");
-    const draft = await waitFor(() => page.$(".ProseMirror textarea, .memo-draft textarea, textarea"));
-    assert(draft, "按 M 没出现草稿输入框");
-    await draft.type("e2e 补一条");
+    await sleep(150);
+    await page.keyboard.type("## 决议");
     await page.keyboard.press("Enter");
-    const added = await waitFor(async () => (await calls(page, "add_memo")).find((c) => c.args.origin === "note"));
-    assert(added, "回车后没调用 add_memo(origin=note)");
-    assert(await waitFor(() => hasText(page, "e2e 补一条")), "新备注没渲染出来");
+    await page.keyboard.type("- 周二上线");
+    const saved = await waitFor(async () => (await calls(page, "save_memo_doc")).find((c) => c.args.text.includes("- 周二上线 <!--")), 4000);
+    assert(saved, "停手后没整篇保存(或没带时间点)");
+    const txt = saved.args.text;
+    assert(/## 决议 <!-- \d\d:\d\d -->/.test(txt), `标题没带时间点:${txt}`);
+    assert(txt.startsWith("定了:周二上线 <!-- 00:06 -->"), `原有内容被改动:${txt}`);
     await page.screenshot({ path: join(out, "flow-note-memo.png") });
     const bad = errors.filter((e) => !benign(e));
     assert(bad.length === 0, "页面错误:\n" + bad.join("\n"));
     await page.close();
   });
 
-  // 5. 录制页:输入框首次按键取锚点,回车以锚点时间保存
-  await scenario("录制页备注:开始打字取锚点,回车保存", async () => {
+  // 5. 录制页:右侧备注文档,写一行带录音时间;快捷键追加的行合并进来不丢本地输入
+  await scenario("录制页备注:写一行带录音时间,快捷键追加合并", async () => {
     const { page, errors } = await openPage("/record", { family: "paper", mode: "light", recording: true });
-    const ta = await waitFor(() => page.$("textarea"));
-    assert(ta, "录制中没有备注输入框");
-    await ta.type("现场记一句");
-    const anchored = await waitFor(async () => (await calls(page, "memo_anchor_now")).length > 0);
-    assert(anchored, "开始打字没有调用 memo_anchor_now");
-    await page.keyboard.press("Enter");
-    const added = await waitFor(async () => (await calls(page, "add_memo")).find((c) => c.args.origin === "composer"));
-    assert(added && added.args.atMs === 7000, `add_memo 的时间点应为锚点 7000,实际 ${added && added.args.atMs}`);
-    assert(await waitFor(() => hasText(page, "现场记一句")), "新备注没出现在书签/备注栏");
-    const overlap = await page.evaluate(() => {
-      const col = document.querySelector(".memo-col")?.getBoundingClientRect();
-      const bar = document.querySelector(".topbar")?.getBoundingClientRect();
-      return col && bar ? col.top < bar.bottom - 1 : "missing";
+    const ed = await waitFor(() => page.$(".memo-doc .ProseMirror"));
+    assert(ed, "录制中没有备注文档");
+    assert(!(await page.$(".memo-composer, .live-body textarea")), "不该再有底部输入框");
+    await waitFor(() => page.evaluate(() => document.querySelector(".memo-doc .ProseMirror")?.textContent.includes("定了")));
+    // 窄窗口默认收起成细轨:先展开
+    if (await page.$(".memo-doc.collapsed")) await page.click(".memo-doc .track .toggle");
+    // 光标放到文末(点击位置在无头浏览器里不稳定,直接设选区)
+    await page.evaluate(() => {
+      const pm = document.querySelector(".memo-doc .ProseMirror");
+      pm.focus();
+      const r = document.createRange();
+      r.selectNodeContents(pm.lastElementChild);
+      r.collapse(false);
+      getSelection().removeAllRanges();
+      getSelection().addRange(r);
     });
-    assert(overlap === false, `备注栏被吸顶操作栏盖住或缺失:${overlap}`);
+    await sleep(150); // 等 PM 读到 selectionchange
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("现场记一句");
+    const saved = await waitFor(async () => (await calls(page, "save_memo_doc")).find((c) => c.args.text.includes("现场记一句 <!--")), 4000);
+    assert(saved, `没有保存带时间点的新行:${JSON.stringify(await page.evaluate(() => [document.querySelector(".memo-doc .ProseMirror")?.innerText, window.__e2e.calls.filter((c) => c.cmd.includes("memo")).map((c) => c.cmd)]))}`);
+    assert(/^定了:周二上线 <!-- 00:06 -->\n\n现场记一句 <!-- 00:1\d -->\n$/.test(saved.args.text), `新行应带录音时间(约 15 秒):${saved.args.text}`);
+    // 模拟快捷键在别处追加了一行(盘上变了),此时本地又改了一处 → 合并后两边都在
+    await page.keyboard.type("再补");
+    await page.evaluate(async () => {
+      const inv = window.__TAURI_INTERNALS__.invoke;
+      await inv("edit_memo_line", { noteId: window.__e2e.NOTE_ID, atMs: 15000, oldText: "不存在", text: "快捷键那句" });
+    });
+    const merged = await waitFor(async () => {
+      const t = await page.evaluate(() => window.__e2e.memoText);
+      return t.includes("快捷键那句") && t.includes("现场记一句再补") ? t : null;
+    }, 5000);
+    assert(merged, `合并后应同时保留快捷键追加与本地输入:${await page.evaluate(() => window.__e2e.memoText)}`);
+    const overlap = await page.evaluate(() => {
+      const col = document.querySelector(".memo-doc header")?.getBoundingClientRect();
+      const bar = document.querySelector(".topbar")?.getBoundingClientRect();
+      return col && bar ? col.top < bar.bottom + 14 - 1 : "missing";
+    });
+    assert(overlap === false, `备注栏标题被吸顶操作栏(含渐隐)盖住或缺失:${overlap}`);
     await page.screenshot({ path: join(out, "flow-record-memo.png") });
     const bad = errors.filter((e) => !benign(e));
     assert(bad.length === 0, "页面错误:\n" + bad.join("\n"));
@@ -219,8 +247,8 @@ try {
     const ta = await page.$("textarea");
     await ta.type("浮窗补一句");
     await page.keyboard.press("Enter");
-    const edited = await waitFor(async () => (await calls(page, "edit_memo")).find((c) => c.args.text === "浮窗补一句"));
-    assert(edited, "回车没调用 edit_memo");
+    const edited = await waitFor(async () => (await calls(page, "edit_memo_line")).find((c) => c.args.text === "浮窗补一句" && c.args.atMs === 6000));
+    assert(edited, "回车没调用 edit_memo_line(时间点 6000)");
     assert(await waitFor(async () => (await calls(page, "memo_panel_hide")).length > 0), "保存后没关闭浮窗");
     const bad = errors.filter((e) => !benign(e));
     assert(bad.length === 0, "页面错误:\n" + bad.join("\n"));

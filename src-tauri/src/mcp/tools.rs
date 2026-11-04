@@ -226,9 +226,11 @@ pub fn get_note(
         })
         .collect::<serde_json::Map<_, _>>()
         .into();
-    // 会议备注:用户亲手写的只读提示(Agent 精修用它校人名术语;一期不开放 MCP 写备注)。
+    // 会议备注:用户亲手写的只读提示(Agent 精修用它校人名术语;不开放 MCP 写备注)。
+    // memos = 带时间点的行视图;memo_doc = 整篇 Markdown 原文(行尾 <!-- mm:ss --> 是时间点)。
     let note_dir = notes_dir(roots).join(id);
-    let memo_list = store::memos::load_memos(&note_dir).memos;
+    let memo_doc = store::memos::load_doc(&note_dir).text;
+    let memo_list = store::memos::parse_lines(&memo_doc);
     let memos_json: Vec<serde_json::Value> = memo_list
         .iter()
         .map(|m| serde_json::json!({ "id": m.id, "at_ms": m.at_ms, "text": m.text }))
@@ -240,6 +242,7 @@ pub fn get_note(
                 "state": note.meta.state, "speakers": speakers, "refined": true,
                 "generated_at": doc.generated_at,
                 "memos": memos_json,
+                "memo_doc": memo_doc,
                 "paragraphs": doc.paragraphs.iter().map(|p| serde_json::json!({
                     "speaker": p.speaker, "name": p.name, "start_ms": p.start_ms,
                     "end_ms": p.end_ms, "text": p.text,
@@ -249,6 +252,7 @@ pub fn get_note(
                 "id": note.meta.id, "title": note.meta.title, "started_at": note.meta.started_at,
                 "state": note.meta.state, "speakers": speakers, "refined": false,
                 "memos": memos_json,
+                "memo_doc": memo_doc,
                 "segments": note.segments.iter().map(|s| serde_json::json!({
                     "seq": s.seq, "source": s.source, "speaker": s.speaker,
                     "start_ms": s.start_ms, "end_ms": s.end_ms, "text": s.text,
@@ -972,13 +976,15 @@ mod tests {
         let id = "20260101-100000";
         fixture_note(tmp.path(), id, "评审会", "2026-01-01T10:00:00+08:00", &[("S1", "先看背景", 0), ("S1", "散会", 9000)]);
         let dir = notes_dir(&roots(tmp.path())).join(id);
-        store::memos::add_memo(&dir, 5_000, "周一封版", "composer", None).unwrap();
+        store::memos::append(&dir, 5_000, "周一封版").unwrap();
         let v = get_note(&roots(tmp.path()), id, "segments", true).unwrap();
         assert_eq!(v["memos"][0]["text"], "周一封版");
         assert_eq!(v["memos"][0]["at_ms"], 5000);
         let md = get_note(&roots(tmp.path()), id, "markdown", true).unwrap();
         let c = md["content"].as_str().unwrap();
-        assert!(c.find("先看背景").unwrap() < c.find("周一封版").unwrap() && c.find("周一封版").unwrap() < c.find("散会").unwrap(), "{c}");
+        // 备注整篇放在正文之前(一个「备注」小节),每行带时间
+        assert!(c.find("`00:05` 周一封版").unwrap() < c.find("先看背景").unwrap(), "{c}");
+        assert_eq!(v["memo_doc"], "周一封版 <!-- 00:05 -->\n");
         let hits = search_notes(&roots(tmp.path()), "封版", 10);
         assert_eq!(hits["hits"][0]["kind"], "memo");
         assert_eq!(hits["hits"][0]["at_ms"], 5000);

@@ -101,26 +101,12 @@
   import { watchJob } from "$lib/jobWatch";
   import Segmented from "$lib/Segmented.svelte";
   import type { SegmentedItem } from "$lib/segmented";
-  import MemoColumn from "$lib/MemoColumn.svelte";
+  import MemoDoc from "$lib/MemoDoc.svelte";
   import { Button } from "$lib/ui/components/button";
   import { Input } from "$lib/ui/components/input";
   import * as DropdownMenu from "$lib/ui/components/dropdown-menu";
   import * as Popover from "$lib/ui/components/popover";
-  import {
-    addMemo,
-    clampAt,
-    deleteMemo,
-    editMemo,
-    loadMemoColumnPref,
-    memoColumnOpen,
-    memoKeyAllowed,
-    noteMemos,
-    onMemosChanged,
-    saveMemoColumnPref,
-    type Memo,
-    type MemoOrigin,
-  } from "$lib/memos";
-  import type { MemoAction, MemoDraft } from "$lib/editor/memoDecorations";
+  import { clampAt, loadMemoColumnPref, memoColumnOpen, memoKeyAllowed, saveMemoColumnPref } from "$lib/memos";
 
   let note = $state<Note | null>(null);
   let error = $state("");
@@ -1906,125 +1892,53 @@
       editsErr = t("notes.edits.failed", { e });
     }
   }
-  // ── 会议备注(memo):正文书签(编辑器装饰)+ 右侧备注栏 + 加/改/删/调时间/撤销。
-  //    纪律同 segment_edited:不做乐观更新,一律以 note_memos / memos_changed 整表为准。
-  //    设计:docs/superpowers/specs/2026-11-03-meeting-memo-design.md「前端 › 笔记页」。 ──
-  let memos = $state<Memo[]>([]);
-  /** 未保存的草稿书签(按 M / 点「加备注」插入;回车保存、Esc 丢弃)。 */
-  let memoDraft = $state<MemoDraft | null>(null);
-  let memoDraftSeq = 0;
-  /** 刚删掉的那条(撤销 = 带原 id 重新 add_memo);约 10s 后收走。 */
-  let memoUndo = $state<Memo | null>(null);
-  let memoUndoTimer: ReturnType<typeof setTimeout> | undefined;
-  let memoErr = $state("");
-  let memoErrTimer: ReturnType<typeof setTimeout> | undefined;
-  /** 本笔记正在录制(含暂停):加备注归录制页,这里不给入口。 */
+  // ── 会议备注(memo):右侧通长一栏的 Markdown 文档(MemoDoc,与录制页同一组件)。
+  //    新写一行的时间点:放过录音取当前播放位置,没放过沿用上一行(拍板 Q4)。点时间 = 滚到
+  //    原文对应位置、不跳播(看备注 ≠ 听录音)。 ──
+  /** 本笔记正在录制(含暂停):备注归录制页编辑,这里只读。 */
   const noteIsRecording = $derived(recording.isLive && recording.noteId === id);
-
-  // 进页/切笔记:先挂 memos_changed 订阅、listen 落定后再取整表——取表在途时若已有
-  // 事件到达,以事件为准(事件是写入之后的整表,比在途的快照新)。
+  let memoDocEl = $state<MemoDoc | null>(null);
+  /** 本篇放过录音没有(切笔记清零):决定新行时间点取播放位置还是沿用上一行。 */
+  let hasPlayed = $state(false);
   $effect(() => {
-    const forId = id;
-    memos = [];
-    memoDraft = null;
-    memoUndo = null;
-    memoErr = "";
-    let alive = true;
-    let gotEvent = false;
-    const un = onMemosChanged((e) => {
-      if (!alive || e.note_id !== forId) return;
-      gotEvent = true;
-      memos = e.memos;
-    });
-    un.then(() => noteMemos(forId))
-      .then((list) => {
-        if (alive && !gotEvent) memos = list;
-      })
-      .catch((e) => {
-        if (alive) showMemoErr(e);
-      });
-    return () => {
-      alive = false;
-      un.then((f) => f());
-    };
+    void id;
+    hasPlayed = false;
   });
-
-  function showMemoErr(e: unknown) {
-    memoErr = t("memo.failed", { e });
-    clearTimeout(memoErrTimer);
-    memoErrTimer = setTimeout(() => (memoErr = ""), 8000);
-  }
-  /** 备注写命令统一出口:失败给提示并把错误抛回书签(书签据此保持编辑态)。 */
-  async function memoCall<T>(f: () => Promise<T>): Promise<T> {
-    try {
-      return await f();
-    } catch (e) {
-      showMemoErr(e);
-      throw e;
-    }
-  }
+  $effect(() => {
+    if (playerPlaying) hasPlayed = true;
+  });
 
   /** 播放器时钟 → 备注时间轴(seekFix 的反向):成品轨播放时扣回 mic 的首帧偏移。 */
   const unseekFix = (ms: number) =>
     playbackScheme === "mixed" ? ms - (mixedInfo?.seek_offset_ms["mic"] ?? 0) : ms;
 
-  function startMemoDraft() {
-    if (!note || noteIsRecording) return;
+  function memoNow(): number | null {
+    if (!hasPlayed) return null;
     const dur = player?.durationMs() ?? 0;
-    const at = clampAt(unseekFix(playerMs), dur > 0 ? dur : Number.MAX_SAFE_INTEGER);
-    memoDraft = { at_ms: at, seq: ++memoDraftSeq };
+    return clampAt(unseekFix(playerMs), dur > 0 ? dur : Number.MAX_SAFE_INTEGER);
   }
 
-  async function onMemoAction(a: MemoAction): Promise<void> {
-    const forId = id; // await 期间可能切笔记:旧笔记的回执不得写进新页
-    switch (a.kind) {
-      case "play":
-        playFrom({ start_ms: a.memo.at_ms });
-        return;
-      case "draftCancel":
-        memoDraft = null;
-        return;
-      case "draftSave":
-        await memoCall(() => addMemo(forId, a.at_ms, a.text, "note"));
-        if (forId === id) memoDraft = null;
-        return;
-      case "edit":
-        await memoCall(() => editMemo(forId, a.memo, { text: a.text }));
-        return;
-      case "adjust":
-        await memoCall(() => editMemo(forId, a.memo, { at_ms: a.at_ms }));
-        return;
-      case "delete": {
-        const gone = await memoCall(() => deleteMemo(forId, a.memo.id));
-        if (forId !== id) return;
-        memoUndo = gone;
-        clearTimeout(memoUndoTimer);
-        memoUndoTimer = setTimeout(() => (memoUndo = null), 10_000);
-        return;
+  /** 点备注的时间:滚到原文里 start ≤ ms 的最后一段并闪一下;播放跟随中先停跟随。 */
+  function jumpToMs(ms: number) {
+    const host = transcriptEl;
+    if (!host) return;
+    let el: HTMLElement | null = null;
+    if (effectiveView === "refined") {
+      for (const node of host.querySelectorAll<HTMLElement>(".md-para[data-start-ms]")) {
+        const s = Number(node.dataset.startMs);
+        if (s <= ms || !el) el = s <= ms ? node : el ?? node;
       }
+    } else {
+      let seq: number | null = null;
+      for (const sg of displaySegments) {
+        if (sg.start_ms <= ms || seq === null) seq = sg.start_ms <= ms ? sg.seq : (seq ?? sg.seq);
+      }
+      if (seq !== null) el = host.querySelector<HTMLElement>(`[data-seq="${seq}"]`);
     }
-  }
-
-  async function undoMemoDelete() {
-    const m = memoUndo;
-    if (!m) return;
-    memoUndo = null;
-    clearTimeout(memoUndoTimer);
-    const forId = id;
-    await memoCall(() =>
-      addMemo(forId, m.at_ms, m.text, m.origin as MemoOrigin, { id: m.id, created_at: m.created_at }),
-    ).catch(() => {});
-  }
-
-  /** 备注栏点一条:滚到正文书签并闪一下;**不跳播**(拍板:看备注≠听录音)。
-      播放跟随中先停跟随,否则下一拍就被拽回当前段(「回到当前位置」按钮随之出现)。 */
-  function pickMemo(m: Memo) {
-    const el = transcriptEl?.querySelector<HTMLElement>(`.memo-bm[data-memo-id="${CSS.escape(m.id)}"]`);
     if (!el) return;
     if (playerPlaying) follow = false;
     el.scrollIntoView({ block: "center", behavior: "smooth" });
-    el.classList.add("flash");
-    setTimeout(() => el.classList.remove("flash"), 1200);
+    el.animate([{ background: "var(--accent-soft, rgb(80 120 255 / 0.18))" }, { background: "transparent" }], { duration: 1600 });
   }
 
   // 备注栏展开/收起:主区(容器)宽度 ≥ 900px 默认展开;用户手动切过就记住、不再自动切。
@@ -2552,10 +2466,10 @@
       editsManage = false;
       retransConfirm = false;
     }
-    // 前台 M = 在播放位置插一个草稿书签(守卫:无修饰键/非输入法/不在可编辑区/本篇没在录)
+    // 前台 M = 在备注文末开一行写(守卫:无修饰键/非输入法/不在可编辑区/本篇没在录)
     if (note && memoKeyAllowed(e, e.target as HTMLElement | null, noteIsRecording)) {
       e.preventDefault();
-      startMemoDraft();
+      memoDocEl?.focusNewLine();
     }
   }}
 />
@@ -2880,9 +2794,9 @@
               </div>
             {/if}
           </div>
-          <!-- 加备注:在当前播放位置插一个草稿书签(同 M 键);录制中本区不出现,入口归录制页 -->
+          <!-- 加备注:在右侧备注文末开一行写(同 M 键);录制中本篇备注归录制页编辑 -->
           <div class="memo-add-wrap">
-            <Button variant="outline" class="memo-add" title={`${t("memo.note.add")} (M)`} onclick={startMemoDraft}>
+            <Button variant="outline" class="memo-add" title={`${t("memo.note.add")} (M)`} disabled={noteIsRecording} onclick={() => memoDocEl?.focusNewLine()}>
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M3.5 14.5V2" />
                 <path d="M3.5 2.5h8.2l-1.9 2.9 1.9 2.9H3.5" />
@@ -3127,10 +3041,6 @@
             onDrainRefined={(p) => refinedSync.queueDrain(p)}
             onBadgeClick={(attrs, rect) => (refinedBadgePop = { attrs, rect })}
             onPlayFrom={(ms) => playFrom({ start_ms: ms })}
-            {memos}
-            memoCuts={edits}
-            {memoDraft}
-            {onMemoAction}
           />
         </div>
         {#if refined.paragraphs.length === 0}
@@ -3171,10 +3081,6 @@
               segDeletePop = { seq, rect };
             }}
             onPlayFrom={(ms) => playFrom({ start_ms: ms })}
-            {memos}
-            memoCuts={edits}
-            {memoDraft}
-            {onMemoAction}
           />
         {/key}
         {#if displaySegments.length === 0}
@@ -3182,20 +3088,19 @@
         {/if}
       {/if}
     </div>
-      <div class="memo-col-slot">
-        <MemoColumn {memos} cuts={edits} open={memoColOpen} onToggle={toggleMemoCol} onPick={pickMemo} />
-      </div>
+      {#key id}
+        <MemoDoc
+          bind:this={memoDocEl}
+          noteId={id}
+          open={memoColOpen}
+          onToggle={toggleMemoCol}
+          now={memoNow}
+          onPickMs={jumpToMs}
+          durationMs={player?.durationMs() ?? 0}
+          editable={!noteIsRecording}
+        />
+      {/key}
     </div>
-
-    {#if memoUndo || memoErr}
-      <div class="memo-toast" role="status">
-        {#if memoErr}<span class="memo-toast-err">{memoErr}</span>{/if}
-        {#if memoUndo}
-          <span>{t("memo.deleted")}</span>
-          <Button variant="link" size="xs" class="h-auto px-1 text-ring" onclick={() => void undoMemoDelete()}>{t("memo.undo")}</Button>
-        {/if}
-      </div>
-    {/if}
 
     {#if segMenuPop && note}
       <!-- 段落说话人选择弹窗(2026-08-22 批量化):与胸牌菜单同一套视觉;
@@ -3514,47 +3419,23 @@
     .row svg.spin { animation: none; }
   }
   /* 控制行:录音 + 播放器整合一行(录音机式) */
-  /* 正文 + 备注栏:收起时第二列只剩竖条按钮(auto),展开 260px */
+  /* 正文 + 备注栏:收起时第二列只剩细轨,展开 300px。备注栏 sticky:正文短时也得有吸顶余量
+     (min-height),否则栏贴着正文区顶端落进操作栏底缘渐隐里被盖淡。 */
   .note-body {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) 2.5rem;
     gap: 16px;
     align-items: start;
+    min-height: calc(100vh - var(--memo-col-top, 0px));
   }
   .note-body.memo-open {
-    grid-template-columns: minmax(0, 1fr) 260px;
-  }
-  .memo-col-slot {
-    position: sticky;
-    top: calc(var(--memo-col-top, 0px) + 8px);
-    min-width: 0;
+    grid-template-columns: minmax(0, 1fr) 300px;
   }
   .memo-add-wrap {
     display: inline-flex;
     align-items: center;
     height: 3.1rem; /* 与 .mix-switch 同:锚定播放器第一行高度 */
     flex: none;
-  }
-  /* 删除撤销/失败提示:右下角浮条(本页此前没有 toast 机制,只给备注用) */
-  .memo-toast {
-    position: fixed;
-    right: 20px;
-    bottom: 20px;
-    z-index: 40;
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    max-width: min(28rem, calc(100vw - 40px));
-    padding: 0.5rem 0.9rem;
-    font-size: 0.85rem;
-    color: var(--ink);
-    background: var(--surface-press);
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-popover);
-  }
-  .memo-toast-err {
-    color: var(--danger-ink);
   }
   .transport {
     display: flex;

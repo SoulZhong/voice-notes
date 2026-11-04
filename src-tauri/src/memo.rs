@@ -1,7 +1,7 @@
 //! 会议备注的命令壳与「按下即钉住」入口(快捷键/托盘共用)。
 //!
-//! 存储规则在 `store::memos`;这里只做三件事:定位笔记目录、按「录制中 / 会后」
-//! 钳时间点、写成功后 emit `memos_changed`(整表)。**不调 `admit_note`**:备注与录制
+//! 存储规则在 `store::memos`(整篇 `memo.md`);这里只做三件事:定位笔记目录、按「录制中 /
+//! 会后」钳时间点、写成功后 emit `memos_changed`(行视图 + 整篇原文)。**不调 `admit_note`**:备注与录制
 //! writer、Aing、重转写不共享任何文件,录制中也能加改删(设计「定死的选择 2」)。
 
 use crate::store::{self, memos};
@@ -11,7 +11,10 @@ use tauri::{AppHandle, Emitter, Manager};
 #[derive(Debug, Clone, Serialize)]
 pub struct MemosChangedEvent {
     pub note_id: String,
+    /// 行视图(时间轴小点、浮窗等用)。
     pub memos: Vec<memos::Memo>,
+    /// 整篇原文 + 版本号(编辑器合并用)。
+    pub doc: memos::MemoDoc,
 }
 
 fn note_dir(app: &AppHandle, note_id: &str) -> Result<std::path::PathBuf, String> {
@@ -43,10 +46,14 @@ fn max_at(app: &AppHandle, note_id: &str, dir: &std::path::Path) -> u64 {
     active_elapsed(app, note_id).unwrap_or_else(|| store::timeline_end_ms(dir))
 }
 
-fn emit_changed(app: &AppHandle, note_id: &str, list: memos::MemoList) {
-    let _ = app.emit("memos_changed", MemosChangedEvent { note_id: note_id.to_string(), memos: list.memos });
+pub(crate) fn emit_changed(app: &AppHandle, note_id: &str, doc: memos::MemoDoc) {
+    let _ = app.emit(
+        "memos_changed",
+        MemosChangedEvent { note_id: note_id.to_string(), memos: memos::parse_lines(&doc.text), doc },
+    );
 }
 
+/// 行视图(带时间点的行,时间升序)。
 #[tauri::command]
 pub async fn note_memos(app: AppHandle, note_id: String) -> Result<Vec<memos::Memo>, String> {
     crate::off_main(move || {
@@ -56,68 +63,98 @@ pub async fn note_memos(app: AppHandle, note_id: String) -> Result<Vec<memos::Me
     .await
 }
 
-/// 录制页输入框第一次按键时调用:时间点一律由后端取,不信前端走表。
+/// 整篇备注(编辑器打开时取)。
+#[tauri::command]
+pub async fn memo_doc(app: AppHandle, note_id: String) -> Result<memos::MemoDoc, String> {
+    crate::off_main(move || {
+        let dir = note_dir(&app, &note_id)?;
+        Ok(memos::load_doc(&dir))
+    })
+    .await
+}
+
+/// 编辑器保存的结果:成功带新文档;冲突带盘上现状(前端合并后重存),不当错误抛。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SaveMemoDocResult {
+    Saved { doc: memos::MemoDoc },
+    Conflict { doc: memos::MemoDoc },
+}
+
+/// 编辑器整篇保存。`base_rev` 是编辑器上次取到/存下的版本;与盘上不一致返回 Conflict。
+/// 时间点超过上限(录制中 = 当前录音时间,会后 = 笔记时长)的钳回上限。
+#[tauri::command]
+pub async fn save_memo_doc(
+    app: AppHandle,
+    note_id: String,
+    text: String,
+    base_rev: String,
+) -> Result<SaveMemoDocResult, String> {
+    crate::off_main(move || {
+        let dir = note_dir(&app, &note_id)?;
+        let text = clamp_doc(&text, max_at(&app, &note_id, &dir));
+        match memos::save_doc(&dir, &text, &base_rev) {
+            Ok(doc) => {
+                emit_changed(&app, &note_id, doc.clone());
+                Ok(SaveMemoDocResult::Saved { doc })
+            }
+            Err(memos::SaveError::Conflict(doc)) => Ok(SaveMemoDocResult::Conflict { doc }),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+}
+
+/// 把文档里超过 `max_ms` 的时间注释钳到 `max_ms`(前端走表略快于后端时常见,差几百毫秒)。
+fn clamp_doc(text: &str, max_ms: u64) -> String {
+    if !text.lines().any(|l| memos::split_stamp(l).1.is_some_and(|a| a > max_ms)) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for raw in text.split_inclusive('\n') {
+        let (line, nl) = match raw.strip_suffix('\n') {
+            Some(l) => (l, "\n"),
+            None => (raw, ""),
+        };
+        match memos::split_stamp(line) {
+            (body, Some(at)) if at > max_ms => out.push_str(&format!("{body} {}{nl}", memos::stamp(max_ms))),
+            _ => {
+                out.push_str(line);
+                out.push_str(nl);
+            }
+        }
+    }
+    out
+}
+
+/// 录制页编辑器取「此刻」的录音时间(后端为准)。
 #[tauri::command]
 pub fn memo_anchor_now(app: AppHandle, note_id: String) -> Result<u64, String> {
     active_elapsed(&app, &note_id).ok_or_else(|| crate::tr!("这篇笔记不在录制中", "This note is not recording"))
 }
 
+/// 浮窗补字:改「时间点 + 原文字」对得上的那一段;找不到就追加一段(不丢字)。
 #[tauri::command]
-pub async fn add_memo(
+pub async fn edit_memo_line(
     app: AppHandle,
     note_id: String,
     at_ms: u64,
+    old_text: String,
     text: String,
-    origin: String,
-    restore_id: Option<String>,
-    restore_created_at: Option<String>,
-) -> Result<memos::Memo, String> {
+) -> Result<(), String> {
     crate::off_main(move || {
         let dir = note_dir(&app, &note_id)?;
-        let at = memos::clamp_at(at_ms, max_at(&app, &note_id, &dir));
-        let restore = restore_id.as_deref().map(|id| (id, restore_created_at.as_deref().unwrap_or("")));
-        let (memo, list) = memos::add_memo(&dir, at, &text, &origin, restore).map_err(|e| e.to_string())?;
-        emit_changed(&app, &note_id, list);
-        Ok(memo)
+        let doc = memos::edit_line(&dir, at_ms, &old_text, &text).map_err(|e| e.to_string())?;
+        emit_changed(&app, &note_id, doc);
+        Ok(())
     })
     .await
 }
 
-#[tauri::command]
-pub async fn edit_memo(
-    app: AppHandle,
-    note_id: String,
-    id: String,
-    expected_updated_at: String,
-    text: Option<String>,
-    at_ms: Option<u64>,
-) -> Result<memos::Memo, String> {
-    crate::off_main(move || {
-        let dir = note_dir(&app, &note_id)?;
-        let at = at_ms.map(|a| memos::clamp_at(a, max_at(&app, &note_id, &dir)));
-        let (memo, list) =
-            memos::edit_memo(&dir, &id, &expected_updated_at, text.as_deref(), at).map_err(|e| e.to_string())?;
-        emit_changed(&app, &note_id, list);
-        Ok(memo)
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn delete_memo(app: AppHandle, note_id: String, id: String) -> Result<memos::Memo, String> {
-    crate::off_main(move || {
-        let dir = note_dir(&app, &note_id)?;
-        let (memo, list) = memos::delete_memo(&dir, &id).map_err(|e| e.to_string())?;
-        emit_changed(&app, &note_id, list);
-        Ok(memo)
-    })
-    .await
-}
-
-/// 快捷键 / 托盘共用:不在录音中什么都不做;否则在按下的这一刻立即写一条时间标记
-/// (空文字备注)、emit,再弹浮窗让用户补文字。写盘放后台线程——调用方可能在主线程
+/// 快捷键 / 托盘共用:不在录音中什么都不做;否则在按下的这一刻立即在文档末尾追加一行
+/// 时间标记(`📍`)、emit,再弹浮窗让用户补文字。写盘放后台线程——调用方可能在主线程
 /// (托盘菜单、快捷键回调),不能在那里做文件 IO 与锁等待。
-pub fn mark_now(app: &AppHandle, origin: &'static str) {
+pub fn mark_now(app: &AppHandle, _origin: &'static str) {
     let Some((note_id, at_ms)) = active_now(app) else {
         return;
     };
@@ -130,9 +167,9 @@ pub fn mark_now(app: &AppHandle, origin: &'static str) {
                 return;
             }
         };
-        match memos::add_memo(&dir, at_ms, "", origin, None) {
-            Ok((memo, list)) => {
-                emit_changed(&app, &note_id, list);
+        match memos::append(&dir, at_ms, "") {
+            Ok((memo, doc)) => {
+                emit_changed(&app, &note_id, doc);
                 crate::memo_panel::show(&app, &note_id, &memo);
             }
             Err(e) => eprintln!("mark_now 写入失败: {e}"),
@@ -148,7 +185,7 @@ pub struct MemoHit {
     pub text: String,
 }
 
-/// 侧栏搜索用:扫全部笔记的备注,文字含 `query`(大小写不敏感)的条目。只读 memos.json,
+/// 侧栏搜索用:扫全部笔记的备注,文字含 `query`(大小写不敏感)的行。只读 memo.md,
 /// 不 load 整篇笔记;个人量级(百场 × 几十条)一次扫毫秒级,不建索引。
 #[tauri::command]
 pub async fn search_memos(app: AppHandle, query: String) -> Result<Vec<MemoHit>, String> {
@@ -167,7 +204,7 @@ fn search_dir(root: &std::path::Path, needle: &str, cap: usize) -> Vec<MemoHit> 
     let mut hits = Vec::new();
     let Ok(rd) = std::fs::read_dir(root) else { return hits };
     for e in rd.flatten() {
-        if !e.path().join(memos::MEMOS_FILE).is_file() {
+        if !e.path().join(memos::MEMO_DOC_FILE).is_file() && !e.path().join(memos::MEMOS_FILE).is_file() {
             continue;
         }
         let note_id = e.file_name().to_string_lossy().into_owned();
@@ -193,10 +230,17 @@ mod tests {
         for id in ["a", "b"] {
             std::fs::create_dir(d.path().join(id)).unwrap();
         }
-        memos::add_memo(&d.path().join("a"), 1_000, "Ship 封版", "note", None).unwrap();
-        memos::add_memo(&d.path().join("b"), 2_000, "别的", "note", None).unwrap();
+        memos::append(&d.path().join("a"), 1_000, "Ship 封版").unwrap();
+        memos::append(&d.path().join("b"), 2_000, "别的").unwrap();
         let hits = search_dir(d.path(), "ship", 10);
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].note_id.as_str(), hits[0].at_ms), ("a", 1_000));
+    }
+
+    #[test]
+    fn clamp_doc_only_touches_late_stamps() {
+        let doc = "a <!-- 00:01 -->\n\nb <!-- 00:09 -->\n";
+        assert_eq!(clamp_doc(doc, 5_000), "a <!-- 00:01 -->\n\nb <!-- 00:05 -->\n");
+        assert_eq!(clamp_doc(doc, 9_000), doc);
     }
 }

@@ -35,8 +35,8 @@ impl NoteStore {
         // (段里还有没被删的话音,文字不切半句——与圈选范围同一条整段纪律)。
         let cuts = super::edits::load_edits(&self.note_dir(id)?).cuts;
         let fully_cut = |s: u64, e: u64| cuts.iter().any(|c| s >= c.start_ms && e <= c.end_ms);
-        // 备注按时间点插入;圈选范围只带范围内的(点判定 start ≤ t < end)。落在删减
-        // 时段里的照样导出并标注(与界面一致)——备注永远属于用户,删减不动它。
+        // 备注整篇作为一个小节放在正文前;圈选范围只带范围内的行(点判定 start ≤ t < end)。
+        // 落在删减时段里的照样导出并标注(与界面一致)——备注永远属于用户,删减不动它。
         let mut memos = super::memos::load_memos(&self.note_dir(id)?).memos;
         if let Some((s, e)) = range {
             memos.retain(|m| s <= m.at_ms && m.at_ms < e);
@@ -220,59 +220,74 @@ pub(crate) fn render_note_with_memos(
     })
 }
 
-/// 备注的归并游标:渲染每个有时间跨度的块之前,先吐出所有 `at_ms < 块.start_ms` 的备注——
-/// 即备注落在「最后一个 `start_ms <= at_ms` 的块」之后,与笔记页书签同一条规则。
-/// 循环结束后 [`MemoCursor::rest`] 吐出比所有块都晚的。
-struct MemoCursor<'a> {
-    memos: &'a [Memo],
-    i: usize,
-    cuts: &'a [CutRange],
-    md: bool,
+/// 备注小节的插入游标:整篇备注(按文档顺序、每行带时间)作为一个「备注」小节,放在第一个
+/// 有时间跨度的块之前——也就是标题/头信息/实体清单之后、正文之前。没有块时由
+/// [`MemoCursor::rest`] 放在末尾。没有备注时什么都不输出(与旧导出逐字节一致)。
+struct MemoCursor {
+    section: String,
 }
 
-impl<'a> MemoCursor<'a> {
-    fn new(memos: &'a [Memo], cuts: &'a [CutRange], md: bool) -> Self {
-        Self { memos, i: 0, cuts, md }
+impl MemoCursor {
+    fn new(memos: &[Memo], cuts: &[CutRange], md: bool) -> Self {
+        Self { section: memo_section(memos, cuts, md) }
     }
 
-    fn before(&mut self, start_ms: u64, out: &mut String) {
-        while let Some(m) = self.memos.get(self.i).filter(|m| m.at_ms < start_ms) {
-            out.push_str(&render_memo(m, self.cuts, self.md));
-            self.i += 1;
-        }
+    fn before(&mut self, _start_ms: u64, out: &mut String) {
+        out.push_str(&std::mem::take(&mut self.section));
     }
 
     fn rest(&mut self, out: &mut String) {
-        for m in &self.memos[self.i..] {
-            out.push_str(&render_memo(m, self.cuts, self.md));
-        }
-        self.i = self.memos.len();
+        out.push_str(&std::mem::take(&mut self.section));
     }
 }
 
-/// 一条备注的导出形态。Markdown 用引用块(多行每行都带 `> `),纯文本用方括号前缀。
-fn render_memo(m: &Memo, cuts: &[CutRange], md: bool) -> String {
-    let cut_tag = if super::memos::in_cut(m.at_ms, cuts) { "(该时段已删减)" } else { "" };
-    let text = m.text.trim_end();
-    if md {
-        let head = if text.is_empty() {
-            format!("> 🔖 **时间标记 {}**{cut_tag}", super::memos::fmt_clock(m.at_ms))
-        } else {
-            let mut lines = text.lines();
-            let first = lines.next().unwrap_or("");
-            let mut h = format!("> 📝 **备注 {}** {first}", super::memos::fmt_clock(m.at_ms));
-            for l in lines {
-                h.push_str(&format!("\n> {l}"));
-            }
-            h.push_str(cut_tag);
-            h
-        };
-        format!("{head}\n\n")
-    } else if text.is_empty() {
-        format!("[时间标记 {}]{cut_tag}\n", format_ts(m.at_ms))
-    } else {
-        format!("[备注 {}] {}{cut_tag}\n", format_ts(m.at_ms), text.replace('\n', "\n    "))
+/// 「备注」小节。Markdown:每行保留用户写的结构(列表/引用/勾选框),行首记号之后插入
+/// `` `mm:ss` ``;用户写的标题降为三级,免得与导出自己的标题层级打架。纯文本:`[hh:mm:ss] 文字`。
+/// 落在删减时段里的行照样导出并标注(备注永远属于用户,删减不动它)。
+fn memo_section(memos: &[Memo], cuts: &[CutRange], md: bool) -> String {
+    if memos.is_empty() {
+        return String::new();
     }
+    let mut lines: Vec<&Memo> = memos.iter().collect();
+    lines.sort_by_key(|m| (m.line, m.at_ms));
+    let mut out = String::new();
+    if md {
+        out.push_str("## 备注\n\n");
+        let mut prev: Option<usize> = None;
+        let mut first = true;
+        for m in lines {
+            let cut_tag = if super::memos::in_cut(m.at_ms, cuts) { "(该时段已删减)" } else { "" };
+            let clock = format!("`{}`", super::memos::fmt_clock(m.at_ms));
+            let body = if m.text.is_empty() { "🔖 时间标记".to_string() } else { m.text.clone() };
+            let raw = if m.md.is_empty() { m.text.as_str() } else { m.md.as_str() };
+            let stripped = super::memos::strip_md_prefix(raw);
+            let prefix = raw.trim_start().strip_suffix(stripped).unwrap_or("").trim_end();
+            let is_list = !prefix.is_empty() && !prefix.starts_with('#');
+            let line = if prefix.starts_with('#') {
+                format!("### {clock} {body}{cut_tag}")
+            } else if prefix.is_empty() {
+                format!("{clock} {body}{cut_tag}")
+            } else {
+                format!("{prefix} {clock} {body}{cut_tag}")
+            };
+            if !first {
+                out.push_str(if is_list && prev.is_some_and(|p| p + 1 == m.line) { "\n" } else { "\n\n" });
+            }
+            first = false;
+            out.push_str(&line);
+            prev = if is_list { Some(m.line) } else { None };
+        }
+        out.push_str("\n\n---\n\n");
+    } else {
+        out.push_str("备注:\n");
+        for m in lines {
+            let cut_tag = if super::memos::in_cut(m.at_ms, cuts) { "(该时段已删减)" } else { "" };
+            let body = if m.text.is_empty() { "时间标记" } else { m.text.as_str() };
+            out.push_str(&format!("[{}] {body}{cut_tag}\n", format_ts(m.at_ms)));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// 把成品轨轨内若干保留区间(毫秒,有序不重叠)拼接写到 tmp。WAV 直接按字节拼
@@ -370,8 +385,8 @@ pub fn render_refined(title: &str, doc: &RefinedDoc, md: bool) -> String {
     render_refined_with_memos(title, doc, md, &[], &[])
 }
 
-/// 带备注的修订稿渲染(备注插在段落之间,规则同 [`MemoCursor`])。无时间跨度的自由块
-/// (用户手写段,start==end==0)不推进游标。
+/// 带备注的修订稿渲染(备注小节放在第一个有时间跨度的段落之前,见 [`MemoCursor`])。
+/// 无时间跨度的自由块(用户手写段,start==end==0)不触发游标。
 pub fn render_refined_with_memos(title: &str, doc: &RefinedDoc, md: bool, memos: &[Memo], cuts: &[CutRange]) -> String {
     let mut cursor = MemoCursor::new(memos, cuts, md);
     let mut out = String::new();
@@ -559,8 +574,10 @@ mod tests {
     use crate::store::NoteStore;
     use serde_json;
 
-    fn memo(at_ms: u64, text: &str) -> Memo {
-        Memo { id: format!("m{at_ms}"), at_ms, text: text.into(), origin: "note".into(), created_at: String::new(), updated_at: String::new() }
+    fn memo(line: usize, at_ms: u64, md: &str) -> Memo {
+        let text = crate::store::memos::strip_md_prefix(md);
+        let text = if text == crate::store::memos::MARKER { String::new() } else { text.to_string() };
+        Memo { id: format!("L{line}"), at_ms, text, md: md.into(), line }
     }
 
     fn memo_note() -> Note {
@@ -582,42 +599,43 @@ mod tests {
     }
 
     #[test]
-    fn memos_interleave_after_last_segment_that_started_before() {
+    fn memo_section_goes_before_body_in_document_order() {
         let note = memo_note();
-        let memos = [memo(5_000, "定了\n周一封版"), memo(10_000, ""), memo(99_000, "尾")];
+        let memos = [
+            memo(1, 16_000, "## 决议"),
+            memo(3, 16_000, "- 周二上线"),
+            memo(4, 31_000, "- [ ] 回滚"),
+            memo(6, 10_000, "📍"),
+            memo(8, 5_000, "定了 周一封版"),
+        ];
         let cuts = [CutRange { start_ms: 9_000, end_ms: 11_000 }];
         let md = render_markdown(&note, &memos, &cuts);
-        let i1 = md.find("] 00:00:00** 一").unwrap();
-        let im = md.find("> 📝 **备注 00:05** 定了\n> 周一封版").expect(&md);
-        let i2 = md.find("] 00:00:10** 二").unwrap();
-        let it = md.find("> 🔖 **时间标记 00:10**(该时段已删减)").expect(&md);
-        let ie = md.find("备注 01:39** 尾").unwrap();
-        // 与段同一时刻的备注排在该段之后(落在「最后一个 start<=at 的段」之后)
-        assert!(i1 < im && im < i2 && i2 < it && it < ie, "{md}");
+        let want = "## 备注\n\n### `00:16` 决议\n\n- `00:16` 周二上线\n- [ ] `00:31` 回滚\n\n`00:10` 🔖 时间标记(该时段已删减)\n\n`00:05` 定了 周一封版\n\n---\n\n";
+        assert!(md.contains(want), "{md}");
+        assert!(md.find("## 备注").unwrap() < md.find("] 00:00:00** 一").unwrap(), "{md}");
         let txt = render_text(&note, &memos, &cuts);
-        assert!(txt.contains("[备注 00:00:05] 定了\n    周一封版"), "{txt}");
-        assert!(txt.contains("[时间标记 00:00:10](该时段已删减)"), "{txt}");
+        assert!(txt.contains("备注:\n[00:00:16] 决议\n[00:00:16] 周二上线\n[00:00:31] 回滚\n[00:00:10] 时间标记(该时段已删减)\n[00:00:05] 定了 周一封版\n\n"), "{txt}");
+        assert!(txt.find("备注:").unwrap() < txt.find("一").unwrap());
         // 无备注时与旧输出逐字节一致
         assert_eq!(render_markdown(&note, &[], &[]), render_note(&note, "md").unwrap());
     }
 
     #[test]
-    fn refined_memos_skip_freeform_blocks_for_placement() {
+    fn refined_memo_section_skips_freeform_blocks() {
         let doc: RefinedDoc = serde_json::from_value(serde_json::json!({
             "schema_version": 2,
             "generated_at": "2026-07-30T00:00:00Z",
             "stages": { "filter": "done", "recluster": "done", "llm": "done" },
             "discarded_seqs": [],
             "paragraphs": [
-                { "speaker": "S1", "name": "张三", "start_ms": 0, "end_ms": 4000, "text": "甲", "source_seqs": [0] },
                 { "speaker": "", "start_ms": 0, "end_ms": 0, "text": "## 手写", "source_seqs": [] },
-                { "speaker": "S1", "name": "张三", "start_ms": 8000, "end_ms": 9000, "text": "乙", "source_seqs": [1] }
+                { "speaker": "S1", "name": "张三", "start_ms": 0, "end_ms": 4000, "text": "甲", "source_seqs": [0] }
             ]
         }))
         .unwrap();
-        let md = render_refined_with_memos("标题", &doc, true, &[memo(6_000, "中间")], &[]);
-        let (a, m, b) = (md.find("甲").unwrap(), md.find("备注 00:06** 中间").unwrap(), md.find("乙").unwrap());
-        assert!(a < m && m < b, "{md}");
+        let md = render_refined_with_memos("标题", &doc, true, &[memo(1, 6_000, "中间")], &[]);
+        let (h, m, a) = (md.find("## 手写").unwrap(), md.find("`00:06` 中间").unwrap(), md.find("甲").unwrap());
+        assert!(h < m && m < a, "{md}");
         assert_eq!(render_refined("标题", &doc, true), render_refined_with_memos("标题", &doc, true, &[], &[]));
     }
 

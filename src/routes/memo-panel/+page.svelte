@@ -1,11 +1,12 @@
 <script lang="ts">
-  // 备注浮窗(⌥⌘M / 托盘「加备注…」):按下那一刻后端已写好一条时间标记,这里只负责补文字。
+  // 备注浮窗(⌥⌘M / 托盘「加备注…」):按下那一刻后端已在备注文末追加一行时间标记(📍),
+  // 这里只负责把它补成文字(edit_memo_line:按时间点+原文字找那一行;找不到就追加,不丢字)。
   // 回车 = 保存并关闭(焦点还给原应用);Esc = 关闭(时间标记保留);失焦 = 有字先存再关。
   // 浮窗开着又按一次快捷键:后端再钉一条新的并发 memo_panel_open——先把当前输入存下再切过去。
   import { onMount } from "svelte";
   import { t } from "$lib/i18n/index.svelte";
   import {
-    editMemo,
+    editMemoLine,
     fmtClock,
     memoPanelHide,
     memoPanelState,
@@ -24,7 +25,7 @@
   async function persist(target: MemoPanelOpen | null, value: string) {
     const v = value.trim();
     if (!target || !v || v.length > MEMO_MAX_CHARS) return;
-    await editMemo(target.note_id, target.memo, { text: v });
+    await editMemoLine(target.note_id, target.memo, v);
   }
 
   async function open(next: MemoPanelOpen) {
@@ -33,7 +34,7 @@
     cur = next;
     text = "";
     error = "";
-    if (prev && prev.memo.id !== next.memo.id) {
+    if (prev && (prev.note_id !== next.note_id || prev.memo.at_ms !== next.memo.at_ms || prev.memo.line !== next.memo.line)) {
       await persist(prev, pending).catch((e) => (error = t("memo.failed", { e: String(e) })));
     }
     queueMicrotask(() => input?.focus());
