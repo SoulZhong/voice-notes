@@ -14,7 +14,6 @@ pub mod migrate;
 pub mod mix_regen;
 pub mod notelock;
 mod notes;
-pub(crate) use notes::timeline_end_ms;
 mod speaker_table;
 pub mod refined;
 pub mod transcode;

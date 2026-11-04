@@ -15,7 +15,7 @@
   import { t } from "$lib/i18n/index.svelte";
   import { fmtClock, memoDoc, MEMO_DOC_MAX_CHARS, onMemosChanged, type MemoDoc as Doc } from "$lib/memos";
   import { mergeMemoDoc } from "$lib/memoDocMerge";
-  import { memoDocSession, saveSerial } from "$lib/memoDocSession";
+  import { memoDocSession, noteSeen, saveSerial } from "$lib/memoDocSession";
   import { memoDocPlugin, SKIP_STAMP, stampSchemaConfig } from "$lib/editor/memoDocSchema";
 
   let {
@@ -55,16 +55,15 @@
   let loaded = false;
   const span = $derived(Math.max(elapsedMs ?? 0, durationMs, 60_000, ...stamps.map((s) => s + 1)));
 
-  // baseSer = 会话基线(盘上内容)经本编辑器序列化后的样子:「有没有改动」与三方合并都拿它比,
-  // 行格式与 serialize() 一致,不会因格式差异冒出假改动。
+  // baseRaw = 编辑器内容所依据的盘面原文(上次与盘对齐的那一版);baseSer = 它经本编辑器序列化后
+  // 的样子(行格式与 serialize() 一致)——「有没有改动」与三方合并都拿它比,不冒假差异。
   let baseSer = "";
-  /** 编辑器上次与盘对齐时的盘面原文(随保存一起交给会话,作为这份改动的基线)。 */
   let baseRaw = "";
-  /** 保存在途时到达的事件:等回执后再判定是不是自己这次保存。 */
-  let deferred: Doc | null = null;
-  /** 本编辑器一次只有一份保存在途(之后的改动等它回来再存,基线才对得上);在途那份的文本。 */
+  /** 本编辑器一次只有一份保存在途;在途那份的文本(离页时排队的最后一份以它为前驱)。 */
   let inflight: string | null = null;
   let again = false;
+  /** 保存在途时收到了「没见过的版本」的事件:回执后重新取盘再对齐(不回放暂存的快照)。 */
+  let staleCheck = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let destroyed = false;
   // 插件闭包里读的「此刻」、回调与可编辑:用普通变量转一手,不在 effect 外读 prop。
@@ -109,7 +108,7 @@
   }
 
   function adopt(doc: Doc) {
-    session.base = doc;
+    noteSeen(session, doc);
     baseRaw = doc.text;
     baseSer = normalize(doc.text);
   }
@@ -133,53 +132,41 @@
     }
     inflight = text;
     try {
-      const out = await saveSerial(session, text, baseRaw);
+      const out = await saveSerial(session, text, { base: baseRaw, prev: null });
       if (destroyed || !editor) return;
       error = "";
-      const typedSince = serialize() !== text;
+      const now = serialize();
       baseRaw = out.doc.text;
       baseSer = normalize(out.doc.text);
-      // 在途期间暂存的事件:就是这次保存落盘的那份(含后端钳过时间的)→ 只当确认
-      const ev = deferred;
-      deferred = null;
-      if (ev && ev.rev !== out.doc.rev && session.pending === 0) queueMicrotask(() => absorbRemote(ev));
       if (out.merged) {
-        // 落盘内容不是本次提交的原样(与别处改动合并过,或后端钳过时间点)
-        if (!typedSince) setContent(out.doc.text);
-        else {
-          // 这期间又打了字:把它合进落盘内容,稍后再存
-          const merged = mergeMemoDoc(text, serialize(), baseSer);
-          setContent(merged);
-          scheduleSave();
-        }
-      } else if (typedSince) {
-        scheduleSave();
+        // 落盘内容合进了别处的改动:把它们带回编辑器;这期间又打的字一并保留
+        setContent(now === text ? out.doc.text : mergeMemoDoc(text, now, baseSer));
       }
     } catch (e) {
       if (!destroyed) error = t("memo.failed", { e: String(e) });
     } finally {
       inflight = null;
-      if (again && !destroyed) {
-        again = false;
-        void save();
+      if (!destroyed && editor) {
+        if (staleCheck && session.pending === 0) {
+          staleCheck = false;
+          void resync();
+        }
+        if (again || serialize() !== baseSer) {
+          again = false;
+          scheduleSave();
+        }
       }
     }
   }
 
-  /** 盘上变了:自己保存引起的就当确认;别处改的 → 没改动直接换成盘上的,有改动三方合并并重存。 */
+  /** 盘上被别处改了(版本没见过):没改动直接换成盘上的;有改动三方合并并重存。 */
   function absorbRemote(doc: Doc) {
-    if (!editor || !loaded) return;
+    if (!editor || !loaded || session.seen.has(doc.rev)) return;
     if (session.pending > 0) {
-      // 保存在途:等回执再判定(后端可能钳过时间点,文本对不上 recent)
-      deferred = doc;
+      // 保存在途:这份事件可能比在途保存读到的盘面旧,也可能更新——回执后重新取盘再判断
+      staleCheck = true;
       return;
     }
-    if (session.recent.has(doc.text)) {
-      // 自己的保存(事件晚于回执到达):更新基线即可,不合并
-      adopt(doc);
-      return;
-    }
-    if (doc.rev === session.base.rev) return;
     const local = serialize();
     const dirty = local !== baseSer;
     const prevBaseSer = baseSer;
@@ -191,6 +178,17 @@
     const merged = mergeMemoDoc(prevBaseSer, local, baseSer);
     if (merged !== local) setContent(merged);
     scheduleSave();
+  }
+
+  /** 重新取盘对齐(在途保存期间有过外部事件时)。 */
+  async function resync() {
+    try {
+      const doc = await memoDoc(myId);
+      if (destroyed || session.pending > 0) return;
+      absorbRemote(doc);
+    } catch {
+      /* 取不到就等下一次事件 */
+    }
   }
 
   let unlisten: Promise<() => void> | null = null;
@@ -240,19 +238,16 @@
       },
     });
     // 先挂事件;再等这一篇在途的保存(上一个编辑器实例卸载时交的最后一份)落定,然后取盘。
-    let latest: Doc | null = null;
+    // 取盘期间到达的事件不必单独处理:取盘结果至少和它一样新。
     unlisten = onMemosChanged((e) => {
-      if (e.note_id !== myId || destroyed) return;
-      if (!loaded) latest = e.doc;
-      else absorbRemote(e.doc);
+      if (e.note_id !== myId || destroyed || !loaded) return;
+      absorbRemote(e.doc);
     });
     await unlisten;
     await session.chain;
     try {
-      const fetched = await memoDoc(myId);
+      const doc = await memoDoc(myId);
       if (destroyed) return;
-      // 取盘在途时到达的事件比快照新
-      const doc = latest ?? fetched;
       adopt(doc);
       setContent(doc.text);
       loaded = true;
@@ -268,9 +263,11 @@
     // 离开页面/切笔记:最后一份改动交给会话的串行队列(排在在途保存之后,冲突会合并重试)
     if (editor) {
       const text = loaded ? serialize() : baseSer;
-      // 基线:有保存在途时是在途那份(最后一份是在它之上继续打的),否则是上次对齐的盘面
-      if (loaded && text !== baseSer && text !== inflight && text.length <= MEMO_DOC_MAX_CHARS)
-        void saveSerial(session, text, inflight ?? baseRaw).catch(() => {});
+      // 有保存在途:只要和在途那份不同就交(含撤销回原样的情况),前驱 = 在途那份,在途失败则
+      // 会话自动退回 baseRaw 作基线;没在途:与盘面不同才交。
+      const need = inflight !== null ? text !== inflight : text !== baseSer;
+      if (loaded && need && text.length <= MEMO_DOC_MAX_CHARS)
+        void saveSerial(session, text, { base: baseRaw, prev: inflight }).catch(() => {});
       void editor.destroy();
       editor = null;
     }

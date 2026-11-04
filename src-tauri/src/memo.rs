@@ -41,11 +41,6 @@ pub(crate) fn active_now(app: &AppHandle) -> Option<(String, u64)> {
     g.as_ref().map(|s| (s.note_id.clone(), s.elapsed_ms()))
 }
 
-/// 时间点上限:录制中 = 当前录音时间(只能往前),会后 = 笔记时间轴终点。
-fn max_at(app: &AppHandle, note_id: &str, dir: &std::path::Path) -> u64 {
-    active_elapsed(app, note_id).unwrap_or_else(|| store::timeline_end_ms(dir))
-}
-
 pub(crate) fn emit_changed(app: &AppHandle, note_id: &str, doc: memos::MemoDoc) {
     let _ = app.emit(
         "memos_changed",
@@ -82,7 +77,9 @@ pub enum SaveMemoDocResult {
 }
 
 /// 编辑器整篇保存。`base_rev` 是编辑器上次取到/存下的版本;与盘上不一致返回 Conflict。
-/// 时间点超过上限(录制中 = 当前录音时间,会后 = 笔记时长)的钳回上限。
+/// 原样落盘、不改写内容:曾在这里把超前的时间点钳回录音时间,但「落盘的不是提交的那份」会让
+/// 编辑器把时间变化和文字变化当成同一行的冲突、合并出重复段(Codex 审出)。前端走表最多超前
+/// 几百毫秒,不值得为它改写用户的文档。
 #[tauri::command]
 pub async fn save_memo_doc(
     app: AppHandle,
@@ -92,7 +89,6 @@ pub async fn save_memo_doc(
 ) -> Result<SaveMemoDocResult, String> {
     crate::off_main(move || {
         let dir = note_dir(&app, &note_id)?;
-        let text = clamp_doc(&text, max_at(&app, &note_id, &dir));
         match memos::save_doc(&dir, &text, &base_rev) {
             Ok(doc) => {
                 emit_changed(&app, &note_id, doc.clone());
@@ -103,28 +99,6 @@ pub async fn save_memo_doc(
         }
     })
     .await
-}
-
-/// 把文档里超过 `max_ms` 的时间注释钳到 `max_ms`(前端走表略快于后端时常见,差几百毫秒)。
-fn clamp_doc(text: &str, max_ms: u64) -> String {
-    if !text.lines().any(|l| memos::split_stamp(l).1.is_some_and(|a| a > max_ms)) {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    for raw in text.split_inclusive('\n') {
-        let (line, nl) = match raw.strip_suffix('\n') {
-            Some(l) => (l, "\n"),
-            None => (raw, ""),
-        };
-        match memos::split_stamp(line) {
-            (body, Some(at)) if at > max_ms => out.push_str(&format!("{body} {}{nl}", memos::stamp(max_ms))),
-            _ => {
-                out.push_str(line);
-                out.push_str(nl);
-            }
-        }
-    }
-    out
 }
 
 /// 录制页编辑器取「此刻」的录音时间(后端为准)。
@@ -237,10 +211,4 @@ mod tests {
         assert_eq!((hits[0].note_id.as_str(), hits[0].at_ms), ("a", 1_000));
     }
 
-    #[test]
-    fn clamp_doc_only_touches_late_stamps() {
-        let doc = "a <!-- 00:01 -->\n\nb <!-- 00:09 -->\n";
-        assert_eq!(clamp_doc(doc, 5_000), "a <!-- 00:01 -->\n\nb <!-- 00:05 -->\n");
-        assert_eq!(clamp_doc(doc, 9_000), doc);
-    }
 }
