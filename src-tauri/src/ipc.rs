@@ -154,6 +154,9 @@ pub struct SpeakersEvent {
     pub speakers: Vec<SpeakerEntry>,
     /// 本次事件伴随的簇合并（仅 Merged 分支非 None）；前端据此回写已上屏历史段。
     pub merged: Option<MergedPair>,
+    /// 本次事件伴随的录制中删除:该说话人名下的已上屏段前端改为未标注。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleared: Option<String>,
 }
 
 /// 声纹库人物摘要，供 `list_people` 返回、管理页展示。sources 取该人已有质心的信道集合

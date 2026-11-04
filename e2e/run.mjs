@@ -263,6 +263,35 @@ try {
     assert(now !== was, "开关状态没变");
     await page.close();
   });
+
+  // 10. 录制中说话人编辑:删除说话人后,条上的 chip 消失、已上屏段落清掉归属(cleared)
+  await scenario("录制页说话人条:删除说话人并清掉已上屏段归属", async () => {
+    const { page, errors } = await openPage("/record", { family: "classic", mode: "light", recording: true });
+    assert(await waitFor(() => hasText(page, "李四")), "录制页没水合出说话人「李四」");
+    const chip = await page.evaluateHandle(
+      () => [...document.querySelectorAll(".chip button.name")].find((b) => b.textContent?.trim() === "李四") ?? null,
+    );
+    assert(chip.asElement(), "说话人条上没有「李四」chip");
+    await chip.asElement().click();
+    const clickRow = (text) =>
+      page.evaluate((t) => {
+        const b = [...document.querySelectorAll(".chip .panel button, .chip .panel a")].find((x) => x.textContent?.includes(t));
+        b?.click();
+        return !!b;
+      }, text);
+    assert(await waitFor(() => clickRow("删除这个说话人")), "编辑面板里没有「删除这个说话人」");
+    assert(await waitFor(() => clickRow("确认删除")), "没出现删除二段确认");
+    const del = await waitFor(async () => (await calls(page, "delete_note_speaker")).find((c) => c.args.speakerId === "S2"));
+    assert(del, "确认后没调用 delete_note_speaker(S2)");
+    assert(await waitFor(async () => !(await hasText(page, "李四"))), "删除后页面上仍有「李四」(chip 或段落徽章没清)");
+    // 不靠 cleared 清归属的话,这段会显示成「新说话人 2」(表里没了该 id 的兜底名)
+    const badge = await page.$eval("#seg-1 .badge", (el) => el.textContent?.trim() ?? "");
+    assert(badge === "对方", `被删说话人的段落徽章应回到未标注「对方」,实际「${badge}」`);
+    const bad = errors.filter((e) => !benign(e));
+    assert(bad.length === 0, "页面错误:\n" + bad.join("\n"));
+    await page.screenshot({ path: join(out, "flow-record-speaker-delete.png") });
+    await page.close();
+  });
 } finally {
   await browser.close();
   vite.kill();

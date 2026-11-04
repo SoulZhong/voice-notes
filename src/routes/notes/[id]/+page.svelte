@@ -75,6 +75,13 @@
   import { playback } from "$lib/playback.svelte";
   import { i18n, t } from "$lib/i18n/index.svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
+  import {
+    attendeeDisplay as attendeeDisplayOf,
+    attendeeEntries as attendeeEntriesOf,
+    buildAttendeeIndex,
+    isAttendeeRemoved,
+    removedAttendeeKeys,
+  } from "$lib/attendees";
   import { schemeToDefaultPlayback, shouldFallbackToDual } from "$lib/audioScheme";
   import { getSettings, modelsStatus } from "$lib/models";
   import { refineReady } from "$lib/refineReady";
@@ -370,63 +377,13 @@
     ed.setRefined(doc);
   });
 
-  /** 日历参会人显示名三级解析(2026-09-18 用户实报:企微订阅日历参会人无姓名,
-      邮箱前缀是拼音):日历自带名 > 声纹库邮箱命中的人名(确认关联时记过邮箱,
-      wangyuqi@… → 王宇琪) > 邮箱前缀兜底。 */
-  const personByEmail = $derived.by(() => {
-    const m = new Map<string, string>();
-    for (const p of people ?? []) {
-      if (!p.name) continue;
-      for (const e of p.emails ?? []) m.set(e.toLowerCase(), p.name);
-    }
-    return m;
-  });
-  /** 拼音兜底:邮箱前缀(去点/去数字)与库中人名全拼比对;带点的企微前缀是
-      「名.姓」序(zhenjie.yang),再试倒序拼接(yangzhenjie→杨振杰)。 */
-  const personByPinyin = $derived.by(() => {
-    const m = new Map<string, string>();
-    for (const p of people ?? []) {
-      if (p.name && p.name_pinyin) m.set(p.name_pinyin, p.name);
-    }
-    return m;
-  });
-  function pinyinResolve(email: string): string | null {
-    const local = email.split("@")[0]?.toLowerCase().replace(/\d+/g, "") ?? "";
-    if (!local) return null;
-    const parts = local.split(".").filter(Boolean);
-    const forms = new Set<string>([parts.join(""), [...parts].reverse().join("")]);
-    for (const f of forms) {
-      const hit = personByPinyin.get(f);
-      if (hit) return hit;
-    }
-    return null;
-  }
-  const attendeeDisplay = (a: { name: string; email: string }) =>
-    (
-      a.name ||
-      personByEmail.get(a.email.toLowerCase()) ||
-      pinyinResolve(a.email) ||
-      a.email.split("@")[0] ||
-      ""
-    ).trim();
-
-  /** 与会人员名单(说话人浮层一键指认用):日历参会人(排除「我」,四级解析,
-      附邮箱供学习回路)+ 手动录入,按序去重。 */
-  const removedAttendeeKeys = $derived(new Set(note?.meta.attendees_removed ?? []));
-  const attendeeRemoved = (a: { name: string; email: string }) =>
-    removedAttendeeKeys.has(a.email.toLowerCase()) || removedAttendeeKeys.has(a.name.toLowerCase());
-  const attendeeEntries = $derived.by(() => {
-    const out: { name: string; email: string }[] = [];
-    for (const a of note?.meta.calendar?.attendees ?? []) {
-      if (a.is_me || attendeeRemoved(a)) continue;
-      const n = attendeeDisplay(a);
-      if (n && !out.some((x) => x.name === n)) out.push({ name: n, email: a.email });
-    }
-    for (const n of note?.meta.attendees ?? []) {
-      if (n && !out.some((x) => x.name === n)) out.push({ name: n, email: "" });
-    }
-    return out;
-  });
+  /** 日历参会人显示名解析与与会人员名单(说话人浮层一键指认用):解析规则见
+      $lib/attendees(录制页共用同一份)。 */
+  const attendeeIdx = $derived(buildAttendeeIndex(people));
+  const attendeeDisplay = (a: { name: string; email: string }) => attendeeDisplayOf(a, attendeeIdx);
+  const removedAttendees = $derived(removedAttendeeKeys(note?.meta));
+  const attendeeRemoved = (a: { name: string; email: string }) => isAttendeeRemoved(a, removedAttendees);
+  const attendeeEntries = $derived(attendeeEntriesOf(note?.meta, attendeeIdx));
   const attendeeNames = $derived(attendeeEntries.map((x) => x.name));
   /** 指认学习回路:用拼音邮箱参会人完成指认后,把邮箱记到该人档案——下次同一
       日历按邮箱精确显示中文名,不再依赖拼音猜。 */

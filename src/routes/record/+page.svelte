@@ -1,6 +1,6 @@
 <script lang="ts">
   import { envelopeStep, shapeLevel, normalizeBars, barStyle, barCountFor } from "$lib/liveWave";
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { recording, type Line } from "$lib/recording.svelte";
@@ -26,7 +26,14 @@
     editSegment,
     setSegmentSpeaker,
     renameSpeaker,
+    getNote,
+    assignNoteSpeakerPerson,
+    clearNoteSpeakerPerson,
+    deleteNoteSpeaker,
+    type NoteMeta,
   } from "$lib/notes";
+  import { listPeople, type PersonSummary } from "$lib/people";
+  import { attendeeEntries as attendeeEntriesOf, buildAttendeeIndex } from "$lib/attendees";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import {
     modelsStatus,
@@ -286,6 +293,49 @@
   /** 改派菜单只列本场已有说话人——不提供「新说话人」选项(后端会拒 "new",
       Task 6 审查结论:别让用户在这条路上撞错)。 */
   const speakerIds = $derived(Object.keys(recording.speakers).sort(speakerIdCompare));
+
+  // ── 说话人条的选人/取消关联/删除(录制中与录完后能力对齐,2026-11-03 用户要求)──
+  // 后端录制中走 writer 单写者路径:选人只改本场表、库侧样本停录后补走;删除后同簇新段
+  // 也不再归属(speakers 事件带 cleared,已上屏段在 recording store 里清归属)。
+  // 录制中不提供试听(系统音采集没排除本程序声音,一放就录进去)。
+  /** 声纹库人物(选人列表 + 与会人名单的邮箱/拼音解析),按场加载一次。 */
+  let livePeople = $state<PersonSummary[]>([]);
+  /** 本篇 meta(与会人员来源:日历快照 + 手动名单 + 隐藏名单)。录制中这两份名单
+      后端都拒改,按场加载一次即可。 */
+  let liveMeta = $state<NoteMeta | null>(null);
+  $effect(() => {
+    const nid = recording.noteId;
+    let stale = false;
+    untrack(() => {
+      livePeople = [];
+      liveMeta = null;
+    });
+    if (!nid) return;
+    listPeople()
+      .then((p) => {
+        if (!stale) livePeople = p;
+      })
+      .catch(() => {});
+    getNote(nid)
+      .then((n) => {
+        if (!stale) liveMeta = n.meta;
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  });
+  const liveAttendees = $derived(attendeeEntriesOf(liveMeta, buildAttendeeIndex(livePeople)));
+  /** 各说话人已上屏段数:说话人条按此排序并折叠碎片(与笔记页同口径)。 */
+  const liveSegCounts = $derived.by(() => {
+    const c: Record<string, number> = {};
+    for (const l of recording.finals) {
+      if (l.speaker) c[l.speaker] = (c[l.speaker] ?? 0) + 1;
+    }
+    return c;
+  });
+  // 指认学习回路(把拼音邮箱记到人物档案)录制中不做:它写声纹库,而录音中声纹库禁写——
+  // 停录 finalize 也要写库,并发写会互相覆盖。录完后在笔记页指认照常学习。
 
   function beginEdit(line: Line) {
     speakerMenuSeq = null;
@@ -1031,7 +1081,17 @@
 
       <!-- 说话人条随头部整体吸顶:滚到会中段落时仍要能对着条上的名字辨认发言人/改名,
            条不在视口内这个对照就断了(用户反馈)。空说话人时组件自身不渲染,不占高。 -->
-      <SpeakerChips speakers={recording.speakers} noteId={recording.noteId} editable={true} />
+      <SpeakerChips
+        speakers={recording.speakers}
+        noteId={recording.noteId}
+        editable={true}
+        counts={liveSegCounts}
+        people={recording.isLive ? livePeople : undefined}
+        onPick={recording.isLive ? (sid, personId) => assignNoteSpeakerPerson(recording.noteId, sid, personId) : undefined}
+        attendees={recording.isLive ? liveAttendees : undefined}
+        onUnlink={recording.isLive ? (sid) => clearNoteSpeakerPerson(recording.noteId, sid) : undefined}
+        onDelete={recording.isLive ? (sid) => deleteNoteSpeaker(recording.noteId, sid) : undefined}
+      />
     {/if}
   </div>
 

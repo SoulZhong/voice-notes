@@ -43,12 +43,18 @@ impl SpeakerTable {
         }
     }
 
-    #[cfg(test)]
+    /// 从内存表构造(录制中的 NoteWriter 自持说话人表,借这里的规则改它,
+    /// 不经 read/flush 搬运——落盘由 writer 自己负责)。
     pub(crate) fn from_map(map: BTreeMap<String, SpeakerMeta>) -> Self {
         Self {
             saved: map.clone(),
             map,
         }
+    }
+
+    /// 交还内存表(与 from_map 配对)。
+    pub(crate) fn into_map(self) -> BTreeMap<String, SpeakerMeta> {
+        self.map
     }
 
     /// 有变化才原子落盘。事务入口在收尾时调一次;需要"先入表再改段"写序的路径
