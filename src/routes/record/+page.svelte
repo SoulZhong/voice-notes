@@ -30,7 +30,6 @@
     assignNoteSpeakerPerson,
     clearNoteSpeakerPerson,
     deleteNoteSpeaker,
-    personAddEmail,
     type NoteMeta,
   } from "$lib/notes";
   import { listPeople, type PersonSummary } from "$lib/people";
@@ -335,19 +334,8 @@
     }
     return c;
   });
-  /** 指认学习回路(同笔记页):用拼音邮箱参会人完成指认后,把邮箱记到该人档案。
-      以盘上表为准取 person_id(speakers 事件可能还没到)。 */
-  async function liveAttendeeUsed(sid: string, email: string) {
-    const nid = recording.noteId;
-    if (!email || !nid) return;
-    try {
-      const fresh = await getNote(nid);
-      const pid = fresh.speakers?.[sid]?.person_id;
-      if (pid) await personAddEmail(pid, email);
-    } catch {
-      /* 学习回路失败不打扰:下次指认还有机会 */
-    }
-  }
+  // 指认学习回路(把拼音邮箱记到人物档案)录制中不做:它写声纹库,而录音中声纹库禁写——
+  // 停录 finalize 也要写库,并发写会互相覆盖。录完后在笔记页指认照常学习。
 
   function beginEdit(line: Line) {
     speakerMenuSeq = null;
@@ -1101,7 +1089,6 @@
         people={recording.isLive ? livePeople : undefined}
         onPick={recording.isLive ? (sid, personId) => assignNoteSpeakerPerson(recording.noteId, sid, personId) : undefined}
         attendees={recording.isLive ? liveAttendees : undefined}
-        onAttendeeUsed={recording.isLive ? liveAttendeeUsed : undefined}
         onUnlink={recording.isLive ? (sid) => clearNoteSpeakerPerson(recording.noteId, sid) : undefined}
         onDelete={recording.isLive ? (sid) => deleteNoteSpeaker(recording.noteId, sid) : undefined}
       />
