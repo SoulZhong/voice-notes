@@ -10,6 +10,36 @@ import { saveMemoDoc, type MemoDoc } from "./memos";
 
 export type SaveOp = { text: string; ok: boolean | null; done: Promise<MemoDoc> };
 
+// ── 离页草稿:离开页面时最后一份先记进本地存储,真落盘后才清;重试耗尽(磁盘满等持续故障)
+//    也不丢,下次打开这篇时编辑器把它合回来(Codex 审出)。 ──
+export type MemoDraft = { text: string; base: string };
+const draftKey = (noteId: string) => `memoDraft.${noteId}`;
+export function stashDraft(noteId: string, d: MemoDraft) {
+  try {
+    localStorage.setItem(draftKey(noteId), JSON.stringify(d));
+  } catch {
+    /* 存不了就只靠队列重试 */
+  }
+}
+export function takeDraft(noteId: string): MemoDraft | null {
+  try {
+    const raw = localStorage.getItem(draftKey(noteId));
+    if (!raw) return null;
+    const d = JSON.parse(raw) as MemoDraft;
+    return typeof d?.text === "string" && typeof d?.base === "string" ? d : null;
+  } catch {
+    return null;
+  }
+}
+export function clearDraft(noteId: string, text?: string) {
+  try {
+    // 只清自己那份:期间若又记了更新的草稿,留着
+    if (text === undefined || takeDraft(noteId)?.text === text) localStorage.removeItem(draftKey(noteId));
+  } catch {
+    /* ignore */
+  }
+}
+
 type Queue = { chain: Promise<unknown>; pending: number };
 const queues = new Map<string, Queue>();
 

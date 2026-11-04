@@ -177,15 +177,29 @@ fn only_inserted(o: &[String], x: &[String]) -> Option<(Vec<String>, Vec<String>
     (k == o.len()).then_some((before, rest))
 }
 
+/// 把另一侧多出来的行接在后面:已在 `have` 里的非空行不重复;区间内部的空行保留(段落边界,
+/// 去掉会让两段粘成一段、前一段的时间注释混进正文,Codex 审出),只修剪首尾空行。
 fn push_extra(out: &mut Vec<String>, extra: impl IntoIterator<Item = String>, have: &[String]) {
-    let extra: Vec<String> = extra.into_iter().filter(|l| !l.trim().is_empty() && !have.contains(l)).collect();
-    if extra.is_empty() {
+    let mut add: Vec<String> = Vec::new();
+    for l in extra {
+        if l.trim().is_empty() {
+            if add.last().is_some_and(|x| !x.trim().is_empty()) {
+                add.push(String::new());
+            }
+        } else if !have.contains(&l) {
+            add.push(l);
+        }
+    }
+    while add.last().is_some_and(|x| x.trim().is_empty()) {
+        add.pop();
+    }
+    if add.is_empty() {
         return;
     }
     if out.last().is_some_and(|l| !l.trim().is_empty()) {
         out.push(String::new());
     }
-    out.extend(extra);
+    out.extend(add);
 }
 
 /// 一段三方都不稳定的区间怎么定:
@@ -893,6 +907,11 @@ mod tests {
         assert_eq!(merge3("A\n\nB\n", "B\n\nC\n", "A\n\nC\n"), "B\n\nC\n");
         // 两边都改了同一行:都留,不丢字
         assert_eq!(merge3("a\n", "a1\n", "a2\n"), "a1\n\na2\n");
+        // 远端把标记补成字,本地在其后粘了两段:两段之间的空行保留
+        assert_eq!(
+            merge3("📍 <!-- 00:40 -->\n", "📍 <!-- 00:40 -->\n\n一 <!-- 00:41 -->\n\n二 <!-- 00:42 -->\n", "补 <!-- 00:40 -->\n"),
+            "补 <!-- 00:40 -->\n\n一 <!-- 00:41 -->\n\n二 <!-- 00:42 -->\n"
+        );
     }
 
     #[test]

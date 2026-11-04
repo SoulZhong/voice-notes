@@ -51,8 +51,15 @@ function onlyInserted(o: readonly string[], x: readonly string[]): [string[], st
   return k === o.length ? [before, rest] : null;
 }
 
+/** 把另一侧多出来的行接在后面:已有的非空行不重复;区间内部空行保留(段落边界),只修剪首尾。 */
 function pushExtra(out: string[], extra: readonly string[], have: readonly string[]) {
-  const add = extra.filter((l) => l.trim() !== "" && !have.includes(l));
+  const add: string[] = [];
+  for (const l of extra) {
+    if (l.trim() === "") {
+      if (add.length > 0 && add[add.length - 1].trim() !== "") add.push("");
+    } else if (!have.includes(l)) add.push(l);
+  }
+  while (add.length > 0 && add[add.length - 1].trim() === "") add.pop();
   if (add.length === 0) return;
   const last = out[out.length - 1];
   if (last !== undefined && last.trim() !== "") out.push("");

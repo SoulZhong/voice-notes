@@ -15,7 +15,7 @@
   import { t } from "$lib/i18n/index.svelte";
   import { fmtClock, memoDoc, MEMO_DOC_MAX_CHARS, onMemosChanged, seqOf, type MemoDoc as Doc } from "$lib/memos";
   import { mergeMemoDoc } from "$lib/memoDocMerge";
-  import { memoDocIdle, saveSerial, type SaveOp } from "$lib/memoDocSession";
+  import { clearDraft, memoDocIdle, saveSerial, stashDraft, takeDraft, type SaveOp } from "$lib/memoDocSession";
   import { memoDocPlugin, SKIP_STAMP, stampSchemaConfig } from "$lib/editor/memoDocSchema";
 
   let {
@@ -154,6 +154,7 @@
     inflight = op;
     try {
       const doc = await op.done;
+      clearDraft(myId);
       if (destroyed || !editor) return;
       error = "";
       // 回执是后端锁内合并后的结果(含保存期间别处的改动);这期间新打的字接到它上面
@@ -252,24 +253,34 @@
     await unlisten;
     // 上一个编辑器实例离开时交的最后一份先落定,再取盘;取盘期间若有更新的事件,再取一次。
     await memoDocIdle(myId);
-    try {
-      for (let i = 0; i < 3; i++) {
+    // 取盘失败(锁超时/临时 IO)不放弃:退避重试,成功取得一致快照后才开放编辑(Codex 审出)
+    for (let attempt = 0; !destroyed; attempt++) {
+      try {
         const doc = await memoDoc(myId);
         if (destroyed) return;
         if (seqOf(doc) >= seqOf(base)) {
           setBase(doc);
           setContent(doc.text);
         }
-        if (wantSeq <= seqOf(base)) break;
+        error = "";
+        break;
+      } catch (e) {
+        error = t("memo.failed", { e: String(e) });
+        await new Promise((r) => setTimeout(r, Math.min(8000, 500 * 2 ** attempt)));
       }
-      loaded = true;
-      v.setProps({});
-      // 剩余的「已知更新版本」交给持续同步(不以固定补读次数收尾);盘面写法不同则存一次规整版
-      void sync();
-      if (baseSer !== base.text) scheduleSave();
-    } catch (e) {
-      error = t("memo.failed", { e: String(e) });
     }
+    if (destroyed) return;
+    loaded = true;
+    v.setProps({});
+    // 上次离页没存上的草稿:合回来再存
+    const draft = takeDraft(myId);
+    if (draft) {
+      const merged = mergeMemoDoc(normalize(draft.base), normalize(draft.text), baseSer);
+      if (merged !== serialize()) setContent(merged);
+    }
+    // 剩余的「已知更新版本」交给持续同步;盘面写法不同或有草稿就存一次
+    void sync();
+    if (serialize() !== base.text) scheduleSave();
   });
 
   onDestroy(() => {
@@ -284,7 +295,10 @@
         // 若成功且内容相同,后端判无变化不写)。没在途:与盘面原文不同才交。
         const need = inflight ? true : text !== base.text;
         if (need && text.length <= MEMO_DOC_MAX_CHARS) {
-          void saveSerial(myId, text, { base: base.text, prev: inflight }, true).done.catch(() => {});
+          stashDraft(myId, { text, base: base.text });
+          void saveSerial(myId, text, { base: base.text, prev: inflight }, true)
+            .done.then(() => clearDraft(myId, text))
+            .catch(() => {});
         }
       }
       void editor.destroy();
