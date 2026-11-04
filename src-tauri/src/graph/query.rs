@@ -4,7 +4,9 @@ use crate::store::{self, RelationPredicate, VoiceprintStore, Voiceprints};
 use rusqlite::types::Value;
 use serde::Deserialize;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 const DEGRADED_MESSAGE: &str = "知识整理记录损坏，当前显示上次可用索引";
 
@@ -26,8 +28,30 @@ struct LedgerView {
 
 pub(crate) struct ReadContext {
     connection: rusqlite::Connection,
-    ledger: LedgerView,
-    people: Voiceprints,
+    ledger: Arc<LedgerView>,
+    people: Arc<Voiceprints>,
+}
+
+/// 图谱上共现边的默认门槛:两端实体至少共同出现在这么多篇笔记里才算一条边。
+/// 只共享 1 篇的边占真实库的 99%(一篇笔记几百个术语两两成边),几乎不带信息;
+/// 它们只在「展开」单个实体时按需取(见 `graph::entity_neighbors`)。
+pub(crate) const MIN_SHARED_NOTES: i64 = 2;
+
+/// 知识账本(7MB 级)解析 + 校验 + 重放一次要上百毫秒,图谱页打开要读好几次。
+/// 按「数据根 + 账本文件 + 声纹库文件」的修改时间与大小缓存校验结果:任一文件变了
+/// (保存治理操作、改声纹库)键就变,下一次读自然重建;不需要写路径主动失效。
+type FileStamp = Option<(SystemTime, u64)>;
+#[derive(PartialEq, Eq)]
+struct LedgerCacheKey {
+    root: PathBuf,
+    ledger: FileStamp,
+    people: FileStamp,
+}
+static LEDGER_CACHE: Mutex<Option<(LedgerCacheKey, Arc<LedgerView>, Arc<Voiceprints>)>> = Mutex::new(None);
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 #[derive(Debug)]
@@ -57,10 +81,39 @@ fn ledger_view(data_root: &Path, people: &Voiceprints) -> LedgerView {
     }
 }
 
+/// 后台预热知识账本缓存(启动后调用一次),见 [`open_read_context`]。
+pub(crate) fn prewarm_read_context(data_root: &Path) -> anyhow::Result<()> {
+    open_read_context(data_root).map(|_| ())
+}
+
 pub(crate) fn open_read_context(data_root: &Path) -> anyhow::Result<ReadContext> {
-    let people = VoiceprintStore::new(data_root.to_path_buf()).load();
+    let key = LedgerCacheKey {
+        root: data_root.to_path_buf(),
+        ledger: file_stamp(&data_root.join(overrides::KNOWLEDGE_FILE)),
+        people: file_stamp(&data_root.join("voiceprints.json")),
+    };
+    let cached = {
+        let guard = LEDGER_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .as_ref()
+            .filter(|(cached_key, _, _)| *cached_key == key)
+            .map(|(_, ledger, people)| (Arc::clone(ledger), Arc::clone(people)))
+    };
+    let (ledger, people) = match cached {
+        Some(hit) => hit,
+        None => {
+            let people = Arc::new(VoiceprintStore::new(data_root.to_path_buf()).load());
+            let ledger = Arc::new(ledger_view(data_root, &people));
+            // 文件读不到(stamp 为 None)时不缓存:下一次再试,别把一次瞬时失败钉住。
+            if key.ledger.is_some() {
+                let mut guard = LEDGER_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                *guard = Some((key, Arc::clone(&ledger), Arc::clone(&people)));
+            }
+            (ledger, people)
+        }
+    };
     Ok(ReadContext {
-        ledger: ledger_view(data_root, &people),
+        ledger,
         connection: index::open_readonly(data_root)?,
         people,
     })
@@ -361,17 +414,25 @@ fn query_cooccurrence_edges(
     connection: &rusqlite::Connection,
     live_nodes: &BTreeSet<String>,
 ) -> anyhow::Result<Vec<ipc::EdgeRow>> {
+    // 共享 ≥ N 篇的边,两端实体都必须至少出现在 N 篇里:先把只出现 1 篇的实体
+    // (真实库约 95%)剔掉再自连接,连接规模从几十万对降到几千对。
     let mut statement = connection.prepare(
-        "SELECT left_entity.entity_id, right_entity.entity_id, count(*) \
-         FROM note_entities left_entity \
-         JOIN note_entities right_entity \
+        "WITH multi AS MATERIALIZED ( \
+           SELECT note_id, entity_id FROM note_entities \
+           WHERE entity_id IN ( \
+             SELECT entity_id FROM note_entities GROUP BY entity_id \
+             HAVING count(DISTINCT note_id) >= ?1)) \
+         SELECT left_entity.entity_id, right_entity.entity_id, count(DISTINCT left_entity.note_id) \
+         FROM multi left_entity \
+         JOIN multi right_entity \
            ON right_entity.note_id = left_entity.note_id \
           AND right_entity.entity_id > left_entity.entity_id \
          GROUP BY left_entity.entity_id, right_entity.entity_id \
+         HAVING count(DISTINCT left_entity.note_id) >= ?1 \
          ORDER BY left_entity.entity_id, right_entity.entity_id",
     )?;
     let edges = statement
-        .query_map([], |row| {
+        .query_map([MIN_SHARED_NOTES], |row| {
             Ok(ipc::EdgeRow {
                 a: row.get(0)?,
                 b: row.get(1)?,

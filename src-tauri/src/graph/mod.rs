@@ -464,17 +464,31 @@ pub(crate) fn related_notes(data_root: &Path, note_id: &str) -> anyhow::Result<V
 
 /// 实体共现边:两实体在同一笔记出现即连边,边权 = 共同出现的笔记数。`a < b` 去重,
 /// 降序返回。力导图用。孤立实体(无任何共现)不产生边,由列表视图承载。
-pub(crate) fn cooccurrence_edges(data_root: &Path) -> anyhow::Result<Vec<(String, String, i64)>> {
+/// 共现边:两端实体至少共同出现在 `min_shared` 篇笔记里。图谱页用
+/// [`query::MIN_SHARED_NOTES`];只共享 1 篇的边按需走 [`entity_neighbors`]。
+/// 先剔掉出现篇数不足 `min_shared` 的实体再自连接(真实库 7408 个实体里约 95% 只出现 1 篇),
+/// 否则全量两两配对是几十万行的 GROUP BY。MATERIALIZED 必须写:不物化时 SQLite 把 CTE
+/// 内联进自连接两侧,真实库实测 134ms,物化后 11ms。
+pub(crate) fn cooccurrence_edges(
+    data_root: &Path,
+    min_shared: i64,
+) -> anyhow::Result<Vec<(String, String, i64)>> {
     let conn = open(data_root)?;
     let mut stmt = conn.prepare(
-        "SELECT ne1.entity_id, ne2.entity_id, COUNT(DISTINCT ne1.note_id) AS shared
-         FROM note_entities ne1
-         JOIN note_entities ne2 ON ne1.note_id = ne2.note_id AND ne1.entity_id < ne2.entity_id
+        "WITH multi AS MATERIALIZED (
+           SELECT note_id, entity_id FROM note_entities
+           WHERE entity_id IN (
+             SELECT entity_id FROM note_entities GROUP BY entity_id
+             HAVING COUNT(DISTINCT note_id) >= ?1))
+         SELECT ne1.entity_id, ne2.entity_id, COUNT(DISTINCT ne1.note_id) AS shared
+         FROM multi ne1
+         JOIN multi ne2 ON ne1.note_id = ne2.note_id AND ne1.entity_id < ne2.entity_id
          GROUP BY ne1.entity_id, ne2.entity_id
+         HAVING shared >= ?1
          ORDER BY shared DESC, ne1.entity_id ASC, ne2.entity_id ASC",
     )?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
+        .query_map([min_shared], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -495,19 +509,57 @@ pub(crate) fn note_nodes(data_root: &Path) -> anyhow::Result<Vec<(String, i64, i
 
 /// 笔记共享边(文章视角,实体共现图的对偶):两篇笔记共享实体即连边,边权 = 共享的
 /// 不同实体数。`a < b` 去重,降序返回。只共享 0 个实体的笔记对不产生边。
-pub(crate) fn note_shared_edges(data_root: &Path) -> anyhow::Result<Vec<(String, String, i64)>> {
+/// 文章视角与实体视角同一口径:只返回共享至少 `min_shared` 个实体的笔记对。
+pub(crate) fn note_shared_edges(
+    data_root: &Path,
+    min_shared: i64,
+) -> anyhow::Result<Vec<(String, String, i64)>> {
     let conn = open(data_root)?;
     let mut stmt = conn.prepare(
         "SELECT ne1.note_id, ne2.note_id, COUNT(DISTINCT ne1.entity_id) AS shared
          FROM note_entities ne1
          JOIN note_entities ne2 ON ne1.entity_id = ne2.entity_id AND ne1.note_id < ne2.note_id
          GROUP BY ne1.note_id, ne2.note_id
+         HAVING shared >= ?1
          ORDER BY shared DESC, ne1.note_id ASC, ne2.note_id ASC",
     )?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
+        .query_map([min_shared], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// 展开一个实体:按共享篇数从高到低取它的前 `limit` 个邻居,跳过 `exclude` 里的
+/// (画布上已有的)。不设共享篇数门槛——强邻居不够时由只共享 1 篇的补上,
+/// 只出现过一场会的实体展开也不会是空的。返回 `(实体, 邻居, 共享篇数)`。
+pub(crate) fn entity_neighbors(
+    data_root: &Path,
+    entity_id: &str,
+    exclude: &std::collections::HashSet<String>,
+    limit: usize,
+) -> anyhow::Result<Vec<(String, String, i64)>> {
+    let conn = open(data_root)?;
+    let mut stmt = conn.prepare(
+        "SELECT other.entity_id, COUNT(DISTINCT me.note_id) AS shared
+         FROM note_entities me
+         JOIN note_entities other ON other.note_id = me.note_id AND other.entity_id <> me.entity_id
+         WHERE me.entity_id = ?1
+         GROUP BY other.entity_id
+         ORDER BY shared DESC, other.entity_id ASC",
+    )?;
+    let mut out = Vec::new();
+    let rows = stmt.query_map([entity_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (other, shared) = row?;
+        if exclude.contains(&other) {
+            continue;
+        }
+        out.push((entity_id.to_string(), other, shared));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// 两个实体同时出现的笔记。用于点击实体图的共现边后按需展示证据。
@@ -788,12 +840,42 @@ mod tests {
         upsert_note(root.path(), "n1", &mk(&["A", "B"])).unwrap();
         upsert_note(root.path(), "n2", &mk(&["A", "B"])).unwrap();
         upsert_note(root.path(), "n3", &mk(&["A", "C"])).unwrap();
-        let edges = cooccurrence_edges(root.path()).unwrap();
+        let edges = cooccurrence_edges(root.path(), 1).unwrap();
         // (e:a,e:b) 共现 2 篇;(e:a,e:c) 共现 1 篇;B、C 从不共现
         assert!(edges.iter().any(|(a, b, w)| a == "e:a" && b == "e:b" && *w == 2), "A,B 共享 2");
         assert!(edges.iter().any(|(a, b, w)| a == "e:a" && b == "e:c" && *w == 1), "A,C 共享 1");
         assert!(!edges.iter().any(|(a, b, _)| (a == "e:b" && b == "e:c") || (a == "e:c" && b == "e:b")), "B,C 不共现");
         assert!(edges.iter().all(|(a, b, _)| a < b), "a<b 去重,不出现反向对");
+
+        // 图谱默认门槛:只留共享 ≥2 篇的,A,C(只共享 1 篇)不下发。
+        let strong = cooccurrence_edges(root.path(), 2).unwrap();
+        assert_eq!(strong, vec![("e:a".to_string(), "e:b".to_string(), 2)]);
+    }
+
+    #[test]
+    fn entity_neighbors_rank_by_shared_notes_and_fill_with_single_note_edges() {
+        let root = tempfile::tempdir().unwrap();
+        let mk = |names: &[&str]| doc_with(
+            names.iter().enumerate().map(|(i, nm)| ent(&format!("ent_{}", i + 1), "term", nm, &[])).collect(),
+            vec![para("x", vec![])],
+        );
+        // A 与 B 共享 2 篇,与 C、D 各共享 1 篇。
+        upsert_note(root.path(), "n1", &mk(&["A", "B", "C"])).unwrap();
+        upsert_note(root.path(), "n2", &mk(&["A", "B", "D"])).unwrap();
+        let none = std::collections::HashSet::new();
+        let got = entity_neighbors(root.path(), "e:a", &none, 2).unwrap();
+        // 强邻居排前面;不足 limit 时用只共享 1 篇的补(按 id 稳定排序)
+        assert_eq!(
+            got,
+            vec![
+                ("e:a".to_string(), "e:b".to_string(), 2),
+                ("e:a".to_string(), "e:c".to_string(), 1),
+            ],
+        );
+        // 画布上已有的跳过,继续往下取
+        let exclude: std::collections::HashSet<String> = ["e:b".to_string()].into_iter().collect();
+        let got = entity_neighbors(root.path(), "e:a", &exclude, 8).unwrap();
+        assert_eq!(got.iter().map(|(_, b, _)| b.as_str()).collect::<Vec<_>>(), vec!["e:c", "e:d"]);
     }
 
     #[test]
@@ -816,12 +898,15 @@ mod tests {
         assert_eq!(n3.1, 2, "n3 含 A、C 两个实体");
 
         // 边:两篇笔记共享实体即连边,边权=共享的不同实体数。
-        let edges = note_shared_edges(root.path()).unwrap();
+        let edges = note_shared_edges(root.path(), 1).unwrap();
         // n1、n2 都是 {A,B} → 共享 2 个实体;n1、n3 共享 A → 1;n2、n3 共享 A → 1。
         assert!(edges.iter().any(|(a, b, w)| a == "n1" && b == "n2" && *w == 2), "n1,n2 共享 2");
         assert!(edges.iter().any(|(a, b, w)| a == "n1" && b == "n3" && *w == 1), "n1,n3 共享 1");
         assert!(edges.iter().any(|(a, b, w)| a == "n2" && b == "n3" && *w == 1), "n2,n3 共享 1");
         assert!(edges.iter().all(|(a, b, _)| a < b), "a<b 去重");
+        // 默认门槛下只剩 n1,n2(共享 2 个实体)
+        let strong = note_shared_edges(root.path(), 2).unwrap();
+        assert_eq!(strong, vec![("n1".to_string(), "n2".to_string(), 2)]);
 
         let shared_entities = shared_entities_for_notes(root.path(), "n1", "n2").unwrap();
         assert_eq!(

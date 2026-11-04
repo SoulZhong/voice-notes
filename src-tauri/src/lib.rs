@@ -5294,7 +5294,8 @@ fn queue_person_graph_rebuild(
     )
 }
 
-#[tauri::command]
+// 只读查询,跑在异步线程池:同步命令会占住主线程,加载期间整个窗口卡住(#732)。
+#[tauri::command(async)]
 fn semantic_graph(
     app: AppHandle,
     filter: graph::query::GraphFilter,
@@ -5304,7 +5305,8 @@ fn semantic_graph(
         .map_err(|error| graph_read_error("semantic_graph", error))
 }
 
-#[tauri::command]
+// 只读查询,跑在异步线程池:同步命令会占住主线程,加载期间整个窗口卡住(#732)。
+#[tauri::command(async)]
 fn semantic_entity_detail(
     app: AppHandle,
     entity_id: String,
@@ -5316,7 +5318,8 @@ fn semantic_entity_detail(
         .map_err(|error| graph_read_error("semantic_entity_detail", error))
 }
 
-#[tauri::command]
+// 只读查询,跑在异步线程池:同步命令会占住主线程,加载期间整个窗口卡住(#732)。
+#[tauri::command(async)]
 fn relation_detail(
     app: AppHandle,
     relation_id: String,
@@ -5404,7 +5407,8 @@ fn undo_knowledge_operation(
     queue_knowledge_rebuild(&app, root, result)
 }
 
-#[tauri::command]
+// 只读查询,跑在异步线程池:同步命令会占住主线程,加载期间整个窗口卡住(#732)。
+#[tauri::command(async)]
 fn graph_entities(app: AppHandle) -> Result<Vec<ipc::EntitySummary>, String> {
     let Ok(root) = data_root(&app) else { return Ok(vec![]) };
     let rows = match graph::list_entities(&root) {
@@ -5429,7 +5433,8 @@ fn graph_entities(app: AppHandle) -> Result<Vec<ipc::EntitySummary>, String> {
 }
 
 /// 力导图数据:节点(全部实体)+ 共现边。任一子查询失败 → 该部分空,整体不 Err。
-#[tauri::command]
+// 只读查询,跑在异步线程池:同步命令会占住主线程,加载期间整个窗口卡住(#732)。
+#[tauri::command(async)]
 fn graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
     let Ok(root) = data_root(&app) else { return Ok(ipc::GraphData { nodes: vec![], edges: vec![] }) };
     let nodes = graph::list_entities(&root)
@@ -5448,7 +5453,7 @@ fn graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
             mention_total: r.mention_total,
         })
         .collect();
-    let edges = graph::cooccurrence_edges(&root)
+    let edges = graph::cooccurrence_edges(&root, graph::query::MIN_SHARED_NOTES)
         .unwrap_or_else(|e| {
             eprintln!("graph_data: 共现边查询失败,返回空: {e}");
             vec![]
@@ -5462,7 +5467,8 @@ fn graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
 /// 文章视角力导图:节点=笔记(name=标题,note_count 字段复用为「该笔记含的实体数」
 /// 驱动节点大小),边=两篇笔记共享的不同实体数。实体视角(graph_data)的对偶。
 /// 任一子查询失败 → 该部分空,整体不 Err。没标题的笔记(已删/找不到)跳过。
-#[tauri::command]
+// 只读查询,跑在异步线程池:同步命令会占住主线程,加载期间整个窗口卡住(#732)。
+#[tauri::command(async)]
 fn note_graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
     let Ok(root) = data_root(&app) else { return Ok(ipc::GraphData { nodes: vec![], edges: vec![] }) };
     let raw_nodes = graph::note_nodes(&root).unwrap_or_else(|e| {
@@ -5489,7 +5495,7 @@ fn note_graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
         .collect();
     // 边两端都得是有标题的笔记(跳过被过滤掉的节点),否则力导图会有指向不存在节点的悬空边。
     let live: std::collections::HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
-    let edges = graph::note_shared_edges(&root)
+    let edges = graph::note_shared_edges(&root, graph::query::MIN_SHARED_NOTES)
         .unwrap_or_else(|e| {
             eprintln!("note_graph_data: 笔记共享边查询失败,返回空: {e}");
             vec![]
@@ -5503,7 +5509,24 @@ fn note_graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
 
 /// 点击图谱共现边时按需读取连接原因。perspective=note 返回共用实体；
 /// perspective=entity 返回同时提到两个实体的笔记标题。
-#[tauri::command]
+/// 展开一个实体:它排名靠前的 `limit` 个邻居(跳过画布上已有的 `exclude`),
+/// 共享篇数从高到低,不足时用只共享 1 篇的补。图谱页默认只拿共享 ≥2 篇的边,
+/// 这条命令是只共享 1 篇的边唯一的下发口(#732)。
+#[tauri::command(async)]
+fn graph_neighbors(
+    app: AppHandle,
+    entity_id: String,
+    exclude: Vec<String>,
+    limit: usize,
+) -> Result<Vec<ipc::EdgeRow>, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let exclude: std::collections::HashSet<String> = exclude.into_iter().collect();
+    let rows = graph::entity_neighbors(&root, &entity_id, &exclude, limit.min(64)).map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(a, b, weight)| ipc::EdgeRow { a, b, weight }).collect())
+}
+
+// 只读查询,跑在异步线程池:同步命令会占住主线程,加载期间整个窗口卡住(#732)。
+#[tauri::command(async)]
 fn graph_edge_detail(
     app: AppHandle,
     a: String,
@@ -9336,6 +9359,17 @@ pub fn run() {
             }
             // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
             mcp::uds::spawn_listener(handle.clone());
+            // 图谱读上下文预热(#732):知识账本解析 + 校验首次约 150ms,启动后 5 秒在后台
+            // 做掉,第一次点开图谱就直接命中缓存。失败无所谓,打开图谱时会再读。
+            {
+                let handle = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    if let Ok(root) = data_root(&handle) {
+                        let _ = graph::query::prewarm_read_context(&root);
+                    }
+                });
+            }
             // 音频自动保留期(spec §5):到期笔记仅清音频轨,转写/精修稿永留。启动后台跑一次,
             // 失败仅打日志(容量治理是增值层,绝不挡启动)。录制中笔记天然不在清理范围——
             // 复用 purge_audio 命令的同一份实现 purge_audio_older_than,其活动笔记豁免
@@ -9464,6 +9498,7 @@ pub fn run() {
             note_related,
             graph_entities,
             graph_data,
+            graph_neighbors,
             semantic_graph,
             semantic_entity_detail,
             relation_detail,

@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { goto, replaceState } from "$app/navigation";
   import { page } from "$app/stores";
   import {
     graphData,
     graphEdgeDetail,
+    graphNeighbors,
     kindLabel,
     type GraphData,
     type GraphEdgeDetailItem,
@@ -29,6 +30,7 @@
     ensureBackboneEdge,
     filterSemanticGraph,
     legacyFallbackGraph,
+    mergeCooccurrenceEdges,
     nextExpandedIds,
     relationLabel,
     resolveGraphRefreshState,
@@ -62,6 +64,13 @@
   const BACKBONE_NODE_LIMIT = 80;
 
   let graph = $state<GraphData>({ nodes: [], edges: [] });
+  /** 展开时按需取回的共现边(含只共享 1 篇的)。与 `graph` 分开存:刷新重拉 `graph`
+   *  时不丢已展开出来的边;收起到主干时清空(#732)。 */
+  let expandedEdges = $state<GraphData["edges"]>([]);
+  const cooccurrenceGraph = $derived<GraphData>({
+    nodes: graph.nodes,
+    edges: mergeCooccurrenceEdges(graph.edges, expandedEdges),
+  });
   let semantic = $state<SemanticGraphData>(emptySemantic());
   let knowledgeFilter = $state<KnowledgeFilter>({
     ...DEFAULT_KNOWLEDGE_FILTER,
@@ -121,7 +130,7 @@
     if (!shouldUseLegacyFallback(globalSemanticPresence, semantic, semanticRequestFailed)) {
       return semantic;
     }
-    return legacyFallbackGraph(semantic, graph);
+    return legacyFallbackGraph(semantic, cooccurrenceGraph);
   });
   const filteredSemantic = $derived(filterSemanticGraph(usableSemantic, effectiveGraphFilter));
   const renderedNodes = $derived(filteredSemantic.nodes.filter((node) => visibleIds.has(node.id)));
@@ -145,7 +154,7 @@
       semantic.semantic_edges.length === 0,
   );
   const semanticFailureHasLegacy = $derived(
-    viewEdges(legacyFallbackGraph(semantic, graph), effectiveGraphFilter).length > 0,
+    viewEdges(legacyFallbackGraph(semantic, cooccurrenceGraph), effectiveGraphFilter).length > 0,
   );
   const semanticStatusMessage = $derived(
     semanticRequestFailed
@@ -235,7 +244,7 @@
       if (generation !== graphGeneration) return;
       console.warn("semantic graph request failed", cause);
       semanticRequestFailed = true;
-      const fallback = legacyFallbackGraph(semantic, graph);
+      const fallback = legacyFallbackGraph(semantic, cooccurrenceGraph);
       if (mode === "preserve-view") {
         const filteredFallback = filterSemanticGraph(fallback, filter);
         const refreshed = resolveGraphRefreshState(
@@ -384,6 +393,17 @@
     if (matches.some((id) => !visibleIds.has(id))) visibleIds = new Set([...visibleIds, ...matches]);
   });
 
+  // 从侧栏搜索点中一个不在画布上的实体:放上画布并展开一次(#732)。只读 selected 与
+  // 加载状态;visibleIds 在 untrack 里读,否则展开写回 visibleIds 会让本 effect 自己重跑。
+  $effect(() => {
+    const id = selected;
+    const ready = loaded && !semanticLoading;
+    if (!id || !ready || debugFixtureRequested) return;
+    untrack(() => {
+      if (!visibleIds.has(id)) revealFrom(id);
+    });
+  });
+
   $effect(() => {
     const id = selected;
     if (!id) {
@@ -437,8 +457,25 @@
   function revealFrom(id: string) {
     const depth = (expansionDepth.get(id) ?? 0) + 1;
     expansionDepth = new Map(expansionDepth).set(id, depth);
+    if (shouldUseLegacyFallback(globalSemanticPresence, semantic, semanticRequestFailed)) {
+      // 只有共现边时:邻居不在前端(默认只下发共享 ≥2 篇的边),向后端要前 8 个,
+      // 跳过画布上已有的;每点一次再往下取 8 个(#732)。
+      void revealCooccurrenceNeighbors(id);
+      return;
+    }
     const revealed = nextExpandedIds(new Set([id]), filteredSemantic.semantic_edges, depth, 8);
     visibleIds = new Set([...visibleIds, ...revealed]);
+  }
+
+  async function revealCooccurrenceNeighbors(id: string) {
+    visibleIds = new Set([...visibleIds, id]);
+    try {
+      const edges = await graphNeighbors(id, [...visibleIds], 8);
+      expandedEdges = mergeCooccurrenceEdges(expandedEdges, edges);
+      visibleIds = new Set([...visibleIds, ...edges.map((edge) => (edge.a === id ? edge.b : edge.a))]);
+    } catch (cause) {
+      console.warn("graph neighbors request failed", cause);
+    }
   }
 
   function pickNode(id: string, _isPerson: boolean) {
@@ -538,6 +575,7 @@
 
   function collapseGraph() {
     expansionDepth = new Map();
+    expandedEdges = [];
     visibleIds = initialIds(usableSemantic);
     graphViewResetKey += 1;
   }
