@@ -22,6 +22,9 @@
   --sc-card-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
   --sc-sidebar: light-dark(#fafafa, #171717);
   --sc-sidebar-accent: light-dark(#f0f0f0, #262626);
+  /* 竖排页签轨道:比侧栏面板暗一档,选中页签(面板色)才"长"得出来 */
+  --sc-rail: light-dark(#ececec, #0c0c0c);
+  --sc-rail-hover: light-dark(#e2e2e2, #1a1a1a);
   --sc-card: light-dark(#ffffff, #171717);
 }
 
@@ -89,25 +92,36 @@
   background: var(--sc-sidebar);
   border-left-color: var(--hairline);
 }
+/* 竖排页签保留「文件夹页签」形态(用户反馈:轨道与面板同色、选中只浅一档,
+ * 「失去了页签的感觉」):轨道比面板暗一档;选中页签与面板同底、三边描边、
+ * 右侧断开盖住面板左边线,与面板连成一体;未选中退在轨道里,hover 半显影。 */
 :root[data-vn-style="shadcn"] .sidebar .tab-rail {
-  background: var(--sc-sidebar);
+  background: var(--sc-rail);
+  padding-left: 4px;
 }
 :root[data-vn-style="shadcn"] .sidebar .vtab {
-  border: 0;
-  border-radius: var(--radius-md);
-  margin: 1px 3px;
-  width: calc(100% - 6px);
-  color: var(--ink-secondary);
+  border: 1px solid transparent;
+  border-right: 0;
+  border-radius: var(--radius-md) 0 0 var(--radius-md);
+  margin: 0;
+  width: 100%;
+  color: var(--ink-faint);
 }
 :root[data-vn-style="shadcn"] .sidebar .vtab.active {
-  background: var(--sc-sidebar-accent);
-  margin-right: 3px;
+  background: var(--sc-sidebar);
+  border-color: var(--hairline-strong);
+  margin-right: -1px;
+  width: calc(100% + 1px);
   color: var(--ink);
-  font-weight: 500;
+  font-weight: 600;
+  box-shadow: -1px 0 2px 0 rgb(0 0 0 / 0.04);
+}
+:root[data-vn-style="shadcn"] .sidebar .panel {
+  border-left-color: var(--hairline-strong);
 }
 :root[data-vn-style="shadcn"] .sidebar .vtab:hover:not(.active) {
-  background: var(--sc-sidebar-accent);
-  color: var(--ink);
+  background: var(--sc-rail-hover);
+  color: var(--ink-secondary);
 }
 :root[data-vn-style="shadcn"] .sidebar .item {
   border-radius: var(--radius-md);
