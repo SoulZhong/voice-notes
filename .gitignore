@@ -1,6 +1,6 @@
 /target
 src-tauri/target/
-node_modules/
+node_modules
 *.onnx
 *.bin
 dist/
