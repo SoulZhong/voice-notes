@@ -205,9 +205,6 @@ fn cut_running(current: &mut Vec<f32>, cur_start: &mut usize, hist: &SampleHisto
     Segment { samples: head, start }
 }
 
-/// 裁剩尾巴的最短保留长度(0.4s)。
-const MIN_TAIL_SAMPLES: usize = 16000 * 400 / 1000;
-
 /// 句首补回量:VAD 判定滞后(min_speech 0.25s 起)+ 常规 pre-roll 0.3s。
 const LEAD_IN_SAMPLES: usize = 16000 * 600 / 1000;
 
@@ -281,13 +278,10 @@ impl Segmenter for SileroSegmenter {
             vad_done = true;
             let padded = pad_segment(raw, &self.history, self.padded_end);
             // 说话途中已切出过的前半截裁掉,只交剩下的。
-            let trimmed = padded.start < self.early_end;
+            // 裁剩的尾巴再短也照常交出:可能是暂停/停止前最后一个字,丢了补不回来;
+            // 识别出空文本的段下游本就会丢。
             let Some(rest) = trim_before(padded, self.early_end) else { continue };
             self.padded_end = rest.start + rest.samples.len();
-            // 裁剩的尾巴只有零点几秒(多半是补帧+一个字的尾音):单独识别只会出乱码,丢掉。
-            if trimmed && rest.samples.len() < MIN_TAIL_SAMPLES {
-                continue;
-            }
             out.extend(split_long(rest.samples, rest.start));
         }
         if vad_done {
