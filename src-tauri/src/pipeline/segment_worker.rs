@@ -218,6 +218,8 @@ pub fn run_segment_worker_with_caption(
     let mut since_partial: usize = 0;
     // 实时字幕(流式):说话期间把音频喂给字幕线程;有它就不再按间隔交整句重识别。
     let mut caption_in_speech = false;
+    // 下次开字幕流时是否补开口 pre-roll(真开口补,连续语音中途切刀不补)。
+    let mut caption_onset_preroll = true;
     // 最近一小段音频:VAD 判定「开口」总晚半拍,开口时把判定点之前的这段一并补给
     // 字幕,不然每句开头的字会被吞(定稿那边靠 pad_segment 补,同理)。
     let mut preroll: std::collections::VecDeque<f32> = std::collections::VecDeque::new();
@@ -301,6 +303,9 @@ pub fn run_segment_worker_with_caption(
         if emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate, caption.as_ref()) > 0 {
             since_partial = 0;
             caption_in_speech = false;
+            // 仍在说话 = 分段器在连续语音中途切了一刀:新字幕流从切口接着喂,
+            // 不补开口 pre-roll(那段已随上一句定稿,补了会在新预览里重复出现)。
+            caption_onset_preroll = !segmenter.in_speech();
         }
         if let Some(c) = &caption {
             preroll.extend(resampled.iter().copied());
@@ -314,14 +319,16 @@ pub fn run_segment_worker_with_caption(
                 } else if let Some(cur) = segmenter.current_partial() {
                     // 刚开口:判定点之前的一小段 + 分段器已攒下的这句开头(含本帧)一次补给字幕。
                     let before = preroll.len().saturating_sub(cur.len());
-                    let from = before.saturating_sub(CAPTION_PREROLL);
+                    let from = if caption_onset_preroll { before.saturating_sub(CAPTION_PREROLL) } else { before };
                     let mut onset: Vec<f32> = preroll.range(from..before).copied().collect();
                     onset.extend_from_slice(&cur);
                     c.audio(source, &onset);
                     caption_in_speech = true;
+                    caption_onset_preroll = true;
                 }
             } else {
                 caption_in_speech = false;
+                caption_onset_preroll = true;
             }
         } else if since_partial >= partial_interval_samples {
             since_partial = 0;

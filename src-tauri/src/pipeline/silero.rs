@@ -11,6 +11,13 @@ pub struct SileroSegmenter {
     history: SampleHistory,
     /// 上一段(含补帧)的绝对末样本号:pre-roll 的不重叠钳制基准。
     padded_end: usize,
+    /// current[0] 的绝对样本号(current 为空时无意义)。
+    cur_start: usize,
+    /// 说话途中已提前切出的语音截止到哪(绝对样本号,单调):VAD 之后交出整段时,
+    /// 这之前的部分已经定稿过,裁掉不重复识别。
+    early_end: usize,
+    /// 说话途中提前切出、待 take_finished 交出的段。
+    early: Vec<Segment>,
 }
 
 impl SileroSegmenter {
@@ -42,7 +49,15 @@ impl SileroSegmenter {
         // buffer_size_in_seconds：内部环形缓冲容量，给足
         let vad = sherpa_onnx::VoiceActivityDetector::create(&config, 30.0)
             .ok_or_else(|| anyhow::anyhow!("加载 Silero VAD 失败(检查 {:?})", model_path))?;
-        Ok(Self { vad, current: Vec::new(), history: SampleHistory::new(), padded_end: 0 })
+        Ok(Self {
+            vad,
+            current: Vec::new(),
+            history: SampleHistory::new(),
+            padded_end: 0,
+            cur_start: 0,
+            early_end: 0,
+            early: Vec::new(),
+        })
     }
 }
 
@@ -168,6 +183,44 @@ fn split_long(samples: Vec<f32>, start: usize) -> Vec<Segment> {
     out
 }
 
+/// 说话途中切一刀:在 current 的 [0.7*MAX, MAX] 内找最安静处切开,前半截成段交出,
+/// 后半截留作当前句。一句里的第一刀(cur_start 之前尚未交出过)从历史缓冲补 pre-roll
+/// ——VAD 判定说话有滞后,current 缺句首;之后的刀是连续语音的内部切口,不补。
+/// `prev_end`:已交出内容的绝对末样本号,补帧不越过它。
+fn cut_running(current: &mut Vec<f32>, cur_start: &mut usize, hist: &SampleHistory, prev_end: usize) -> Segment {
+    let cut = quietest_cut(current, MAX_SEGMENT_SAMPLES * 7 / 10, MAX_SEGMENT_SAMPLES);
+    let cut = if cut > 0 { cut.min(current.len()) } else { MAX_SEGMENT_SAMPLES.min(current.len()) };
+    let head: Vec<f32> = current.drain(..cut).collect();
+    let start = *cur_start;
+    *cur_start += cut;
+    if start > prev_end {
+        let want = start.saturating_sub(LEAD_IN_SAMPLES).max(prev_end);
+        let (from, pre) = hist.range(want, start);
+        if !pre.is_empty() {
+            let mut samples = pre;
+            samples.extend_from_slice(&head);
+            return Segment { samples, start: from };
+        }
+    }
+    Segment { samples: head, start }
+}
+
+/// 句首补回量:VAD 判定滞后(min_speech 0.25s 起)+ 常规 pre-roll 0.3s。
+const LEAD_IN_SAMPLES: usize = 16000 * 600 / 1000;
+
+/// 裁掉段里 `watermark` 之前的部分(已在说话途中交出过);整段都在之前则返回 None。
+fn trim_before(seg: Segment, watermark: usize) -> Option<Segment> {
+    let end = seg.start + seg.samples.len();
+    if watermark <= seg.start {
+        return Some(seg);
+    }
+    if watermark >= end {
+        return None;
+    }
+    let off = watermark - seg.start;
+    Some(Segment { samples: seg.samples[off..].to_vec(), start: watermark })
+}
+
 impl Segmenter for SileroSegmenter {
     fn in_speech(&self) -> bool {
         // current 只在 VAD 判为说话时累积,静音即清空。
@@ -187,7 +240,24 @@ impl Segmenter for SileroSegmenter {
         self.history.push(samples);
         self.vad.accept_waveform(samples);
         if self.vad.detected() {
+            if self.current.is_empty() {
+                self.cur_start = self.history.end() - samples.len();
+            }
             self.current.extend_from_slice(samples);
+            // 一口气不停顿地讲:sherpa 不强制 max_speech_duration,一句要等到第一个
+            // 1.2s 停顿才交出(实测一分钟一句)——这期间没有定稿、预览越攒越长、
+            // 录音中改不了说话人。说话途中就按上限切出定稿段。
+            if self.current.len() >= MAX_SEGMENT_SAMPLES {
+                let seg = cut_running(
+                    &mut self.current,
+                    &mut self.cur_start,
+                    &self.history,
+                    self.padded_end.max(self.early_end),
+                );
+                self.early_end = seg.start + seg.samples.len();
+                self.padded_end = self.padded_end.max(self.early_end);
+                self.early.push(seg);
+            }
         } else {
             // 静音期清空预览缓冲：避免噪声导致 is_speech 抖动却不成段时，
             // current 里残留过时片段被当成 partial 显示。
@@ -196,7 +266,8 @@ impl Segmenter for SileroSegmenter {
     }
 
     fn take_finished(&mut self) -> Vec<Segment> {
-        let mut out = Vec::new();
+        let mut out: Vec<Segment> = std::mem::take(&mut self.early);
+        let mut vad_done = false;
         while !self.vad.is_empty() {
             let Some(seg) = self.vad.front() else { break };
             let raw = Segment { samples: seg.samples().to_vec(), start: seg.start().max(0) as usize };
@@ -204,11 +275,16 @@ impl Segmenter for SileroSegmenter {
             self.vad.pop();
             // 先补帧再硬切:split_long 的内部切点两侧是连续语音,不补(补了会在
             // 切口两侧重复 0.5s 内容);补帧只发生在 VAD 判定的真实句边界。
+            vad_done = true;
             let padded = pad_segment(raw, &self.history, self.padded_end);
-            self.padded_end = padded.start + padded.samples.len();
-            out.extend(split_long(padded.samples, padded.start));
+            // 说话途中已切出过的前半截裁掉,只交剩下的。
+            // 裁剩的尾巴再短也照常交出:可能是暂停/停止前最后一个字,丢了补不回来;
+            // 识别出空文本的段下游本就会丢。
+            let Some(rest) = trim_before(padded, self.early_end) else { continue };
+            self.padded_end = rest.start + rest.samples.len();
+            out.extend(split_long(rest.samples, rest.start));
         }
-        if !out.is_empty() {
+        if vad_done {
             // 已完成的语句对应的"当前句"已结束，清空预览缓冲。
             self.current.clear();
         }
@@ -394,6 +470,95 @@ mod tests {
         let padded = pad_segment(seg, &hist, 0);
         assert_eq!(padded.start, 5_000);
         assert_eq!(padded.samples.len(), 1000);
+    }
+
+    /// 说话途中切刀:前半截成段且 ≤ 上限,当前句只留后半截,绝对时间轴衔接。
+    #[test]
+    fn cut_running_splits_current_and_advances_start() {
+        let total = MAX_SEGMENT_SAMPLES + 8000;
+        let hist = indexed_history(LEAD_IN_SAMPLES + total);
+        let start = LEAD_IN_SAMPLES; // 句首之前有足量历史
+        let mut current: Vec<f32> = (start..start + total).map(|i| i as f32).collect();
+        let mut cur_start = start;
+        let seg = cut_running(&mut current, &mut cur_start, &hist, 0);
+        // 第一刀补了句首
+        assert_eq!(seg.start, 0, "一句的第一刀应从历史补回句首");
+        let seg_end = seg.start + seg.samples.len();
+        assert_eq!(seg_end, cur_start, "切口两侧无缝衔接");
+        assert_eq!(current.first().copied(), Some(cur_start as f32), "当前句从切口开始");
+        assert_eq!(current.len() + (cur_start - start), total, "不丢样本");
+        let cut_len = cur_start - start;
+        assert!(cut_len >= MAX_SEGMENT_SAMPLES * 7 / 10 && cut_len <= MAX_SEGMENT_SAMPLES);
+        // 补帧内容是历史里的真实样本
+        assert_eq!(seg.samples[0], 0.0);
+        assert_eq!(seg.samples[LEAD_IN_SAMPLES], start as f32);
+    }
+
+    /// 同一句的后续刀(start 已等于已交出末尾)不补帧,不与前一刀重叠。
+    #[test]
+    fn cut_running_later_cut_has_no_lead_in() {
+        let hist = indexed_history(3 * MAX_SEGMENT_SAMPLES);
+        let start = MAX_SEGMENT_SAMPLES;
+        let mut current = vec![0.5f32; MAX_SEGMENT_SAMPLES];
+        let mut cur_start = start;
+        let seg = cut_running(&mut current, &mut cur_start, &hist, start);
+        assert_eq!(seg.start, start, "已交出到 start,不得再补帧重叠");
+    }
+
+    #[test]
+    fn trim_before_drops_emitted_prefix() {
+        let seg = Segment { samples: (100..200).map(|i| i as f32).collect(), start: 100 };
+        let kept = trim_before(seg.clone(), 150).unwrap();
+        assert_eq!(kept.start, 150);
+        assert_eq!(kept.samples[0], 150.0);
+        assert_eq!(kept.samples.len(), 50);
+        assert!(trim_before(seg.clone(), 200).is_none(), "整段已交出");
+        assert_eq!(trim_before(seg, 50).unwrap().start, 100, "水位在段前:原样");
+    }
+
+    /// 真实模型:不停顿的长语音(fixture 首尾拼接去掉静音)在说话途中就交出 ≤15s 的段,
+    /// 整体样本时间轴单调不重叠。
+    #[test]
+    #[ignore]
+    fn continuous_speech_is_cut_while_speaking() {
+        let model = crate::models::root().join("silero_vad.onnx");
+        let mut seg = SileroSegmenter::new(&model).expect("加载 VAD");
+        let wav = {
+            let mut r = hound::WavReader::open(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/sample_16k.wav"
+            ))
+            .expect("fixture");
+            r.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect::<Vec<f32>>()
+        };
+        // 去掉低能量帧再重复拼接 → 近似一口气不停的讲话
+        let voiced: Vec<f32> = wav
+            .chunks(320)
+            .filter(|c| c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32 > 1e-4)
+            .flatten()
+            .copied()
+            .collect();
+        let mut all = Vec::new();
+        let mut early_seen = false;
+        for _ in 0..(40 * 16000 / voiced.len().max(1) + 1) {
+            for c in voiced.chunks(320) {
+                seg.accept(c);
+                let got = seg.take_finished();
+                if !got.is_empty() && seg.in_speech() {
+                    early_seen = true;
+                }
+                all.extend(got);
+            }
+        }
+        seg.flush();
+        all.extend(seg.take_finished());
+        assert!(early_seen, "说话途中应已交出定稿段");
+        let mut prev = 0usize;
+        for s in &all {
+            assert!(s.samples.len() <= MAX_SEGMENT_SAMPLES + LEAD_IN_SAMPLES, "段长超限: {}", s.samples.len());
+            assert!(s.start >= prev, "时间轴重叠: {} < {}", s.start, prev);
+            prev = s.start + s.samples.len();
+        }
     }
 
     /// 暂停功能依赖：flush 之后继续 accept，段的 start 样本偏移必须延续而非归零。
