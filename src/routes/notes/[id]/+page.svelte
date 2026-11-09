@@ -2466,14 +2466,15 @@
 
 <svelte:window
   onclick={() => {
-    exportMenuOpen = false;
+    // 「更多」菜单(exportMenuOpen)不在这里关:它是模态 DropdownMenu,按下即打开并给 body
+    // 加 pointer-events:none,松手那次 click 落到 <html> 而不是触发钮,触发钮的
+    // stopPropagation 拦不住,这里一关就成了「点开就消失」。点外面/Esc 由组件自己关。
     editsManage = false;
     retransConfirm = false;
     entityChipsEl?.closeAll();
   }}
   onkeydown={(e) => {
     if (e.key === "Escape") {
-      exportMenuOpen = false;
       editsManage = false;
       retransConfirm = false;
     }
@@ -2617,7 +2618,7 @@
             <AiStateLabel state={aiState} label={t("notes.refine.label")} />
           </Button>
           <!-- 「更多」菜单:低频动作收拢(方案 C,2026-11-05 用户拍板):重新推断身份 / 导出 / 打开目录。
-               开合仍 bind 到 exportMenuOpen(window 的 click/Esc 关闭处理照旧生效);触发钮 stopPropagation。 -->
+               开合 bind 到 exportMenuOpen;点外面/Esc 由组件自己关(window 的 click 关闭处理不管它,见 svelte:window 注释)。 -->
           <DropdownMenu.Root bind:open={exportMenuOpen}>
             <DropdownMenu.Trigger>
               {#snippet child({ props })}

@@ -331,6 +331,31 @@ try {
     await page.screenshot({ path: join(out, "flow-record-speaker-delete.png") });
     await page.close();
   });
+
+  // 11. 笔记页「更多」菜单:按下→停一会儿→松开(真人点击的节奏)后菜单仍开着。
+  // 模态菜单按下即开并给 body 加 pointer-events:none,松手的 click 落到 <html>;
+  // 若 window 的 click 关闭处理也管这个菜单,就会「点开就消失」。
+  await scenario("笔记页更多菜单:慢点击后保持打开", async () => {
+    const { page, errors } = await openPage(`/notes/${NOTE}`, { family: "classic", mode: "light" });
+    const btn = await waitFor(() => page.$('button[aria-label="更多"]'));
+    assert(btn, "笔记页没有「更多」按钮");
+    const box = await btn.boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await sleep(150);
+    await page.mouse.up();
+    await sleep(400);
+    const open = await page.evaluate(() => !!document.querySelector('[data-slot="dropdown-menu-content"][data-state="open"]'));
+    assert(open, "松开鼠标后「更多」菜单自己关掉了");
+    await page.keyboard.press("Escape");
+    assert(
+      await waitFor(() => page.evaluate(() => !document.querySelector('[data-slot="dropdown-menu-content"]'))),
+      "Esc 没关掉「更多」菜单",
+    );
+    const bad = errors.filter((e) => !benign(e));
+    assert(bad.length === 0, "页面错误:\n" + bad.join("\n"));
+    await page.close();
+  });
 } finally {
   await browser.close();
   vite.kill();
