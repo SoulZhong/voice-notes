@@ -8650,6 +8650,7 @@ impl Drop for UnpauseOnDrop {
 fn migrate_guard(
     running: &Arc<Mutex<bool>>,
     download_running: &Arc<AtomicBool>,
+    refining: bool,
     relation_backfill_running: &Arc<AtomicBool>,
     retranscribing: &Arc<Mutex<Option<(String, String)>>>,
     mixed_regen: &Arc<Mutex<Option<String>>>,
@@ -8662,6 +8663,13 @@ fn migrate_guard(
     if *running.lock().unwrap() {
         download_running.store(false, Ordering::SeqCst);
         return Err(tr!("录制中不能迁移", "Cannot migrate while recording"));
+    }
+    if refining {
+        download_running.store(false, Ordering::SeqCst);
+        return Err(tr!(
+            "Aing 进行中,完成后再迁移",
+            "Aing is in progress; please migrate after it finishes"
+        ));
     }
     // 关系补建会读取并写回 aing.json,与迁移复制来源数据互斥。
     if relation_backfill_running.load(Ordering::SeqCst) {
@@ -8707,10 +8715,11 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
     store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
     let old_root = data_root(&app).map_err(|e| e.to_string())?;
     store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
-    // 守卫二:抢迁移/下载互斥位 + 录制/关系补建守卫。
+    // 守卫二:抢迁移/下载互斥位 + 录制/Aing/关系补建守卫。
     migrate_guard(
         &state.running,
         &state.download_running,
+        app.state::<lifecycle::LifecycleHandle>().any_refining(),
         &state.relation_backfill_running,
         &state.retranscribing,
         &state.mixed_regen,
@@ -8795,10 +8804,11 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
     let old_root = models::root();
     // 嵌套守卫同 data:目标与当前模型根互不包含。以上皆只读检查,失败无需复位。
     store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
-    // 抢迁移/下载互斥位 + 录制/关系补建守卫。
+    // 抢迁移/下载互斥位 + 录制/Aing/关系补建守卫。
     migrate_guard(
         &state.running,
         &state.download_running,
+        app.state::<lifecycle::LifecycleHandle>().any_refining(),
         &state.relation_backfill_running,
         &state.retranscribing,
         &state.mixed_regen,
@@ -8892,6 +8902,7 @@ fn purge_audio_older_than(app: &AppHandle, older_than_days: Option<u32>) -> Resu
     migrate_guard(
         &state.running,
         &state.download_running,
+        app.state::<lifecycle::LifecycleHandle>().any_refining(),
         &state.relation_backfill_running,
         &state.retranscribing,
         &state.mixed_regen,
@@ -10222,23 +10233,31 @@ mod tests {
         let rb = Arc::new(AtomicBool::new(false));
         let rt = Arc::new(Mutex::new(None));
         let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rb, &rt, &mr).is_err(), "录制中拒绝");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "录制中拒绝");
         assert!(!dl.load(Ordering::SeqCst), "拒绝后复位互斥位");
+        // Aing=true → 拒,并复位迁移互斥位。
+        let running = Arc::new(Mutex::new(false));
+        let dl = Arc::new(AtomicBool::new(false));
+        let rb = Arc::new(AtomicBool::new(false));
+        let rt = Arc::new(Mutex::new(None));
+        let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        assert!(migrate_guard(&running, &dl, true, &rb, &rt, &mr).is_err(), "Aing中拒绝");
+        assert!(!dl.load(Ordering::SeqCst), "Aing拒绝后复位互斥位");
         // download_running 已 true(下载/另一迁移在跑）→ 拒。
         let running = Arc::new(Mutex::new(false));
         let dl = Arc::new(AtomicBool::new(true));
         let rb = Arc::new(AtomicBool::new(false));
         let rt = Arc::new(Mutex::new(None));
         let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rb, &rt, &mr).is_err(), "下载/迁移进行中拒绝");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "下载/迁移进行中拒绝");
         // relation backfill=true → 拒。
         let dl = Arc::new(AtomicBool::new(false));
         let rb = Arc::new(AtomicBool::new(true));
-        assert!(migrate_guard(&running, &dl, &rb, &rt, &mr).is_err(), "关系补建中拒绝");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "关系补建中拒绝");
         assert!(!dl.load(Ordering::SeqCst), "关系补建拒绝后复位互斥位");
         // 都空闲 → 过,并已抢下互斥位(swap 置 true)。
         let rb = Arc::new(AtomicBool::new(false));
-        assert!(migrate_guard(&running, &dl, &rb, &rt, &mr).is_ok(), "空闲放行");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_ok(), "空闲放行");
         assert!(dl.load(Ordering::SeqCst), "放行后互斥位已抢占");
     }
 
@@ -10255,10 +10274,10 @@ mod tests {
         let rb = Arc::new(AtomicBool::new(false));
         let rt = Arc::new(Mutex::new(Some(("n1".to_string(), "decode".to_string()))));
         let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rb, &rt, &mr).is_err(), "重转写占槽时迁移必拒");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "重转写占槽时迁移必拒");
         assert!(!dl.load(std::sync::atomic::Ordering::SeqCst), "拒绝后必须复位互斥位");
         *rt.lock().unwrap() = None;
-        assert!(migrate_guard(&running, &dl, &rb, &rt, &mr).is_ok(), "槽清空后迁移应放行");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_ok(), "槽清空后迁移应放行");
     }
 
     /// codex 第二轮 P1:补生成槽占用时迁移必拒(worker 正 mmap 读源轨/写笔记目录,
@@ -10273,10 +10292,10 @@ mod tests {
         let rb = Arc::new(AtomicBool::new(false));
         let rt: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
         let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Some("n1".into())));
-        assert!(migrate_guard(&running, &dl, &rb, &rt, &mr).is_err(), "补生成占槽时迁移必拒");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "补生成占槽时迁移必拒");
         assert!(!dl.load(std::sync::atomic::Ordering::SeqCst), "拒绝后复位互斥位");
         *mr.lock().unwrap() = None;
-        assert!(migrate_guard(&running, &dl, &rb, &rt, &mr).is_ok(), "槽清空后迁移应放行");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_ok(), "槽清空后迁移应放行");
     }
 
     /// Fix 2(codex 第三轮,A↔R 占槽后互查闭环)的说明性单测:验证 A 侧判据本身——

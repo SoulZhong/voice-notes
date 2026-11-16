@@ -42,6 +42,7 @@ pub enum Envelope {
     /// 与 recording_status 直读同理),actor 直答自身内核态。供 rename/assign_
     /// refined_* 的「Aing 中拒绝」守卫读取(原 AppState.refining.contains)。
     QueryRefine { note_id: String, reply: Sender<bool> },
+    QueryAnyRefine { reply: Sender<bool> },
 }
 
 #[derive(Clone)]
@@ -84,6 +85,16 @@ impl LifecycleHandle {
             .send(Envelope::QueryRefine { note_id: note_id.to_string(), reply: rtx })
             .is_err()
         {
+            return false;
+        }
+        rrx.recv().unwrap_or(false)
+    }
+
+    /// Whether any note is currently in Aing. Data-directory migration uses this
+    /// coarse guard because it copies the whole notes tree.
+    pub fn any_refining(&self) -> bool {
+        let (rtx, rrx) = crossbeam_channel::bounded(1);
+        if self.tx.send(Envelope::QueryAnyRefine { reply: rtx }).is_err() {
             return false;
         }
         rrx.recv().unwrap_or(false)
@@ -802,6 +813,10 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                     // 查询直答(不进迁移表):回执后处理下一封。
                     Envelope::QueryRefine { note_id, reply } => {
                         let _ = reply.send(state.refine.is_running(&note_id));
+                        continue;
+                    }
+                    Envelope::QueryAnyRefine { reply } => {
+                        let _ = reply.send(state.refine.running_ids().next().is_some());
                         continue;
                     }
                 };
