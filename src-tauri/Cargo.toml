@@ -44,8 +44,8 @@ hound = "3.5"
 # k2-fsa 官方 Rust 绑定(sherpa-rs 已被上游弃用并指向此 crate)。默认静态链接
 # (含 onnxruntime),macOS dylib / Windows DLL 分发面随之消失。sys 与安全 crate
 # 必须同版本(同一 links 键,同一份原生库)。sys 直用原因见 asr/engine.rs 模块注释。
-sherpa-onnx = "1.13.4"
-sherpa-onnx-sys = "1.13.4"
+sherpa-onnx = "2.0.3"
+sherpa-onnx-sys = "2.0.3"
 chrono = "0.4"
 log = "0.4"
 # 实体规范名/别名/关系端点统一使用 Unicode full default case folding（如 ß == SS）。
