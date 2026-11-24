@@ -172,6 +172,11 @@ path = "src/bin/drift_stats.rs"
 required-features = ["devtools"]
 
 [[bin]]
+name = "graph_rebuild"
+path = "src/bin/graph_rebuild.rs"
+required-features = ["devtools"]
+
+[[bin]]
 name = "scene_backfill"
 path = "src/bin/scene_backfill.rs"
 required-features = ["devtools"]

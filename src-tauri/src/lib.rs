@@ -30,6 +30,17 @@ mod ailog;
 mod refine;
 pub mod retranscribe;
 mod graph;
+
+/// devtools bin graph_rebuild 的入口:对指定数据根按现有账本重建图谱索引,返回统计行。
+/// 用于数据修复前在副本上演练(#847:迁移漏搬账本后的恢复)。
+#[cfg(feature = "devtools")]
+pub fn devtools_graph_rebuild(data_root: &std::path::Path) -> anyhow::Result<String> {
+    let stats = graph::index::rebuild_from_sources(data_root)?;
+    Ok(format!(
+        "entities={} mentions={} relations={} evidence={} pending={}",
+        stats.entities, stats.mentions, stats.relations, stats.evidence, stats.pending
+    ))
+}
 pub mod mcp;
 mod redact;
 mod telemetry;
@@ -8676,7 +8687,16 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
             telemetry::report_error(telemetry::ErrorKind::Migration, &msg);
             let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "error".into(), message: msg });
         };
-        let entries: &[&str] = &["notes", "voiceprints.json", "voiceprints"];
+        // 整根搬(#847):白名单曾漏掉图谱账本等后加的数据,见 data_root_entries 注释。
+        // 旧根若就是 app_data_dir,settings.json(迁移指针)等应用文件与数据同住,只挑数据条目。
+        let shared_with_app_files = app
+            .path()
+            .app_data_dir()
+            .map(|app_data| app_data == old_root)
+            .unwrap_or(true);
+        let entry_names = store::migrate::data_root_entries(&old_root, shared_with_app_files);
+        let entry_refs: Vec<&str> = entry_names.iter().map(|s| s.as_str()).collect();
+        let entries: &[&str] = &entry_refs;
         // 第一步:复制+校验(失败已自清新目录,旧数据未动)。
         if let Err(e) = store::migrate::copy_and_verify_entries(&old_root, &new_path, entries) {
             return emit_err(&app, format!("{e:#}"));

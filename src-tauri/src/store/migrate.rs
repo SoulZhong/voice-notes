@@ -181,9 +181,158 @@ pub fn ensure_disjoint(old_root: &Path, new_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 数据根迁移要搬的顶层条目。
+///
+/// 为什么不再用三项白名单(#847):原先写死 notes / voiceprints.json / voiceprints,
+/// 后来加进数据根的东西全被漏搬——图谱账本 knowledge-overrides.json(用户确认/改名/
+/// 合并实体的唯一留痕,不可重建)、graph.sqlite、设备听写 dictations、说话人合并拆分
+/// 流水 merge_journal / split_ops、ai_logs、声纹辅助文件。新根里账本缺失会被当成
+/// "全新安装"从零重建,所有实体退化成每篇各算一个,图谱变空。
+///
+/// 两种旧根,两种口径:
+/// - `shared_with_app_files = false`(用户自选的数据目录,整个目录归数据所有):搬
+///   **全部**顶层条目,只跳过锁与半截文件。以后往数据根加新东西自动跟着走,不会再漏。
+/// - `shared_with_app_files = true`(旧根就是系统 app_data_dir,同目录里还住着
+///   settings.json、models、logs、mcp.sock 等**不随数据走**的应用文件——settings.json
+///   正是迁移指针本身):只搬名字以 [`DATA_ENTRY_PREFIXES`] 开头的条目。往数据根加
+///   新的顶层条目时必须同步登记到该表。
+///
+/// 旧根读不到(不存在)视作空。结果排序,便于测试与日志稳定。
+pub fn data_root_entries(old_root: &Path, shared_with_app_files: bool) -> Vec<String> {
+    let mut entries: Vec<String> = std::fs::read_dir(old_root)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| !is_transient_root_entry(name))
+                .filter(|name| {
+                    !shared_with_app_files
+                        || DATA_ENTRY_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    entries
+}
+
+/// 数据根下属于"用户数据"的顶层条目名前缀(前缀匹配顺带覆盖 .bak / .previous /
+/// -wal / -shm 等伴生文件)。只在旧根与应用文件同住 app_data_dir 时用来挑拣。
+const DATA_ENTRY_PREFIXES: [&str; 12] = [
+    "notes",
+    "voiceprints",
+    "knowledge-overrides.json",
+    "graph.sqlite",
+    "dictations",
+    "merge_journal",
+    "split_ops",
+    "ai_logs",
+    "banned_samples.json",
+    "centroid_receipts.jsonl",
+    "sample_trace.json",
+    "speaker_truth.jsonl",
+];
+
+/// 不随迁移走的顶层条目:锁文件(新根按需重建,搬过去只会带上陈旧的持锁痕迹)、
+/// 原子写的中间文件(.tmp / .next,搬了就是半截数据)、访达的 .DS_Store。
+fn is_transient_root_entry(name: &str) -> bool {
+    name == ".DS_Store" || name.ends_with(".lock") || name.ends_with(".tmp") || name.ends_with(".next")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #847 回归:图谱账本等白名单外的条目必须跟着走;锁与半截文件不走。
+    #[test]
+    fn data_root_entries_cover_everything_but_transient_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old");
+        std::fs::create_dir_all(old.join("notes")).unwrap();
+        std::fs::create_dir_all(old.join("dictations")).unwrap();
+        for f in [
+            "voiceprints.json",
+            "knowledge-overrides.json",
+            "knowledge-overrides.json.bak",
+            "graph.sqlite",
+            ".graph-index.lock",
+            ".knowledge-overrides.lock",
+            "knowledge-overrides.json.tmp",
+            "graph.sqlite.next",
+            ".DS_Store",
+        ] {
+            std::fs::write(old.join(f), b"x").unwrap();
+        }
+        assert_eq!(
+            data_root_entries(&old, false),
+            vec![
+                "dictations",
+                "graph.sqlite",
+                "knowledge-overrides.json",
+                "knowledge-overrides.json.bak",
+                "notes",
+                "voiceprints.json",
+            ]
+        );
+        assert!(data_root_entries(&tmp.path().join("missing"), false).is_empty());
+    }
+
+    /// 旧根是 app_data_dir 时,settings.json(迁移指针本身)、models、logs 等应用文件
+    /// 必须留在原地;数据条目连同伴生文件照搬。
+    #[test]
+    fn data_root_entries_leave_app_files_behind_when_root_is_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("app_data");
+        for d in ["notes", "models", "logs", "device", "voiceprints", "ai_logs"] {
+            std::fs::create_dir_all(old.join(d)).unwrap();
+        }
+        for f in [
+            "settings.json",
+            "settings.json.bak-pre-overhaul",
+            "hooks.json",
+            "mcp.sock",
+            "telemetry_session.json",
+            "voiceprints.json",
+            "voiceprints.json.bak",
+            "knowledge-overrides.json",
+            "graph.sqlite",
+            "graph.sqlite.previous",
+            ".graph-index.lock",
+        ] {
+            std::fs::write(old.join(f), b"x").unwrap();
+        }
+        assert_eq!(
+            data_root_entries(&old, true),
+            vec![
+                "ai_logs",
+                "graph.sqlite",
+                "graph.sqlite.previous",
+                "knowledge-overrides.json",
+                "notes",
+                "voiceprints",
+                "voiceprints.json",
+                "voiceprints.json.bak",
+            ]
+        );
+    }
+
+    #[test]
+    fn migrating_all_root_entries_carries_the_knowledge_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old");
+        let new = tmp.path().join("new");
+        std::fs::create_dir_all(old.join("notes/n1")).unwrap();
+        std::fs::write(old.join("notes/n1/meta.json"), b"{}").unwrap();
+        std::fs::write(old.join("knowledge-overrides.json"), b"{\"ledger\":1}").unwrap();
+        std::fs::write(old.join(".graph-index.lock"), b"").unwrap();
+        let entries = data_root_entries(&old, false);
+        let refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+        copy_and_verify_entries(&old, &new, &refs).unwrap();
+        remove_old_entries(&old, &refs);
+        assert_eq!(std::fs::read(new.join("knowledge-overrides.json")).unwrap(), b"{\"ledger\":1}");
+        assert!(new.join("notes/n1/meta.json").exists());
+        assert!(!new.join(".graph-index.lock").exists());
+        assert!(!old.join("knowledge-overrides.json").exists());
+    }
 
     #[test]
     fn migrate_entries_moves_and_cleans_old() {
