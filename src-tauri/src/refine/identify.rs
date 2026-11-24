@@ -506,7 +506,10 @@ pub struct RawAssignment {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RawIdentifyEvidence {
     pub paragraph_index: usize,
+    /// 模型报的区间只当定位提示(缺省 0),真实区间由 adjudicate 按 quote 查出后回填。
+    #[serde(default)]
     pub start: usize,
+    #[serde(default)]
     pub end: usize,
     pub quote: String,
     pub r#type: String,
@@ -565,18 +568,6 @@ fn sanitize_new_name(name: &str) -> Option<String> {
     }
 }
 
-/// Unicode scalar 半开区间取子串;越界返回 None。
-fn char_slice(text: &str, start: usize, end: usize) -> Option<String> {
-    if start >= end {
-        return None;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    if end > chars.len() {
-        return None;
-    }
-    Some(chars[start..end].iter().collect())
-}
-
 /// 五道裁决(spec + Codex 修订):①结构 ②区间逐字 ③证据-身份一致性
 /// ④冲突 ⑤声学门,再分档。绝不只信 LLM 自报 confidence。
 pub fn adjudicate(
@@ -607,20 +598,41 @@ pub fn adjudicate(
         _ => return reject("person-xor-new-name"),
     };
 
-    // ② 区间逐字校验(任一 evidence 不过 → 整条丢弃:证据造假一票否决)。
-    // 未知 type 只丢该条 evidence。
+    // ② 引文逐字校验。未知 type 只丢该条 evidence。
+    //
+    // 2026-11-24(#849)起,区间由程序按 quote 定位(见 super::quote),模型报的
+    // start/end 只当提示:5 个月 57 条推断里至少 30 条死于「下标对不上」,最终采纳
+    // 0 条——模型抄得对引文,数不对字数。定位到的区间与原文切片回填,落盘的证据
+    // 仍然逐字符等于原文。
+    //
+    // 引文在全文都找不到的那条 evidence 只丢它自己,不再连坐整条推断:后面的一致性
+    // 检查与分档只看留下来的、已逐字核实的证据;一条都不剩时照旧由下方
+    // no-valid-evidence 拒绝。「引文全部对不上」仍归 evidence-mismatch,便于日志聚类。
     let mut evidence: Vec<RawIdentifyEvidence> = Vec::new();
+    let mut unlocated = 0usize;
     for ev in &raw.evidence {
         if !EVIDENCE_TYPES.contains(&ev.r#type.as_str()) {
             continue;
         }
-        let Some(p) = doc.paragraphs.get(ev.paragraph_index) else {
-            return reject("evidence-mismatch");
-        };
-        match char_slice(&p.text, ev.start, ev.end) {
-            Some(s) if s == ev.quote => evidence.push(ev.clone()),
-            _ => return reject("evidence-mismatch"),
+        let located = super::quote::locate_in_paragraphs(
+            doc.paragraphs.iter().map(|paragraph| paragraph.text.as_str()),
+            ev.paragraph_index,
+            &ev.quote,
+            Some((ev.start, ev.end)),
+        );
+        match located {
+            Some((paragraph_index, start, end)) => evidence.push(RawIdentifyEvidence {
+                paragraph_index,
+                start,
+                end,
+                quote: super::quote::slice(&doc.paragraphs[paragraph_index].text, start, end),
+                r#type: ev.r#type.clone(),
+            }),
+            None => unlocated += 1,
         }
+    }
+    if evidence.is_empty() && unlocated > 0 {
+        return reject("evidence-mismatch");
     }
 
     // ③ 证据-身份一致性:self_intro 的 quote 必须含目标名(防"我是李雷"指认张伟);
@@ -1326,6 +1338,51 @@ mod tests {
         assert_eq!(bad.reject_reason, Some("evidence-mismatch"));
         let oob = adjudicate(&raw("R1", Some("P1"), None, vec![ev(0, 0, 999, "x", "self_intro")]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
         assert_eq!(oob.reject_reason, Some("evidence-mismatch"));
+    }
+
+    /// #849:模型抄对了引文、数错了下标——以前整条推断丢弃,现在按引文定位并回填真实区间。
+    #[test]
+    fn wrong_offsets_are_recovered_from_the_quote() {
+        let (doc, members, stats, vp) = adjudicate_fixture();
+        for (start, end) in [(3, 9), (0, 0), (50, 60)] {
+            let v = adjudicate(
+                &raw("R1", Some("P1"), None, vec![ev(0, start, end, "我是张伟", "self_intro")]),
+                &doc, &members, &stats, &vp, true, &BTreeMap::new(),
+            );
+            assert!(v.reject_reason.is_none(), "下标 ({start},{end}) 应被纠正");
+            assert_eq!((v.evidence[0].start, v.evidence[0].end), (0, 4));
+            assert_eq!(v.evidence[0].quote, "我是张伟");
+        }
+    }
+
+    /// 编造的那条证据只丢它自己;留下的逐字证据照常裁决。全是编的才整条拒绝。
+    #[test]
+    fn fabricated_evidence_is_dropped_without_sinking_verified_evidence() {
+        let (doc, members, stats, vp) = adjudicate_fixture();
+        let mixed = adjudicate(
+            &raw("R1", Some("P1"), None, vec![
+                ev(0, 0, 0, "我是张伟", "self_intro"),
+                ev(0, 0, 0, "我叫张伟,负责后端", "self_intro"),
+            ]),
+            &doc, &members, &stats, &vp, true, &BTreeMap::new(),
+        );
+        assert!(mixed.reject_reason.is_none());
+        assert_eq!(mixed.evidence.len(), 1);
+        let all_fake = adjudicate(
+            &raw("R1", Some("P1"), None, vec![ev(0, 0, 0, "我叫张伟,负责后端", "self_intro")]),
+            &doc, &members, &stats, &vp, true, &BTreeMap::new(),
+        );
+        assert_eq!(all_fake.reject_reason, Some("evidence-mismatch"));
+    }
+
+    #[test]
+    fn evidence_without_offsets_parses() {
+        let (raws, skipped) = parse_raw_identify(
+            r#"{"assignments":[{"cluster":"R1","person_id":"P1","new_name":null,"confidence":"high","evidence":[{"paragraph_index":0,"quote":"我是张伟","type":"self_intro"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!((raws.len(), skipped), (1, 0));
+        assert_eq!((raws[0].evidence[0].start, raws[0].evidence[0].end), (0, 0));
     }
 
     #[test]

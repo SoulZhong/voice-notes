@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { onTranscodeDone , onAingProgress, onAutoSplitProgress } from "$lib/events";
+  import { onTranscodeDone , onAingProgress, onAingConfigRejected, onAutoSplitProgress } from "$lib/events";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { save } from "@tauri-apps/plugin-dialog";
@@ -150,6 +150,20 @@
     const un = onAingProgress((e) => {
       if (e.note_id !== forId) return;
       aingProg = { stage: e.stage, done: e.done, total: e.total, avgMs: e.avg_chunk_ms };
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+  $effect(() => {
+    // AI 服务拒绝了请求(密钥失效/无权限/模型不存在):后端已终止本轮整理,这里把原因
+    // 说清楚——否则只有一句"在线 AI 处理失败",用户不知道该去改配置(#849)。
+    const forId = id;
+    const un = onAingConfigRejected((e) => {
+      if (e.note_id !== forId) return;
+      refineErr = t(e.status === 404 ? "notes.refine.modelNotFound" : "notes.refine.authRejected", {
+        status: e.status,
+      });
     });
     return () => {
       un.then((f) => f());
@@ -727,6 +741,7 @@
       op && Date.now() - new Date(op.created_at).getTime() < 24 * 3600_000 ? op : null;
   }
   async function retryPartial() {
+    refineErr = ""; // 上一轮的"AI 服务拒绝"提示不带进这次重试(成功后不该还挂着)
     try {
       await retryFailedRefine(id);
       refining = true; // 事件随后接管;先置上避免按钮双击

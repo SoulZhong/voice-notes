@@ -138,6 +138,8 @@ export const zh = {
   "notes.refine.completeHint": "AI 已完成，点击重新执行",
   "notes.refine.failedHint": "AI 执行失败，点击重试",
   "notes.refine.rerunFailed": "重新执行 AI 失败：{e}",
+  "notes.refine.authRejected": "AI 服务拒绝了请求（HTTP {status}）：API Key 无效。本轮整理已停止，请到「AI」页检查配置后重试。",
+  "notes.refine.modelNotFound": "AI 服务找不到所配置的模型或接入点（HTTP {status}）。本轮整理已停止，请到「AI」页检查配置后重试。",
 
   // 详情页:文件重转写(三期)
   "notes.retrans.run": "重新转文字",
@@ -352,6 +354,8 @@ export const en = {
   "notes.refine.completeHint": "AI complete; click to run again",
   "notes.refine.failedHint": "AI failed; click to retry",
   "notes.refine.rerunFailed": "Failed to re-run AI: {e}",
+  "notes.refine.authRejected": "The AI service rejected the request (HTTP {status}): the API key is invalid. This run was stopped; check the configuration on the AI page and try again.",
+  "notes.refine.modelNotFound": "The AI service could not find the configured model or endpoint (HTTP {status}). This run was stopped; check the configuration on the AI page and try again.",
 
   "notes.retrans.run": "Re-transcribe",
   "notes.retrans.runningShort": "Transcribing…",

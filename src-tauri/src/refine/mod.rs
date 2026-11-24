@@ -7,6 +7,7 @@ pub mod filter;
 pub mod identify;
 pub mod llm;
 pub mod prompts;
+pub(crate) mod quote;
 pub mod recluster;
 pub mod relations;
 
@@ -613,6 +614,10 @@ pub fn run_llm(
     let raw_relations = if matches!(text_outcome, llm::LlmOutcome::Failed) {
         eprintln!("refine relations: 正文全失败,跳过关系抽取");
         None
+    } else if let Some(code) = llm::config_rejection_pending() {
+        // 前面的块成功、中途才被拒(密钥在跑的过程中失效):同一把钥匙再发也是同样的错。
+        eprintln!("refine relations: AI 服务已拒绝请求(HTTP {code}),跳过关系抽取");
+        None
     } else {
         match llm::extract_relations(cfg, doc, log) {
             Ok(relations) => Some(relations),
@@ -652,35 +657,41 @@ pub fn run_llm(
     // CAS 成功后在锁内完成 materialize + 整份提交。成功替换关系和 extraction；任意
     // parse/materialize/validator 失败只恢复同一原始整份基线里的旧图谱字段。
     if let Some(raw_relations) = raw_relations {
-        match relations::materialize(note_id, doc, raw_relations) {
-            Ok(graph) => {
-                let source_hash = crate::store::source_hash(&doc.paragraphs);
-                let extraction = GraphExtraction {
-                    contract_version: crate::store::aing_graph::GRAPH_CONTRACT_VERSION,
-                    provider: "openai".into(),
-                    model: llm_model.to_string(),
-                    run_id: crate::store::stable_id(
-                        "run_",
-                        &[
-                            note_id.to_string(),
-                            llm_model.to_string(),
-                            doc.generated_at.clone(),
-                            source_hash.clone(),
-                        ],
-                    ),
-                    generated_at: doc.generated_at.clone(),
-                    source_hash,
-                    mode: "http".into(),
-                };
-                relations::apply_validated_graph(doc, extraction, graph);
-            }
-            Err(issues) => {
-                for issue in issues {
-                    eprintln!("refine relations: {}: {}", issue.field, issue.message);
-                }
-                fallback_graph.clone().restore(note_id, doc);
-                doc.stages.relations = "failed".into();
-            }
+        // 宽松物化(#849):引文位置由程序定、坏一条丢一条。只有「模型提了关系却一条
+        // 都没站住」才算失败并回退旧图谱;部分存活按成功入库,丢了什么记日志。
+        let lenient = relations::materialize_lenient(note_id, doc, raw_relations);
+        for issue in &lenient.issues {
+            eprintln!("refine relations: 丢弃 {}: {}", issue.field, issue.message);
+        }
+        eprintln!(
+            "refine relations: 模型提出 {} 条,入库 {} 条",
+            lenient.proposed,
+            lenient.graph.relations.len()
+        );
+        if lenient.proposed > 0 && lenient.graph.relations.is_empty() {
+            fallback_graph.clone().restore(note_id, doc);
+            doc.stages.relations = "failed".into();
+        } else {
+            let graph = lenient.graph;
+            let source_hash = crate::store::source_hash(&doc.paragraphs);
+            let extraction = GraphExtraction {
+                contract_version: crate::store::aing_graph::GRAPH_CONTRACT_VERSION,
+                provider: "openai".into(),
+                model: llm_model.to_string(),
+                run_id: crate::store::stable_id(
+                    "run_",
+                    &[
+                        note_id.to_string(),
+                        llm_model.to_string(),
+                        doc.generated_at.clone(),
+                        source_hash.clone(),
+                    ],
+                ),
+                generated_at: doc.generated_at.clone(),
+                source_hash,
+                mode: "http".into(),
+            };
+            relations::apply_validated_graph(doc, extraction, graph);
         }
     } else {
         fallback_graph.restore(note_id, doc);
@@ -2706,4 +2717,87 @@ mod tests {
             "refined.json 应已生成"
         );
     }
+    /// 离线回放(#849 验收用,不进常规测试):拿数据目录 ai_logs 里**真实的模型响应**
+    /// 过一遍现在的解析与校验,看关系与身份推断各能站住多少条。不发任何网络请求。
+    ///
+    /// 用法:VN_REPLAY_ROOT=<数据目录> cargo test --features devtools --lib \
+    ///        refine::tests::replay_logged_model_responses -- --ignored --nocapture
+    ///
+    /// 局限:用的是笔记**现在**的 aing.json,不是当时那一版。事后重新整理过的笔记,
+    /// 段落已变,引文可能对不上——数字是下限。
+    #[test]
+    #[ignore]
+    fn replay_logged_model_responses() {
+        let Ok(root) = std::env::var("VN_REPLAY_ROOT") else {
+            eprintln!("未设置 VN_REPLAY_ROOT,跳过");
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let vp = crate::store::VoiceprintStore::new(root.clone()).load();
+        let (mut rel_calls, mut rel_proposed, mut rel_kept, mut rel_strict) = (0, 0, 0, 0);
+        let (mut id_calls, mut id_proposed, mut id_kept) = (0, 0, 0);
+        let mut id_reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut rel_reasons: BTreeMap<String, usize> = BTreeMap::new();
+        let mut files: Vec<_> = std::fs::read_dir(root.join("ai_logs"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        files.sort();
+        for file in files {
+            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            let kind = entry["kind"].as_str().unwrap_or_default();
+            if entry["status"] != "ok" || !matches!(kind, "refine_relations" | "identify") {
+                continue;
+            }
+            let Some(content) = entry["response"]
+                .as_str()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|env| env["choices"][0]["message"]["content"].as_str().map(str::to_string))
+            else {
+                continue;
+            };
+            let note_id = entry["note_id"].as_str().unwrap_or_default();
+            let Some(mut doc) = crate::store::load_refined(&root.join("notes").join(note_id)) else {
+                continue;
+            };
+            crate::store::ensure_graph_ids(note_id, &mut doc);
+            if kind == "refine_relations" {
+                let Ok((raw, _)) = llm::parse_relation_only_payload(&content) else { continue };
+                if raw.is_empty() {
+                    continue;
+                }
+                rel_calls += 1;
+                rel_proposed += raw.len();
+                if let Ok(graph) = relations::materialize(note_id, &doc, raw.clone()) {
+                    rel_strict += graph.relations.len();
+                }
+                let lenient = relations::materialize_lenient(note_id, &doc, raw);
+                rel_kept += lenient.graph.relations.len();
+                for issue in &lenient.issues {
+                    *rel_reasons.entry(issue.message.clone()).or_default() += 1;
+                }
+            } else {
+                let Ok((raws, _)) = identify::parse_raw_identify(&content) else { continue };
+                if raws.is_empty() {
+                    continue;
+                }
+                id_calls += 1;
+                let members = identify::cluster_members_from_doc(&doc);
+                for raw in &raws {
+                    id_proposed += 1;
+                    let verdict = identify::adjudicate(raw, &doc, &members, &[], &vp, false, &BTreeMap::new());
+                    match verdict.reject_reason {
+                        None => id_kept += 1,
+                        Some(reason) => *id_reasons.entry(reason).or_default() += 1,
+                    }
+                }
+            }
+        }
+        println!("关系:{rel_calls} 次有内容的响应,模型提出 {rel_proposed} 条;旧校验入库 {rel_strict} 条,新校验入库 {rel_kept} 条");
+        println!("关系被丢原因(按问题条数): {rel_reasons:#?}");
+        println!("身份推断:{id_calls} 次有内容的响应,模型提出 {id_proposed} 条;通过引文与结构校验 {id_kept} 条;被拒原因 {id_reasons:?}");
+    }
+
 }
