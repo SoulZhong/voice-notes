@@ -172,6 +172,10 @@ struct AppState {
     /// 模型下载互斥位（true = 下载线程在跑）与取消信号。
     download_running: Arc<AtomicBool>,
     download_cancel: Arc<AtomicBool>,
+    /// 数据目录迁移进行中(true = 迁移线程在搬笔记树)。与 download_running 分开记:
+    /// 那一位下载模型时也是 true,而下载模型不该挡住 Aing;这一位只在搬数据时为 true,
+    /// 供 Aing / 关系补建的起跑入口拒绝(见 reject_while_data_migrating)。
+    data_migrating: Arc<AtomicBool>,
     /// 全局串行转码队列。自带独立叶子锁：绝不在持有 running/generation/session_slot
     /// 任一把锁时调它的阻塞方法（cancel_and_wait 等 in-flight）。停录入队、启动回溯
     /// 扫描入队、续录前 cancel_and_wait 都从队列这一把锁出入，与上述锁序完全解耦。
@@ -213,6 +217,7 @@ impl Default for AppState {
             hotwords_dirty: Arc::new(AtomicBool::new(false)),
             download_running: Arc::new(AtomicBool::new(false)),
             download_cancel: Arc::new(AtomicBool::new(false)),
+            data_migrating: Arc::new(AtomicBool::new(false)),
             transcode: store::transcode::TranscodeQueue::new(),
             graph_scheduler: graph::index::RebuildScheduler::default(),
             relation_backfill_running: Arc::new(AtomicBool::new(false)),
@@ -1251,6 +1256,22 @@ impl Drop for ResetOnDrop {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
+}
+
+/// 数据目录迁移进行中时拒绝起跑 Aing / 关系补建:两者都会改写笔记目录里的 aing.json,
+/// 而迁移正在逐文件复制并校验这棵树——中途被改,轻则校验失败迁移白跑,重则新旧两处
+/// 内容不一致。migrate_guard 管「它们在跑时不许迁移」,这里管反方向。
+///
+/// 已知残留窗口:本检查与迁移侧「过守卫→置位」之间没有写后读闭环,两边在同一毫秒内
+/// 起跑仍可能同时放行。两个动作都要人手点,窗口极窄,暂不为它引入更重的互斥。
+pub(crate) fn reject_while_data_migrating(state: &AppState) -> Result<(), String> {
+    if state.data_migrating.load(Ordering::SeqCst) {
+        return Err(tr!(
+            "数据目录迁移进行中,完成后再试",
+            "The data directory is being migrated; please try again after it finishes"
+        ));
+    }
+    Ok(())
 }
 
 /// RAII:Aing 集条目必然移除。与上面 ResetOnDrop 同一教训的第二例——
@@ -3419,6 +3440,7 @@ struct AingConfigRejected {
 #[tauri::command]
 async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    reject_while_data_migrating(&app.state::<AppState>())?;
     if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         if rid == id {
             return Err(tr!("该笔记正在重新转文字", "This note is being re-transcribed"));
@@ -3592,6 +3614,7 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
+    reject_while_data_migrating(&app.state::<AppState>())?;
     // 重转写中该笔记拒绝 Aing:重转写持 NoteLock,refine 的 run_local 提交时也会
     // 因锁失败——这里提前拒绝只是把错误从「跑完才失败」提到「点下去就说清」。
     if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
@@ -4470,6 +4493,7 @@ fn start_relation_backfill(
     state: State<AppState>,
     request: ipc::BackfillRequest,
 ) -> Result<(), String> {
+    reject_while_data_migrating(&state)?;
     let gate = refine::backfill::BackfillGate::acquire(
         Arc::clone(&state.relation_backfill_running),
         Arc::clone(&state.relation_backfill_run_id),
@@ -8725,11 +8749,15 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
         &state.mixed_regen,
     )?;
     let running = state.download_running.clone();
+    // 过了守卫才置位:守卫保证同一时刻只有一个迁移,不会被另一次被拒的调用误复位。
+    state.data_migrating.store(true, Ordering::SeqCst);
+    let data_migrating = state.data_migrating.clone();
     let transcode = state.transcode.clone();
     std::thread::spawn(move || {
         // 两道 RAII:先复位互斥位(ResetOnDrop),再 unpause(UnpauseOnDrop)。Drop 逆序:
         // 先 unpause 再复位 running,顺序无碍,关键是两者都必然发生(含 panic 展开)。
         let _reset = ResetOnDrop(running);
+        let _reset_migrating = ResetOnDrop(data_migrating);
         // pause_and_wait 会阻塞等 in-flight 转码——只在后台线程调,命令线程绝不调。
         transcode.pause_and_wait();
         let _unpause = UnpauseOnDrop(transcode.clone());
@@ -10220,6 +10248,19 @@ mod tests {
         assert_eq!(ids, vec!["vad", "speaker", "whisper", "dictation_stream"]);
         // Apple 选型:实时字幕不走流式,不多下。
         assert!(!default_download_ids(crate::settings::ASR_APPLE).contains(&"dictation_stream"));
+    }
+
+    #[test]
+    fn data_migration_blocks_aing_and_backfill_entrypoints() {
+        use std::sync::atomic::Ordering;
+        let state = super::AppState::default();
+        assert!(super::reject_while_data_migrating(&state).is_ok(), "空闲放行");
+        state.data_migrating.store(true, Ordering::SeqCst);
+        assert!(super::reject_while_data_migrating(&state).is_err(), "迁移中拒绝");
+        // 下载模型占的是另一位,不该挡住 Aing。
+        state.data_migrating.store(false, Ordering::SeqCst);
+        state.download_running.store(true, Ordering::SeqCst);
+        assert!(super::reject_while_data_migrating(&state).is_ok(), "下载模型不挡 Aing");
     }
 
     #[test]
