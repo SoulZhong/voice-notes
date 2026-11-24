@@ -78,6 +78,36 @@ fn post_long_with_retry(cfg: &LlmConfig, url: &str, body: &str) -> anyhow::Resul
     }
 }
 
+/// 「配置错了,再发也是同样的错」的状态码:密钥无效(401)、模型或接入点不存在(404)。
+/// 遇到它整轮 Aing 立刻收手——2026-11-13~16 密钥失效的三天里,63 次调用照发不误,
+/// 一篇 20 块的笔记连吃 20 次 401,界面上只显示"部分段落未精修"。
+///
+/// 403 **不算**:有的网关/内容安全会对某一块的**内容**回 403,那只是这一块的事,
+/// 为它中止整轮并提示"密钥无效"是误报。
+pub(crate) fn config_rejection(status: Option<u16>) -> Option<u16> {
+    status.filter(|code| matches!(code, 401 | 404))
+}
+
+thread_local! {
+    /// 本线程最近一次精修是否被服务端以配置类错误拒绝(见 [`config_rejection`])。
+    ///
+    /// 用线程局部量而不是改 `polish`/`run_llm` 的返回类型:这两个函数有四十多个调用点
+    /// (绝大多数是测试),而需要这个信号的只有 `spawn_refine` 一处——它与 `polish`
+    /// 在同一个 Aing 工作线程上顺序执行,读写天然配对。`polish_with_memos` 入口清零。
+    static CONFIG_REJECTED: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+/// 只看不取:本线程这一轮精修是否已被配置类错误拒绝。`run_llm` 用它决定要不要
+/// 再发关系抽取(同一把钥匙,发了也是同样的错);最终由调用方 take 走。
+pub(crate) fn config_rejection_pending() -> Option<u16> {
+    CONFIG_REJECTED.with(|cell| cell.get())
+}
+
+/// 取走(并清除)本线程上一次精修留下的配置类拒绝状态码。
+pub fn take_config_rejection() -> Option<u16> {
+    CONFIG_REJECTED.with(|cell| cell.take())
+}
+
 /// 这块该不该重试。只有网络类失败才有重试的意义,且要排掉 4xx;内容类(响应能
 /// 收到但内容不合约)重试等于原样再错一次。
 fn retryable(e: &ChunkErr) -> bool {
@@ -129,12 +159,15 @@ impl super::backfill::RelationExecutor for HttpRelationExecutor {
         doc: &crate::store::RefinedDoc,
     ) -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
         let raw = extract_relations(&self.cfg, doc, None)?;
-        super::relations::materialize(note_id, doc, raw).map_err(|issues| {
-            anyhow::anyhow!(
+        let lenient = super::relations::materialize_lenient(note_id, doc, raw);
+        // 模型提了关系却一条都没站住:按失败报,别把「全丢」写成一次成功的空结果。
+        if lenient.proposed > 0 && lenient.graph.relations.is_empty() {
+            anyhow::bail!(
                 "图谱校验失败:{}",
-                serde_json::to_string(&issues).unwrap_or_else(|_| "invalid graph".into())
-            )
-        })
+                serde_json::to_string(&lenient.issues).unwrap_or_else(|_| "invalid graph".into())
+            );
+        }
+        Ok(lenient.graph)
     }
 }
 
@@ -241,6 +274,8 @@ pub fn extract_relations(
     let mut body = json!({
         "model": cfg.model,
         "temperature": 0.1,
+        // 与分块精修、身份推断对齐:此前唯独这一处没要 JSON 模式(#849)。
+        "response_format": { "type": "json_object" },
         "messages": [
             {"role": "system", "content": prompts::RELATION_ONLY_SYSTEM},
             {"role": "user", "content": serde_json::to_string(&json!({
@@ -254,19 +289,43 @@ pub fn extract_relations(
     // 瞬时失败也同样重试一次(Codex P2:漏了这条路径,一次抖动就白丢整篇关系)。
     let started = std::time::Instant::now();
     let payload = body.to_string();
+    // 响应正文一到手就留底:解析失败时日志也要有**原文**。此前错误路径记 null,
+    // 5 个月 150 次失败里「模型到底回了什么」一个字都查不到(#849)。
+    let mut raw: Option<String> = None;
     let outcome = post_long_with_retry(cfg, &url, &payload).and_then(|response| {
+        raw = Some(response.clone());
         let envelope: Value = serde_json::from_str(&response)?;
         let content = envelope["choices"][0]["message"]["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("响应缺 choices[0].message.content"))?;
-        // 原始响应与解析结果一起交出去:解析失败时日志里也要留下**原始正文**,
-        // 否则 finish_reason 之类的证据随错误一起蒸发(与 do_call_chunk 同一条教训)。
-        parse_relation_only_payload(content).map(|relations| (relations, response))
+        let truncated = envelope["choices"][0]["finish_reason"].as_str() == Some("length");
+        match parse_relation_only_payload(content) {
+            Ok((relations, skipped)) => {
+                if skipped > 0 {
+                    eprintln!("refine relations: {skipped} 条关系形状不合法,已跳过");
+                }
+                // 模型给了关系却一条都解析不出来:是失败,不是"这篇没有关系"。
+                // 当成空集返回会把旧图谱覆盖成空、阶段标 done,回填也不会再碰它。
+                if relations.is_empty() && skipped > 0 {
+                    anyhow::bail!("模型返回了 {skipped} 条关系,但形状全部不合法");
+                }
+                Ok(relations)
+            }
+            // 撞输出上限的断尾 JSON 与「模型写坏了 JSON」是两回事,日志上要分得开。
+            Err(error) if truncated => {
+                Err(anyhow::anyhow!("输出被截断(finish_reason=length): {error}"))
+            }
+            Err(error) => Err(error),
+        }
     });
     if let Some(ctx) = log {
         let (response, status, error) = match &outcome {
-            Ok((_, raw)) => (Value::String(raw.clone()), "ok", None),
-            Err(e) => (Value::Null, "error", Some(e.to_string())),
+            Ok(_) => (raw.take().map(Value::String).unwrap_or(Value::Null), "ok", None),
+            Err(e) => (
+                raw.take().map(Value::String).unwrap_or(Value::Null),
+                "error",
+                Some(e.to_string()),
+            ),
         };
         crate::ailog::record(
             ctx,
@@ -283,17 +342,107 @@ pub fn extract_relations(
             },
         );
     }
-    outcome.map(|(relations, _)| relations)
+    outcome
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RelationOnlyPayload {
-    relations: Vec<RawRelation>,
+/// 宽松解析关系响应,返回 (可用关系, 跳过条数)。
+///
+/// 只有「整份不是 JSON」或「找不到 relations 数组」才整体失败;单条形状不对只跳过
+/// 那一条。容忍的偏差都是实测或常见的模型写法(#849):
+/// - 顶层直接给数组,或包在 ```json 围栏里;
+/// - `evidence` 给了单个对象而不是数组(11 月 55 次 `invalid type: map, expected a
+///   sequence` 的推定成因);
+/// - `predicate` 给了字符串而不是 `{type,label}`;
+/// - 下标/置信度写成了数字字符串;`start/end` 缺失(本来就不再依赖,见 relations::
+///   materialize_lenient);多出未知字段。
+pub(crate) fn parse_relation_only_payload(content: &str) -> anyhow::Result<(Vec<RawRelation>, usize)> {
+    let value: Value = serde_json::from_str(strip_code_fence(content))?;
+    let items = match &value {
+        Value::Array(items) => items,
+        other => other
+            .get("relations")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("响应缺 relations 数组"))?,
+    };
+    let mut relations = Vec::with_capacity(items.len());
+    let mut skipped = 0usize;
+    for item in items {
+        match parse_raw_relation(item) {
+            Some(relation) => relations.push(relation),
+            None => skipped += 1,
+        }
+    }
+    Ok((relations, skipped))
 }
 
-fn parse_relation_only_payload(content: &str) -> anyhow::Result<Vec<RawRelation>> {
-    Ok(serde_json::from_str::<RelationOnlyPayload>(content)?.relations)
+/// 去掉模型偶尔包在 JSON 外面的 Markdown 代码围栏。
+fn strip_code_fence(content: &str) -> &str {
+    let trimmed = content.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let rest = rest.strip_prefix("json").unwrap_or(rest);
+    rest.strip_suffix("```").unwrap_or(rest).trim()
+}
+
+fn loose_usize(value: &Value) -> Option<usize> {
+    value
+        .as_u64()
+        .map(|n| n as usize)
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+fn nonempty_str(value: &Value) -> Option<String> {
+    value.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+fn parse_raw_relation(value: &Value) -> Option<RawRelation> {
+    let subject = nonempty_str(&value["subject"])?;
+    let object = nonempty_str(&value["object"])?;
+    let predicate = match &value["predicate"] {
+        Value::String(kind) if !kind.trim().is_empty() => {
+            RelationPredicate { kind: kind.trim().to_string(), label: None }
+        }
+        Value::Object(map) => RelationPredicate {
+            kind: map.get("type").or_else(|| map.get("kind")).and_then(nonempty_str)?,
+            label: map.get("label").and_then(nonempty_str),
+        },
+        _ => return None,
+    };
+    let confidence = value["confidence"]
+        .as_f64()
+        .or_else(|| value["confidence"].as_str().and_then(|s| s.trim().parse().ok()))
+        // 没给就取中性值:置信度只影响展示分档,不该因为缺它丢掉一条有证据的关系。
+        .unwrap_or(0.5);
+    let evidence_items: Vec<&Value> = match &value["evidence"] {
+        Value::Array(items) => items.iter().collect(),
+        single @ Value::Object(_) => vec![single],
+        _ => Vec::new(),
+    };
+    let evidence: Vec<RawEvidence> = evidence_items
+        .into_iter()
+        .filter_map(|item| {
+            Some(RawEvidence {
+                paragraph_index: loose_usize(&item["paragraph_index"])?,
+                // 下标只是定位提示,缺了记 0——对不上时程序按引文查找。
+                start: loose_usize(&item["start"]).unwrap_or(0),
+                end: loose_usize(&item["end"]).unwrap_or(0),
+                quote: nonempty_str(&item["quote"])?,
+            })
+        })
+        .collect();
+    if evidence.is_empty() {
+        return None;
+    }
+    Some(RawRelation {
+        subject,
+        predicate,
+        object,
+        confidence,
+        valid_from: nonempty_str(&value["valid_from"]),
+        valid_to: nonempty_str(&value["valid_to"]),
+        evidence,
+    })
 }
 
 #[derive(Debug)]
@@ -837,6 +986,8 @@ pub fn polish_with_memos(
     log: Option<&crate::ailog::Ctx>,
     progress: &dyn Fn(usize, usize, u64),
 ) -> (LlmOutcome, Vec<RawEntity>) {
+    // 先清上一轮留下的配置类拒绝标记(早退路径也要清,免得陈旧值被误读)。
+    CONFIG_REJECTED.with(|cell| cell.set(None));
     let chunks = chunk_indices(paragraphs);
     if chunks.is_empty() {
         return (LlmOutcome::Done, Vec::new());
@@ -917,10 +1068,29 @@ pub fn polish_with_memos(
             }
             Err(e) => {
                 if matches!(e, ChunkErr::Network(_)) {
-                    network_failed += 1;
+                    network_failed += chunk.len();
                 }
                 eprintln!("refine llm: 块失败保留原文: {e}");
                 failed_paras.extend(chunk.iter().copied());
+                // 配置类拒绝:后面的块发出去也是同一个错,整轮到此为止。剩余段落
+                // 全部记失败(保原文),修好配置后「失败段重跑」能接着做。
+                let rejected = match &e {
+                    ChunkErr::Network(err) => err
+                        .downcast_ref::<ureq::Error>()
+                        .and_then(|u| config_rejection(err_status(u))),
+                    _ => None,
+                };
+                if let Some(code) = rejected {
+                    let skipped: usize = queue.iter().map(|c| c.len()).sum();
+                    eprintln!(
+                        "refine llm: 服务端拒绝(HTTP {code},配置类错误),跳过剩余 {skipped} 段,终止本轮"
+                    );
+                    for rest in queue.drain(..) {
+                        network_failed += rest.len();
+                        failed_paras.extend(rest);
+                    }
+                    CONFIG_REJECTED.with(|cell| cell.set(Some(code)));
+                }
             }
         }
         spent_ms += t0.elapsed().as_millis() as u64;
@@ -930,8 +1100,6 @@ pub fn polish_with_memos(
     let failed = {
         failed_paras.sort_unstable();
         failed_paras.dedup();
-        // 失败**块**数语义(Failed/Partial 判定)仍按块:用去重前无从回推,这里以
-        // network_failed 对比的是块数,改用"有失败段"的布尔即可。
         !failed_paras.is_empty()
     };
     let outcome = if !failed {
@@ -1208,15 +1376,131 @@ mod tests {
     }
 
     #[test]
-    fn relation_only_payload_rejects_unknown_output_fields() {
-        assert!(parse_relation_only_payload(r#"{"relations":[]}"#).is_ok());
-        let error = parse_relation_only_payload(r#"{"relations":[],"texts":["mutated"]}"#)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("unknown field") && error.contains("texts"),
-            "{error}"
-        );
+    fn relation_payload_tolerates_the_shapes_models_actually_write() {
+        // 规范写法照收;多出的未知字段不再整份拒绝。
+        let (ok, skipped) = parse_relation_only_payload(
+            r#"{"relations":[{"subject":"张三","predicate":{"type":"responsible_for","label":null},"object":"灯塔计划","confidence":0.8,"valid_from":null,"valid_to":null,"evidence":[{"paragraph_index":3,"start":0,"end":8,"quote":"张三负责灯塔计划"}]}],"texts":["多余字段"]}"#,
+        )
+        .unwrap();
+        assert_eq!((ok.len(), skipped), (1, 0));
+        assert_eq!((ok[0].evidence[0].start, ok[0].evidence[0].end), (0, 8));
+
+        // evidence 是单个对象、predicate 是字符串、下标是数字字符串、没有 start/end、
+        // 没有 confidence、外面包着代码围栏。
+        let (loose, skipped) = parse_relation_only_payload(
+            "```json\n{\"relations\":[{\"subject\":\" 张三 \",\"predicate\":\"uses\",\"object\":\"灯塔计划\",\"evidence\":{\"paragraph_index\":\"3\",\"quote\":\"张三用灯塔计划\"}}]}\n```",
+        )
+        .unwrap();
+        assert_eq!((loose.len(), skipped), (1, 0));
+        let relation = &loose[0];
+        assert_eq!(relation.subject, "张三");
+        assert_eq!(relation.predicate.kind, "uses");
+        assert_eq!(relation.predicate.label, None);
+        assert_eq!(relation.confidence, 0.5);
+        assert_eq!(relation.evidence.len(), 1);
+        assert_eq!(relation.evidence[0].paragraph_index, 3);
+        assert_eq!((relation.evidence[0].start, relation.evidence[0].end), (0, 0));
+
+        // 顶层直接给数组。
+        let (top, _) = parse_relation_only_payload(
+            r#"[{"subject":"a","predicate":{"kind":"custom","label":"合作"},"object":"b","confidence":"0.7","evidence":[{"paragraph_index":0,"quote":"a 和 b 合作"}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(top[0].predicate.label.as_deref(), Some("合作"));
+        assert_eq!(top[0].confidence, 0.7);
+    }
+
+    #[test]
+    fn relation_payload_skips_broken_items_instead_of_failing_the_batch() {
+        let (kept, skipped) = parse_relation_only_payload(
+            r#"{"relations":[
+                {"subject":"张三","predicate":{"type":"uses"},"object":"灯塔计划","confidence":0.8,"evidence":[{"paragraph_index":0,"quote":"张三用灯塔计划"}]},
+                {"subject":"","predicate":{"type":"uses"},"object":"灯塔计划","evidence":[{"paragraph_index":0,"quote":"x"}]},
+                {"subject":"张三","predicate":{"type":"uses"},"object":"灯塔计划","evidence":[]},
+                {"subject":"张三","predicate":42,"object":"灯塔计划","evidence":[{"paragraph_index":0,"quote":"x"}]},
+                "不是对象"
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!((kept.len(), skipped), (1, 4));
+        // 整体不是 JSON / 没有 relations 数组才整体失败。
+        assert!(parse_relation_only_payload("抱歉,我无法完成").is_err());
+        assert!(parse_relation_only_payload(r#"{"result":"ok"}"#).is_err());
+    }
+
+    /// 审查发现:模型给了关系却全部形状不合法,不能当成"成功的空结果"。
+    #[test]
+    fn relations_that_all_fail_to_parse_are_a_failure_not_an_empty_success() {
+        let content = r#"{"relations":[{"subject":"张三","predicate":{"type":"uses"},"object":"灯塔计划","evidence":["张三用灯塔计划"]}]}"#;
+        let envelope = serde_json::json!({ "choices": [{ "message": { "content": content } }] }).to_string();
+        let base = mock_server(vec![envelope]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let doc: crate::store::RefinedDoc = serde_json::from_value(serde_json::json!({
+            "schema_version": crate::store::refined::REFINED_SCHEMA_VERSION,
+            "generated_at": "2026-11-24T00:00:00+08:00",
+            "stages": {"filter":"done","recluster":"done","llm":"done","entities":"done","relations":"off"},
+            "paragraphs": [],
+        }))
+        .unwrap();
+        let error = extract_relations(&cfg, &doc, None).unwrap_err().to_string();
+        assert!(error.contains("形状全部不合法"), "{error}");
+        assert_eq!(parse_relation_only_payload(r#"{"relations":[]}"#).unwrap().0.len(), 0);
+    }
+
+    /// #849:关系调用解析失败时,AI 日志必须留下模型的原始响应(此前记 null)。
+    #[test]
+    fn relation_parse_failure_keeps_the_raw_response_in_the_ai_log() {
+        let envelope = serde_json::json!({
+            "choices": [{ "message": { "content": "抱歉,这不是JSON" }, "finish_reason": "stop" }]
+        })
+        .to_string();
+        let base = mock_server(vec![envelope]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ailog::Ctx { data_root: tmp.path().to_path_buf(), note_id: "n1".into() };
+        let doc: crate::store::RefinedDoc = serde_json::from_value(serde_json::json!({
+            "schema_version": crate::store::refined::REFINED_SCHEMA_VERSION,
+            "generated_at": "2026-11-24T00:00:00+08:00",
+            "stages": {"filter":"done","recluster":"done","llm":"done","entities":"done","relations":"off"},
+            "paragraphs": [],
+        }))
+        .unwrap();
+        assert!(extract_relations(&cfg, &doc, Some(&ctx)).is_err());
+        let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
+        let entry = &v["entries"].as_array().unwrap()[0];
+        assert_eq!(entry["kind"], "refine_relations");
+        assert_eq!(entry["status"], "error");
+        let raw = entry["response"].as_str().expect("解析失败也要留原始响应,不许 null");
+        assert!(raw.contains("这不是JSON"), "{raw}");
+    }
+
+    /// #849:密钥失效时第一块就收手,不再逐块重发;并留下状态码供上层提示用户。
+    #[test]
+    fn config_rejection_stops_the_whole_run_after_the_first_chunk() {
+        let good = chat_body(&["不该被用到"], "{}");
+        let (base, hits) = mock_server_with_status(vec![(401, "{}".into()), (200, good.clone()), (200, good)]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        // 三段各自超过分块预算 → 三块。
+        let long = "字".repeat(CHUNK_CHARS + 1);
+        let mut ps = vec![para(&long), para(&long), para(&long)];
+        let (outcome, _) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        assert!(matches!(outcome, LlmOutcome::Failed), "配置类拒绝按整体失败");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "后两块不得再发");
+        assert!(ps.iter().all(|p| p.text == long), "全部保留原文");
+        assert_eq!(take_config_rejection(), Some(401));
+        assert_eq!(take_config_rejection(), None, "取走即清");
+    }
+
+    #[test]
+    fn config_rejection_is_only_for_configuration_status_codes() {
+        for code in [401, 404] {
+            assert_eq!(config_rejection(Some(code)), Some(code));
+        }
+        // 403 可能是网关对某一块内容的拦截,不能当成密钥问题中止整轮。
+        for code in [400, 403, 408, 429, 500, 503] {
+            assert_eq!(config_rejection(Some(code)), None, "{code} 不是配置类错误");
+        }
+        assert_eq!(config_rejection(None), None, "传输层错误不是配置问题");
     }
 
     fn para(text: &str) -> crate::store::RefinedParagraph {

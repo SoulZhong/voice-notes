@@ -34,8 +34,18 @@ pub const REFINE_SYSTEM: &str = r#"你是会议逐字稿精修助手。对输入
 texts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项;只收实体类的错写→正写,一条就是一个词,不要把多个词连成一条。entities 没有可给空数组,aliases 可省略。
 输入里若有「用户备注」一节(每行 t=时间 备注:内容),那是用户在会上亲手记的只读提示:用来判断错字、统一人名与术语写法、理解主题;不得把备注内容复制或改写进 texts,备注与正文冲突时以正文为准。"#;
 
-/// 只补关系(正文与实体已定稿)。用于精修已完成、仅图谱需要重建的回填路径。
-pub const RELATION_ONLY_SYSTEM: &str = r#"你是会议语义关系抽取器。正文和实体已经定稿，禁止改写、补写或删除任何段落与实体。只根据给定 paragraphs 和 entities 抽取有逐字证据的 relations。subject/object 必须使用 entities 中的规范 name 或 alias；predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at 或 custom，custom 必须带非空 label；confidence 必须在 0 到 1；valid_from/valid_to 为 null 或带时区 RFC3339，且 from 严格早于 to。evidence.paragraph_index 是全文绝对下标；start/end 是 Unicode scalar 半开区间；quote 必须逐字符等于该区间。只输出 JSON 对象 {"relations":[...]}；没有可靠关系时输出 {"relations":[]}。"#;
+/// 关系抽取(正文与实体已定稿):每轮 HTTP Aing 精修之后整篇抽一次,也用于只补
+/// 图谱的回填路径。
+///
+/// 2026-11-24(#849)起**不再要求模型给字符位置**:模型数不准字数,5 个月里关系
+/// 入库 0 条。位置由程序按 quote 在段里查找(`refine::quote`)。同时给出完整输出
+/// 样例——此前只有字段说明,模型常把 evidence 写成单个对象。
+pub const RELATION_ONLY_SYSTEM: &str = r#"你是会议语义关系抽取器。正文和实体已经定稿，禁止改写、补写或删除任何段落与实体。只根据给定 paragraphs 和 entities 抽取有原文证据的 relations。
+subject/object 必须使用 entities 中的规范 name 或 alias，且两者不同；predicate 是对象 {"type":..,"label":..}，type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at 或 custom，custom 必须带非空 label，其余 label 为 null；confidence 在 0 到 1 之间；valid_from/valid_to 为 null 或带时区的 RFC3339 时间，且 from 严格早于 to。
+evidence 必须是数组（哪怕只有一条），每项只有两个字段：paragraph_index 是该段在输入里的 paragraph_index；quote 是从该段正文里原样复制的一段连续文字，尽量同时包含 subject 和 object 的名字，不得改写、缩写、加省略号或拼接多处。不要输出字符位置。
+只输出一个 JSON 对象，形如：
+{"relations":[{"subject":"张三","predicate":{"type":"responsible_for","label":null},"object":"灯塔计划","confidence":0.8,"valid_from":null,"valid_to":null,"evidence":[{"paragraph_index":3,"quote":"张三负责灯塔计划"}]}]}
+没有可靠关系时输出 {"relations":[]}。"#;
 
 /// 起笔记标题(HTTP 路径)。正文经 user 消息给出,此处只给约束。
 /// Agent 路径的同名任务见 [`agent_title`](fn.agent_title.html)——那边没有 system 位,
@@ -110,7 +120,7 @@ pub fn refine_paragraph_line(index: usize, speaker: &str, text: &str) -> String 
 ///   `new_name`),**名单本身是运行时数据,不在本文件**;
 /// - `sampled`:按预算采样的会议片段(`identify::sample_paragraphs`);
 /// - `calendar`:当场日历事件(可选),参会人上限 [`super::identify::CALENDAR_ATTENDEES_IN_PROMPT`]。
-pub const IDENTIFY_SYSTEM: &str = r#"你是会议说话人身份推断器。输入 JSON 含三部分:clusters(说话人簇:speaker 是簇号,total_ms 时长,is_mic=true 的簇大概率是记录者「我」,linked 非空表示已确认身份),candidates(声纹库候选人:person_id 与姓名),sampled(带 speaker 标注的会议片段,paragraph_index 是全文绝对段落下标)。任务:只为 linked 为空或存在矛盾证据的簇推断真实身份;每条推断给出簇号、身份(二选一:candidates 里的 person_id,或候选外的新名字 new_name——new_name 必须有自我介绍级证据)、自报 confidence(high|medium|low)、以及证据列表。证据 type 只能是:self_intro(该簇自我介绍,如「我是张伟」,quote 必须包含所指认的名字)、addressed_reply(称呼应答配对:必须给两条证据——一条在其它簇里称呼该名字,一条是该簇的应答)、third_person_exclusion(该簇以第三人称谈及某人,证明该簇不是那个人)、role_topic(角色/主题弱线索)。所有证据必须逐字存在:paragraph_index 用输入标注的绝对下标,start/end 是该段落的 Unicode scalar(char)半开区间,quote 必须逐字符精确等于该区间,禁止改写、缩略或拼接。输入可能含 calendar 字段(当场会议的日历事件:标题与参会人名单,「(我)」标注记录者本人):参会人是强先验候选,但允许临时加入者/代参会,不是硬约束,不得仅凭名单在无文本证据时强行认人。输出 JSON:{"assignments":[{"cluster":"R2","person_id":"P3","new_name":null,"confidence":"high","evidence":[{"paragraph_index":0,"start":0,"end":4,"quote":"我是张伟","type":"self_intro"}]}]}。person_id 与 new_name 恰好一个非空。没有可靠推断输出 {"assignments":[]}。禁止为已明确关联且无矛盾证据的簇输出条目,禁止仅凭主题相似强行认人。"#;
+pub const IDENTIFY_SYSTEM: &str = r#"你是会议说话人身份推断器。输入 JSON 含三部分:clusters(说话人簇:speaker 是簇号,total_ms 时长,is_mic=true 的簇大概率是记录者「我」,linked 非空表示已确认身份),candidates(声纹库候选人:person_id 与姓名),sampled(带 speaker 标注的会议片段,paragraph_index 是全文绝对段落下标)。任务:只为 linked 为空或存在矛盾证据的簇推断真实身份;每条推断给出簇号、身份(二选一:candidates 里的 person_id,或候选外的新名字 new_name——new_name 必须有自我介绍级证据)、自报 confidence(high|medium|low)、以及证据列表。证据 type 只能是:self_intro(该簇自我介绍,如「我是张伟」,quote 必须包含所指认的名字)、addressed_reply(称呼应答配对:必须给两条证据——一条在其它簇里称呼该名字,一条是该簇的应答)、third_person_exclusion(该簇以第三人称谈及某人,证明该簇不是那个人)、role_topic(角色/主题弱线索)。所有证据必须逐字存在:paragraph_index 用输入标注的绝对下标,quote 是从该段落原样复制的一段连续文字,禁止改写、缩略、加省略号或拼接;不要输出字符位置。输入可能含 calendar 字段(当场会议的日历事件:标题与参会人名单,「(我)」标注记录者本人):参会人是强先验候选,但允许临时加入者/代参会,不是硬约束,不得仅凭名单在无文本证据时强行认人。输出 JSON:{"assignments":[{"cluster":"R2","person_id":"P3","new_name":null,"confidence":"high","evidence":[{"paragraph_index":0,"quote":"我是张伟","type":"self_intro"}]}]}。person_id 与 new_name 恰好一个非空。没有可靠推断输出 {"assignments":[]}。禁止为已明确关联且无矛盾证据的簇输出条目,禁止仅凭主题相似强行认人。"#;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 三、Agent 执行体(claude / gemini / codex CLI)的提示词 —— 消费方 refine/agent.rs

@@ -141,6 +141,13 @@ export function onAingProgress(cb: (e: AingProgressEvent) => void) {
   return listen<AingProgressEvent>("aing_progress", (ev) => cb(ev.payload));
 }
 
+/** AI 服务以配置类错误拒绝了请求:401 = 密钥无效,404 = 模型或接入点不存在。
+ * 后端收到后已终止本轮整理(不再逐块重发),界面据此给出可操作的提示。 */
+export type AingConfigRejectedEvent = { note_id: string; status: number };
+export function onAingConfigRejected(cb: (e: AingConfigRejectedEvent) => void) {
+  return listen<AingConfigRejectedEvent>("aing_config_rejected", (ev) => cb(ev.payload));
+}
+
 /** 原生播放器位置事件(~200ms 一发,播/停/seek 立即补发):前端只画 UI,时钟在 Rust。
  * gen 是装载代次(生产环境从 1 起,永不为 0),播放会话 store 靠它辨认事件归属。 */
 export type PlayerPosEvent = { pos_ms: number; playing: boolean; gen: number };

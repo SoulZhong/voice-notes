@@ -226,6 +226,190 @@ pub fn materialize(
     store::aing_graph::validate_graph(note_id, doc, relations)
 }
 
+/// 宽松物化的结果:入库的图谱 + 一路上丢掉了什么。
+pub struct LenientGraph {
+    pub graph: ValidatedGraph,
+    /// 被丢弃的关系/证据及原因(`relation_index` 是模型原始输出里的下标)。
+    pub issues: Vec<ValidationIssue>,
+    /// 模型一共提了几条关系。`proposed > 0` 而 `graph.relations` 为空 = 全军覆没。
+    pub proposed: usize,
+}
+
+/// 实体 `entity_id` 在 `paragraph` 里的 mention id。`span` 为 Some 时只取与该区间
+/// 相交的;None 取整段的。
+fn mention_ids(
+    note_id: &str,
+    paragraph: &crate::store::RefinedParagraph,
+    entity_id: &str,
+    span: Option<(usize, usize)>,
+) -> Vec<String> {
+    paragraph
+        .mentions
+        .iter()
+        .filter(|mention| mention.entity == entity_id)
+        .filter(|mention| span.is_none_or(|(start, end)| overlaps(start, end, mention.start, mention.end)))
+        .map(|mention| store::mention_id(note_id, paragraph, &mention.entity, mention.start, mention.end))
+        .collect()
+}
+
+/// HTTP 路径的宽松物化。与 [`materialize`] 的三点不同(2026-11-24,#849):
+///
+/// 1. **引文位置由程序定**。模型报的 `start/end` 只当提示,对不上就按 `quote` 在段里
+///    查找(见 [`super::quote`]),找到的区间与原文切片回填。盘上 338 篇笔记的关系
+///    此前为 0 条,绝大多数死在「下标对不上」。
+/// 2. **坏一条丢一条**。任何一条关系不合格只丢它自己,其余照常入库;旧行为是一条
+///    出错整篇作废。
+/// 3. **mention 就近兜底**。引文区间没盖住主语/宾语的 mention 时(引文里用了代词
+///    或没把人名抄全),退到**同一段**里该实体的 mention。实体归属仍由模型给的
+///    主宾语名解析,引文仍逐字存在,只是不再要求两端都落在引文区间之内。底线不放:
+///    至少一条证据所在的段落要同时提到主语和宾语;两端都没提到的段落不留作证据。
+///
+/// Agent / MCP 写回路径仍走严格的 [`materialize`]:那边的调用方拿得到最终段落,
+/// 而且提交被拒后可以改了重交。
+pub fn materialize_lenient(note_id: &str, doc: &RefinedDoc, raw: Vec<RawRelation>) -> LenientGraph {
+    let proposed = raw.len();
+    let mut issues = Vec::new();
+    // (模型原始下标, 候选关系)
+    let mut candidates: Vec<(usize, RelationFact)> = Vec::new();
+
+    for (relation_index, raw_relation) in raw.into_iter().enumerate() {
+        let subject = resolve_entity(doc, &raw_relation.subject, relation_index, "subject", &mut issues);
+        let object = resolve_entity(doc, &raw_relation.object, relation_index, "object", &mut issues);
+        let (Some(subject), Some(object)) = (subject, object) else {
+            continue;
+        };
+
+        let mut subject_mentions = Vec::new();
+        let mut object_mentions = Vec::new();
+        let mut evidence_rows: Vec<RelationEvidence> = Vec::new();
+        // 是否至少有一条证据所在的段落同时提到了主语和宾语。
+        let mut co_mentioned = false;
+        let mut located_any = false;
+        for (evidence_index, raw_evidence) in raw_relation.evidence.into_iter().enumerate() {
+            let located = super::quote::locate_in_paragraphs(
+                doc.paragraphs.iter().map(|paragraph| paragraph.text.as_str()),
+                raw_evidence.paragraph_index,
+                &raw_evidence.quote,
+                Some((raw_evidence.start, raw_evidence.end)),
+            );
+            let Some((paragraph_index, start, end)) = located else {
+                issue(
+                    &mut issues,
+                    relation_index,
+                    relation_field(relation_index, &format!("evidence[{evidence_index}].quote")),
+                    "evidence quote was not found in the document",
+                );
+                continue;
+            };
+            located_any = true;
+            let paragraph = &doc.paragraphs[paragraph_index];
+            // 每端先取引文区间内的 mention;区间没盖住就退到**同一段**里的。
+            let endpoint_mentions = |entity_id: &str| {
+                let in_span = mention_ids(note_id, paragraph, entity_id, Some((start, end)));
+                if in_span.is_empty() {
+                    mention_ids(note_id, paragraph, entity_id, None)
+                } else {
+                    in_span
+                }
+            };
+            let row_subject = endpoint_mentions(&subject.id);
+            let row_object = endpoint_mentions(&object.id);
+            // 这段两端都没提到:这条引文跟这条关系对不上,不留作证据。
+            if row_subject.is_empty() && row_object.is_empty() {
+                issue(
+                    &mut issues,
+                    relation_index,
+                    relation_field(relation_index, &format!("evidence[{evidence_index}]")),
+                    "evidence paragraph mentions neither the subject nor the object",
+                );
+                continue;
+            }
+            co_mentioned |= !row_subject.is_empty() && !row_object.is_empty();
+            subject_mentions.extend(row_subject);
+            object_mentions.extend(row_object);
+            evidence_rows.push(RelationEvidence {
+                id: String::new(),
+                paragraph_index,
+                start,
+                end,
+                quote: super::quote::slice(&paragraph.text, start, end),
+                source_seqs: paragraph.source_seqs.clone(),
+                source_hash: String::new(),
+            });
+        }
+        if !located_any {
+            issue(
+                &mut issues,
+                relation_index,
+                relation_field(relation_index, "evidence"),
+                "no evidence could be located in the document",
+            );
+            continue;
+        }
+        // 主语和宾语必须在**同一条证据的同一段**里共同出现过至少一次。只靠"证据 A 的
+        // 段落提到主语、证据 B 的段落提到宾语"拼不出一条关系。
+        if !co_mentioned {
+            let endpoint = if subject_mentions.is_empty() { "subject_mentions" } else { "object_mentions" };
+            issue(
+                &mut issues,
+                relation_index,
+                relation_field(relation_index, endpoint),
+                "no single evidence paragraph mentions both the subject and the object",
+            );
+            continue;
+        }
+        subject_mentions.sort();
+        subject_mentions.dedup();
+        object_mentions.sort();
+        object_mentions.dedup();
+        candidates.push((
+            relation_index,
+            RelationFact {
+                id: String::new(),
+                subject: subject.id.clone(),
+                predicate: raw_relation.predicate,
+                object: object.id.clone(),
+                subject_mentions,
+                object_mentions,
+                confidence: raw_relation.confidence,
+                valid_from: raw_relation.valid_from,
+                valid_to: raw_relation.valid_to,
+                evidence: evidence_rows,
+            },
+        ));
+    }
+
+    // 交给统一 validator。它按候选列表里的位置报错:剔掉被点名的再验,直到通过。
+    // 每轮候选数严格减少,必然终止;空集合恒合法。
+    loop {
+        let facts = candidates.iter().map(|(_, fact)| fact.clone()).collect();
+        match store::aing_graph::validate_graph(note_id, doc, facts) {
+            Ok(graph) => return LenientGraph { graph, issues, proposed },
+            Err(found) => {
+                let bad: std::collections::BTreeSet<usize> =
+                    found.iter().map(|found| found.relation_index).collect();
+                for mut found in found {
+                    if let Some((original, _)) = candidates.get(found.relation_index) {
+                        found.relation_index = *original;
+                    }
+                    issues.push(found);
+                }
+                let before = candidates.len();
+                let mut position = 0usize;
+                candidates.retain(|_| {
+                    let keep = !bad.contains(&position);
+                    position += 1;
+                    keep
+                });
+                if candidates.len() == before {
+                    // validator 报了错却没点到任何候选(不该发生):全丢,保证终止。
+                    candidates.clear();
+                }
+            }
+        }
+    }
+}
+
 pub fn apply_validated_graph(
     doc: &mut RefinedDoc,
     extraction: GraphExtraction,
@@ -309,6 +493,124 @@ mod tests {
                 quote: quote.into(),
             }],
         }
+    }
+
+    fn two_entity_doc(text: &str, subject: (usize, usize), object: (usize, usize)) -> RefinedDoc {
+        doc(
+            text,
+            vec![entity("ent_1", "张三", &[]), entity("ent_2", "灯塔计划", &[])],
+            vec![
+                Mention { id: String::new(), entity: "ent_1".into(), start: subject.0, end: subject.1 },
+                Mention { id: String::new(), entity: "ent_2".into(), start: object.0, end: object.1 },
+            ],
+        )
+    }
+
+    /// #849 的核心回归:模型抄对了引文、数错了下标——以前整篇作废,现在照常入库。
+    #[test]
+    fn lenient_recovers_relations_whose_offsets_are_wrong() {
+        let doc = two_entity_doc("今天定了,张三负责灯塔计划。", (5, 7), (9, 13));
+        // 严格路径仍然拒绝(Agent/MCP 写回的契约不变)。
+        assert!(materialize("note-1", &doc, vec![raw("张三", "灯塔计划", 0, 8, "张三负责灯塔计划")]).is_err());
+
+        for (start, end) in [(0, 8), (0, 0), (40, 90)] {
+            let lenient = materialize_lenient(
+                "note-1",
+                &doc,
+                vec![raw("张三", "灯塔计划", start, end, "张三负责灯塔计划")],
+            );
+            assert_eq!(lenient.proposed, 1);
+            assert_eq!(lenient.graph.relations.len(), 1, "下标 ({start},{end}) 应被纠正: {:?}", lenient.issues);
+            let evidence = &lenient.graph.relations[0].evidence[0];
+            assert_eq!((evidence.start, evidence.end), (5, 13));
+            assert_eq!(evidence.quote, "张三负责灯塔计划");
+        }
+    }
+
+    #[test]
+    fn lenient_keeps_good_relations_when_others_are_bad() {
+        let doc = two_entity_doc("张三负责灯塔计划。", (0, 2), (4, 8));
+        let lenient = materialize_lenient(
+            "note-1",
+            &doc,
+            vec![
+                raw("张三", "灯塔计划", 0, 0, "张三负责灯塔计划"),
+                raw("李四", "灯塔计划", 0, 0, "张三负责灯塔计划"), // 主语不是本篇实体
+                raw("张三", "灯塔计划", 0, 0, "张三已经放弃灯塔计划"), // 引文是编的
+                raw("张三", "张三", 0, 0, "张三负责灯塔计划"),     // 自环,validator 拒
+            ],
+        );
+        assert_eq!(lenient.proposed, 4);
+        assert_eq!(lenient.graph.relations.len(), 1, "{:?}", lenient.issues);
+        let flagged: std::collections::BTreeSet<usize> =
+            lenient.issues.iter().map(|issue| issue.relation_index).collect();
+        assert_eq!(flagged, [1, 2, 3].into_iter().collect(), "问题记在模型原始下标上");
+    }
+
+    #[test]
+    fn lenient_reports_total_loss_as_empty_with_proposals() {
+        let doc = two_entity_doc("张三负责灯塔计划。", (0, 2), (4, 8));
+        let lenient = materialize_lenient(
+            "note-1",
+            &doc,
+            vec![raw("张三", "灯塔计划", 0, 0, "完全没有这句话的引文")],
+        );
+        assert_eq!((lenient.proposed, lenient.graph.relations.len()), (1, 0));
+        assert!(!lenient.issues.is_empty());
+        // 模型说没有关系:空集合、零问题。
+        let empty = materialize_lenient("note-1", &doc, vec![]);
+        assert_eq!((empty.proposed, empty.graph.relations.len(), empty.issues.len()), (0, 0, 0));
+    }
+
+    /// 引文没把宾语名字抄进来(只抄了「张三负责」):退到同段里该实体的 mention。
+    #[test]
+    fn lenient_falls_back_to_same_paragraph_mentions() {
+        let doc = two_entity_doc("张三负责灯塔计划。", (0, 2), (4, 8));
+        let lenient =
+            materialize_lenient("note-1", &doc, vec![raw("张三", "灯塔计划", 0, 0, "张三负责")]);
+        assert_eq!(lenient.graph.relations.len(), 1, "{:?}", lenient.issues);
+        let fact = &lenient.graph.relations[0];
+        assert_eq!(fact.object_mentions, vec![mention_id("note-1", &doc.paragraphs[0], "ent_2", 4, 8)]);
+        assert_eq!(fact.evidence[0].quote, "张三负责");
+    }
+
+    /// 同段里根本没提到宾语:没有落点,丢这一条。
+    #[test]
+    fn lenient_drops_relations_with_no_mention_anywhere_near_the_evidence() {
+        let doc = doc(
+            "张三负责这件事。",
+            vec![entity("ent_1", "张三", &[]), entity("ent_2", "灯塔计划", &[])],
+            vec![Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 2 }],
+        );
+        let lenient =
+            materialize_lenient("note-1", &doc, vec![raw("张三", "灯塔计划", 0, 0, "张三负责这件事")]);
+        assert_eq!(lenient.graph.relations.len(), 0);
+        assert!(lenient.issues.iter().any(|issue| issue.field.ends_with("object_mentions")));
+    }
+
+    /// 审查发现:不能拿"证据 A 的段落提到主语、证据 B 的段落提到宾语"拼出一条关系。
+    #[test]
+    fn lenient_requires_one_paragraph_mentioning_both_endpoints() {
+        let mut split = two_entity_doc("张三今天请假了。", (0, 2), (0, 0));
+        split.paragraphs[0].mentions.truncate(1); // 段 0 只提到张三
+        let mut second = split.paragraphs[0].clone();
+        second.text = "灯塔计划下周上线。".into();
+        second.source_seqs = vec![11];
+        second.mentions = vec![Mention { id: String::new(), entity: "ent_2".into(), start: 0, end: 4 }];
+        split.paragraphs.push(second);
+        let mut relation = raw("张三", "灯塔计划", 0, 0, "张三今天请假了");
+        relation.evidence.push(RawEvidence {
+            paragraph_index: 1,
+            start: 0,
+            end: 0,
+            quote: "灯塔计划下周上线".into(),
+        });
+        let lenient = materialize_lenient("note-1", &split, vec![relation]);
+        assert_eq!(lenient.graph.relations.len(), 0, "两段各提一端,不构成关系");
+        assert!(lenient
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("mentions both the subject and the object")));
     }
 
     #[test]

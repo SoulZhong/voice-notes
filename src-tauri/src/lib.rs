@@ -998,11 +998,23 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 }
                 report("llm", &doc.stages.llm);
+                // 服务端以配置类错误拒绝(密钥无效/模型不存在):精修已自行收手,
+                // 这里把同一把钥匙的后续调用(身份推断、标题)一并免掉,并告诉界面原因——
+                // 否则用户只看到一句笼统的"在线 AI 处理失败"(#849)。
+                let config_rejected = refine::llm::take_config_rejection();
+                if let Some(code) = config_rejected {
+                    eprintln!("refine({note_id}): AI 服务拒绝请求(HTTP {code}),跳过身份推断与标题");
+                    let _ = app.emit(
+                        "aing_config_rejected",
+                        AingConfigRejected { note_id: note_id.clone(), status: code },
+                    );
+                }
                 // identify(P2a 只读期):精修定稿后推断说话人身份,产物只落
                 // identify.json + 收件箱建议卡,零自动写入。执行体分派内含
                 // refine_llm_ready 门禁(用户关精修/agent provider → 静默跳过);
                 // 失败仅留日志,绝不影响 Aing 结果。
                 let identify_exec = match identify_executor(&s) {
+                    Ok(_) if config_rejected.is_some() => None,
                     Ok(e) => Some(e),
                     Err(reason) => {
                         eprintln!("identify({note_id}): 跳过——{reason}");
@@ -1095,7 +1107,10 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // LLM Aing 阶段成功(标题是独立的小调用,Aing 分块失败不代表标题也会
                 // 失败;llm 失败时段落是原文,起标题足够)。手动命名永远最高优先级,
                 // 失败静默保默认名。
-                if refine_exec.is_some() && store::writer::is_default_title(&note.meta.title) {
+                if refine_exec.is_some()
+                    && config_rejected.is_none()
+                    && store::writer::is_default_title(&note.meta.title)
+                {
                     refine_beat_touch(&note_id, beat_gen, "title", "running"); // 心跳表打点,同 identify
                     // 标题跟随 Aing 执行体:Agent 模式一发一收(无 MCP、无工具),
                     // HTTP 模式走原 chat completions。两边同一长度守卫、同样失败即放弃。
@@ -3378,6 +3393,14 @@ struct AingProgress {
     avg_chunk_ms: u64,
 }
 
+/// AI 服务以配置类错误拒绝了请求(401 密钥无效,404 模型/接入点不存在)。
+/// 界面据此给出可操作的提示,而不是笼统的"在线 AI 处理失败"。
+#[derive(Clone, serde::Serialize)]
+struct AingConfigRejected {
+    note_id: String,
+    status: u16,
+}
+
 /// 只重试 Aing 失败的段落(不重发已成功的块,token 不重花;2026-08-20 设计)。
 /// 与整篇 Aing 同一套 lifecycle 契约:RefineProgress(all,running) 注册(编辑被拒、
 /// 前端 aiState=running)→ 逐块心跳 → all/done|failed → RefineFinished。
@@ -3502,6 +3525,12 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
                     );
                 },
             );
+            if let Some(code) = refine::llm::take_config_rejection() {
+                let _ = app.emit(
+                    "aing_config_rejected",
+                    AingConfigRejected { note_id: note_id.clone(), status: code },
+                );
+            }
             // 子集内仍失败的位置 → 原下标。
             let still_failed_pos: std::collections::BTreeSet<usize> = match outcome {
                 refine::llm::LlmOutcome::Partial(v) => v.into_iter().collect(),
