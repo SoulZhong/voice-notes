@@ -113,6 +113,13 @@ pub const ARTIFACTS: &[Artifact] = &[
             sha256: "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
         }],
     },
+    // 维护提醒(2026-11-28):上游于 2026-11-19 重新导出并覆盖了下面两个声纹模型的同名文件
+    // (导出器 pytorch 2.4.1 → 2.14.1,各多 1 字节),这里登记的是重新导出后的字节数与哈希。
+    // 用 38 段真实会议语音实测:ERes2NetV2 新旧输出逐位相同;CAM++ 不相同——同一段语音
+    // 新旧声纹余弦 0.957~0.996,两两相似度平均偏 0.03、最大偏 0.14。含义:已装旧文件的
+    // 用户不会重新下载(旧字节数仍算已安装,见 legacy_bytes),不受影响;但删掉 CAM++ 再重新下载的用户,库里旧声纹与新算出的
+    // 声纹不在完全相同的空间里,识别会略变差,重建声纹库可恢复。上游再覆盖一次会再次
+    // 全员下载校验失败,发版前的 every_registered_model_url_is_downloadable 能查出来。
     Artifact {
         id: "speaker",
         label: "说话人区分",
@@ -123,8 +130,8 @@ pub const ARTIFACTS: &[Artifact] = &[
         prune: &[],
         files: &[FinalFile {
             rel_path: "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
-            bytes: 28_281_138,
-            sha256: "f682b514c05d947ee3fa91cd6ec6c5c7543479a128373fa29b1faedccd21fd11",
+            bytes: 28_281_139,
+            sha256: "e6af4d4c444f3dab01d991bb9b7d5af98eb979e329f6c8880a19d5553561ed25",
         }],
     },
     Artifact {
@@ -138,8 +145,8 @@ pub const ARTIFACTS: &[Artifact] = &[
         prune: &[],
         files: &[FinalFile {
             rel_path: "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
-            bytes: 71_441_526,
-            sha256: "bf1a75b9930474cf3389ef415e6e5d38ca96fea4a3a00f7e301d080a58ee2239",
+            bytes: 71_441_527,
+            sha256: "eda0bf86422a9725a3523d5a1d3d75dedf340664e0ba65cfc1c7b2a78b6cf0b5",
         }],
     },
     Artifact {
@@ -374,11 +381,25 @@ pub fn required_now(id: &str, asr_model: &str) -> bool {
     }
 }
 
+/// 上游覆盖同名文件之前的旧版字节数:本机已装的旧文件照样算「已安装」,不逼用户重下。
+/// 只登记**确认旧文件仍可正常使用**的工件。两个声纹模型在此(上游 2026-11-19 重新导出,
+/// 各多 1 字节):升级后若把旧文件判成未安装,全体老用户的说话人识别会停摆,而且 CAM++
+/// 重下后的新文件算出的声纹与库里旧声纹并不完全同空间(实测见 ARTIFACTS 里的维护提醒)。
+fn legacy_bytes(rel_path: &str) -> &'static [u64] {
+    match rel_path {
+        "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx" => &[28_281_138],
+        "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx" => &[71_441_526],
+        _ => &[],
+    }
+}
+
 pub fn artifact_present(root: &Path, a: &Artifact) -> bool {
     a.files.iter().all(|f| {
         root.join(f.rel_path)
             .metadata()
-            .map(|m| m.is_file() && m.len() == f.bytes)
+            .map(|m| {
+                m.is_file() && (m.len() == f.bytes || legacy_bytes(f.rel_path).contains(&m.len()))
+            })
             .unwrap_or(false)
     })
 }
@@ -466,6 +487,23 @@ mod tests {
             id: "t", label: "测试", url: "http://example.invalid/t.bin",
             kind: ArtifactKind::File, approx_mb: 1, prune: &[],
             files: &[FinalFile { rel_path: "t.bin", bytes: 4, sha256: "deadbeef" }],
+        }
+    }
+
+    /// 上游覆盖声纹模型前装好的旧文件(少 1 字节)仍算已安装;随便差一点的不算。
+    #[test]
+    fn artifact_present_accepts_pre_reexport_speaker_models() {
+        for id in ["speaker", "speaker-eres2netv2"] {
+            let a = ARTIFACTS.iter().find(|a| a.id == id).unwrap();
+            let f = &a.files[0];
+            let tmp = tempfile::tempdir().unwrap();
+            let file = std::fs::File::create(tmp.path().join(f.rel_path)).unwrap();
+            file.set_len(f.bytes - 1).unwrap();
+            assert!(artifact_present(tmp.path(), a), "{id}: 旧版字节数算已安装");
+            file.set_len(f.bytes).unwrap();
+            assert!(artifact_present(tmp.path(), a), "{id}: 新版字节数算已安装");
+            file.set_len(f.bytes - 2).unwrap();
+            assert!(!artifact_present(tmp.path(), a), "{id}: 其它大小不算");
         }
     }
 
