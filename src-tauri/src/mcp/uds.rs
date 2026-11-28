@@ -337,6 +337,8 @@ impl UdsBackend for AppBackend<'_> {
         // 只放行 complete、非活动会话;spawn 后即返回,重活受 AING_GATE 串行闸约束(逐篇跑不爆核)。
         let fire = |id: &str| -> Result<(), String> {
             crate::store::validate_note_id(id).map_err(|e| e.to_string())?;
+            // 与 lib.rs::refine_note 同款:数据目录迁移中不起跑 Aing。
+            crate::reject_while_data_migrating(&app.state::<crate::AppState>())?;
             // 与 lib.rs::refine_note 命令逐字同款的重转写守卫——两处必须同步改。
             // 原因:reaing 是 MCP 侧直投 RefineRequest 的入口,不经过 refine_note 命令,
             // 若不在此复刻检查,MCP 客户端可在重转写运行期间绕过守卫触发 refine,

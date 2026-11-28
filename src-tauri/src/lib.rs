@@ -172,6 +172,10 @@ struct AppState {
     /// 模型下载互斥位（true = 下载线程在跑）与取消信号。
     download_running: Arc<AtomicBool>,
     download_cancel: Arc<AtomicBool>,
+    /// 数据目录迁移进行中(true = 迁移线程在搬笔记树)。与 download_running 分开记:
+    /// 那一位下载模型时也是 true,而下载模型不该挡住 Aing;这一位只在搬数据时为 true,
+    /// 供 Aing / 关系补建的起跑入口拒绝(见 reject_while_data_migrating)。
+    data_migrating: Arc<AtomicBool>,
     /// 全局串行转码队列。自带独立叶子锁：绝不在持有 running/generation/session_slot
     /// 任一把锁时调它的阻塞方法（cancel_and_wait 等 in-flight）。停录入队、启动回溯
     /// 扫描入队、续录前 cancel_and_wait 都从队列这一把锁出入，与上述锁序完全解耦。
@@ -213,6 +217,7 @@ impl Default for AppState {
             hotwords_dirty: Arc::new(AtomicBool::new(false)),
             download_running: Arc::new(AtomicBool::new(false)),
             download_cancel: Arc::new(AtomicBool::new(false)),
+            data_migrating: Arc::new(AtomicBool::new(false)),
             transcode: store::transcode::TranscodeQueue::new(),
             graph_scheduler: graph::index::RebuildScheduler::default(),
             relation_backfill_running: Arc::new(AtomicBool::new(false)),
@@ -1251,6 +1256,22 @@ impl Drop for ResetOnDrop {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
+}
+
+/// 数据目录迁移进行中时拒绝起跑 Aing / 关系补建:两者都会改写笔记目录里的 aing.json,
+/// 而迁移正在逐文件复制并校验这棵树——中途被改,轻则校验失败迁移白跑,重则新旧两处
+/// 内容不一致。migrate_guard 管「它们在跑时不许迁移」,这里管反方向。
+///
+/// 已知残留窗口:本检查与迁移侧「过守卫→置位」之间没有写后读闭环,两边在同一毫秒内
+/// 起跑仍可能同时放行。两个动作都要人手点,窗口极窄,暂不为它引入更重的互斥。
+pub(crate) fn reject_while_data_migrating(state: &AppState) -> Result<(), String> {
+    if state.data_migrating.load(Ordering::SeqCst) {
+        return Err(tr!(
+            "数据目录迁移进行中,完成后再试",
+            "The data directory is being migrated; please try again after it finishes"
+        ));
+    }
+    Ok(())
 }
 
 /// RAII:Aing 集条目必然移除。与上面 ResetOnDrop 同一教训的第二例——
@@ -3419,6 +3440,7 @@ struct AingConfigRejected {
 #[tauri::command]
 async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    reject_while_data_migrating(&app.state::<AppState>())?;
     if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         if rid == id {
             return Err(tr!("该笔记正在重新转文字", "This note is being re-transcribed"));
@@ -3592,6 +3614,7 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
+    reject_while_data_migrating(&app.state::<AppState>())?;
     // 重转写中该笔记拒绝 Aing:重转写持 NoteLock,refine 的 run_local 提交时也会
     // 因锁失败——这里提前拒绝只是把错误从「跑完才失败」提到「点下去就说清」。
     if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
@@ -4470,6 +4493,7 @@ fn start_relation_backfill(
     state: State<AppState>,
     request: ipc::BackfillRequest,
 ) -> Result<(), String> {
+    reject_while_data_migrating(&state)?;
     let gate = refine::backfill::BackfillGate::acquire(
         Arc::clone(&state.relation_backfill_running),
         Arc::clone(&state.relation_backfill_run_id),
@@ -8650,6 +8674,8 @@ impl Drop for UnpauseOnDrop {
 fn migrate_guard(
     running: &Arc<Mutex<bool>>,
     download_running: &Arc<AtomicBool>,
+    refining: bool,
+    relation_backfill_running: &Arc<AtomicBool>,
     retranscribing: &Arc<Mutex<Option<(String, String)>>>,
     mixed_regen: &Arc<Mutex<Option<String>>>,
 ) -> Result<(), String> {
@@ -8661,6 +8687,21 @@ fn migrate_guard(
     if *running.lock().unwrap() {
         download_running.store(false, Ordering::SeqCst);
         return Err(tr!("录制中不能迁移", "Cannot migrate while recording"));
+    }
+    if refining {
+        download_running.store(false, Ordering::SeqCst);
+        return Err(tr!(
+            "Aing 进行中,完成后再迁移",
+            "Aing is in progress; please migrate after it finishes"
+        ));
+    }
+    // 关系补建会读取并写回 aing.json,与迁移复制来源数据互斥。
+    if relation_backfill_running.load(Ordering::SeqCst) {
+        download_running.store(false, Ordering::SeqCst);
+        return Err(tr!(
+            "关系补建进行中,完成后再迁移",
+            "A relation backfill is in progress; please migrate after it finishes"
+        ));
     }
     // 再查重转写槽;同样必须复位互斥位。poison 只可能因锁内 panic 产生,槽是纯数据,
     // 中毒后继续读最后一次写入的值好过让迁移永久拒绝。
@@ -8698,14 +8739,25 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
     store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
     let old_root = data_root(&app).map_err(|e| e.to_string())?;
     store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
-    // 守卫二:抢迁移/下载互斥位 + 录制守卫(先 swap download 再查 running,见 migrate_guard)。
-    migrate_guard(&state.running, &state.download_running, &state.retranscribing, &state.mixed_regen)?;
+    // 守卫二:抢迁移/下载互斥位 + 录制/Aing/关系补建守卫。
+    migrate_guard(
+        &state.running,
+        &state.download_running,
+        app.state::<lifecycle::LifecycleHandle>().any_refining(),
+        &state.relation_backfill_running,
+        &state.retranscribing,
+        &state.mixed_regen,
+    )?;
     let running = state.download_running.clone();
+    // 过了守卫才置位:守卫保证同一时刻只有一个迁移,不会被另一次被拒的调用误复位。
+    state.data_migrating.store(true, Ordering::SeqCst);
+    let data_migrating = state.data_migrating.clone();
     let transcode = state.transcode.clone();
     std::thread::spawn(move || {
         // 两道 RAII:先复位互斥位(ResetOnDrop),再 unpause(UnpauseOnDrop)。Drop 逆序:
         // 先 unpause 再复位 running,顺序无碍,关键是两者都必然发生(含 panic 展开)。
         let _reset = ResetOnDrop(running);
+        let _reset_migrating = ResetOnDrop(data_migrating);
         // pause_and_wait 会阻塞等 in-flight 转码——只在后台线程调,命令线程绝不调。
         transcode.pause_and_wait();
         let _unpause = UnpauseOnDrop(transcode.clone());
@@ -8780,8 +8832,15 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
     let old_root = models::root();
     // 嵌套守卫同 data:目标与当前模型根互不包含。以上皆只读检查,失败无需复位。
     store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
-    // 抢迁移/下载互斥位 + 录制守卫(先 swap download 再查 running,见 migrate_guard)。
-    migrate_guard(&state.running, &state.download_running, &state.retranscribing, &state.mixed_regen)?;
+    // 抢迁移/下载互斥位 + 录制/Aing/关系补建守卫。
+    migrate_guard(
+        &state.running,
+        &state.download_running,
+        app.state::<lifecycle::LifecycleHandle>().any_refining(),
+        &state.relation_backfill_running,
+        &state.retranscribing,
+        &state.mixed_regen,
+    )?;
     // 顶层条目文件名(read_dir 收集 String):不存在的旧根视作空(首次即自定义,无可搬)。
     let entries: Vec<String> = std::fs::read_dir(&old_root)
         .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
@@ -8868,7 +8927,14 @@ fn audio_disk_usage(app: AppHandle) -> Result<u64, String> {
 /// 与启动扫描、转码 worker 的探锁语义一致。
 fn purge_audio_older_than(app: &AppHandle, older_than_days: Option<u32>) -> Result<u64, String> {
     let state = app.state::<AppState>();
-    migrate_guard(&state.running, &state.download_running, &state.retranscribing, &state.mixed_regen)?;
+    migrate_guard(
+        &state.running,
+        &state.download_running,
+        app.state::<lifecycle::LifecycleHandle>().any_refining(),
+        &state.relation_backfill_running,
+        &state.retranscribing,
+        &state.mixed_regen,
+    )?;
     let _reset = ResetOnDrop(state.download_running.clone());
     state.transcode.pause_and_wait();
     let _unpause = UnpauseOnDrop(state.transcode.clone());
@@ -10185,29 +10251,54 @@ mod tests {
     }
 
     #[test]
-    fn migrate_guard_rejects_recording_and_download() {
+    fn data_migration_blocks_aing_and_backfill_entrypoints() {
+        use std::sync::atomic::Ordering;
+        let state = super::AppState::default();
+        assert!(super::reject_while_data_migrating(&state).is_ok(), "空闲放行");
+        state.data_migrating.store(true, Ordering::SeqCst);
+        assert!(super::reject_while_data_migrating(&state).is_err(), "迁移中拒绝");
+        // 下载模型占的是另一位,不该挡住 Aing。
+        state.data_migrating.store(false, Ordering::SeqCst);
+        state.download_running.store(true, Ordering::SeqCst);
+        assert!(super::reject_while_data_migrating(&state).is_ok(), "下载模型不挡 Aing");
+    }
+
+    #[test]
+    fn migrate_guard_rejects_recording_download_and_relation_backfill() {
         use super::migrate_guard;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
         // running=true → 拒,且必须复位刚抢下的互斥位(否则迁移互斥位永久卡死)。
         let running = Arc::new(Mutex::new(true));
         let dl = Arc::new(AtomicBool::new(false));
+        let rb = Arc::new(AtomicBool::new(false));
         let rt = Arc::new(Mutex::new(None));
         let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rt, &mr).is_err(), "录制中拒绝");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "录制中拒绝");
         assert!(!dl.load(Ordering::SeqCst), "拒绝后复位互斥位");
+        // Aing=true → 拒,并复位迁移互斥位。
+        let running = Arc::new(Mutex::new(false));
+        let dl = Arc::new(AtomicBool::new(false));
+        let rb = Arc::new(AtomicBool::new(false));
+        let rt = Arc::new(Mutex::new(None));
+        let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        assert!(migrate_guard(&running, &dl, true, &rb, &rt, &mr).is_err(), "Aing中拒绝");
+        assert!(!dl.load(Ordering::SeqCst), "Aing拒绝后复位互斥位");
         // download_running 已 true(下载/另一迁移在跑）→ 拒。
         let running = Arc::new(Mutex::new(false));
         let dl = Arc::new(AtomicBool::new(true));
+        let rb = Arc::new(AtomicBool::new(false));
         let rt = Arc::new(Mutex::new(None));
         let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rt, &mr).is_err(), "下载/迁移进行中拒绝");
-        // 都空闲 → 过,并已抢下互斥位(swap 置 true)。
-        let running = Arc::new(Mutex::new(false));
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "下载/迁移进行中拒绝");
+        // relation backfill=true → 拒。
         let dl = Arc::new(AtomicBool::new(false));
-        let rt = Arc::new(Mutex::new(None));
-        let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rt, &mr).is_ok(), "空闲放行");
+        let rb = Arc::new(AtomicBool::new(true));
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "关系补建中拒绝");
+        assert!(!dl.load(Ordering::SeqCst), "关系补建拒绝后复位互斥位");
+        // 都空闲 → 过,并已抢下互斥位(swap 置 true)。
+        let rb = Arc::new(AtomicBool::new(false));
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_ok(), "空闲放行");
         assert!(dl.load(Ordering::SeqCst), "放行后互斥位已抢占");
     }
 
@@ -10217,17 +10308,17 @@ mod tests {
     #[test]
     fn migrate_guard_rejects_while_retranscribing() {
         use super::migrate_guard;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
         use std::sync::{Arc, Mutex};
         let running = Arc::new(Mutex::new(false));
         let dl = Arc::new(AtomicBool::new(false));
+        let rb = Arc::new(AtomicBool::new(false));
         let rt = Arc::new(Mutex::new(Some(("n1".to_string(), "decode".to_string()))));
         let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rt, &mr).is_err(), "重转写占槽时迁移必拒");
-        assert!(!dl.load(Ordering::SeqCst), "拒绝后必须复位互斥位");
-        // 槽清空后(worker 跑完)同一互斥位可以再次放行。
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "重转写占槽时迁移必拒");
+        assert!(!dl.load(std::sync::atomic::Ordering::SeqCst), "拒绝后必须复位互斥位");
         *rt.lock().unwrap() = None;
-        assert!(migrate_guard(&running, &dl, &rt, &mr).is_ok(), "槽清空后迁移应放行");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_ok(), "槽清空后迁移应放行");
     }
 
     /// codex 第二轮 P1:补生成槽占用时迁移必拒(worker 正 mmap 读源轨/写笔记目录,
@@ -10235,16 +10326,17 @@ mod tests {
     #[test]
     fn migrate_guard_rejects_while_mixed_regen() {
         use super::migrate_guard;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
         use std::sync::{Arc, Mutex};
         let running = Arc::new(Mutex::new(false));
         let dl = Arc::new(AtomicBool::new(false));
+        let rb = Arc::new(AtomicBool::new(false));
         let rt: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
         let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Some("n1".into())));
-        assert!(migrate_guard(&running, &dl, &rt, &mr).is_err(), "补生成占槽时迁移必拒");
-        assert!(!dl.load(Ordering::SeqCst), "拒绝后复位互斥位");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_err(), "补生成占槽时迁移必拒");
+        assert!(!dl.load(std::sync::atomic::Ordering::SeqCst), "拒绝后复位互斥位");
         *mr.lock().unwrap() = None;
-        assert!(migrate_guard(&running, &dl, &rt, &mr).is_ok(), "槽清空后迁移应放行");
+        assert!(migrate_guard(&running, &dl, false, &rb, &rt, &mr).is_ok(), "槽清空后迁移应放行");
     }
 
     /// Fix 2(codex 第三轮,A↔R 占槽后互查闭环)的说明性单测:验证 A 侧判据本身——
